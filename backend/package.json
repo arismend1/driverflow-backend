@@ -1,0 +1,21 @@
+{
+  "name": "driverflow-backend",
+  "version": "1.0.0",
+  "description": "DriverFlow Production Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node migrate_phase1.js && node migrate_phase2.js && node migrate_phase3.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.17.1",
+    "jsonwebtoken": "^9.0.0"
+  }
+}
