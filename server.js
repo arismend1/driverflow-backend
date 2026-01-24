@@ -33,6 +33,15 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Root Endpoint (Health/Connectivity)
+app.get("/", (req, res) => {
+    res.status(200).json({
+        status: "ok",
+        service: "DriverFlow API",
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Health Check
 app.get('/health', (req, res) => {
     res.json({ ok: true, status: 'online' });
