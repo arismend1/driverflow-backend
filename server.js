@@ -11,6 +11,7 @@ const Database = require('better-sqlite3');
 // Assumes these files exist. If not, logic inside them is skipped for this file overwrite.
 const { nowIso, nowEpochMs } = require('./time_provider');
 const { enforceCompanyCanOperate } = require('./access_control');
+const sgMail = require('@sendgrid/mail'); // SendGrid Integration
 
 const app = express();
 app.use(express.json());
@@ -20,6 +21,14 @@ app.use(cors());
 const SECRET_KEY = process.env.JWT_SECRET || 'driverflow_secret_key_mvp';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'driverflow_admin_secret_123';
 const REQUEST_DURATION_MINUTES = 30;
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+
+if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
+    sgMail.setApiKey(SENDGRID_API_KEY);
+    console.log('[EMAIL] SendGrid Configured (Live).');
+} else {
+    console.log('[EMAIL] No Valid API Key (starts with SG.). Using Console Log Mode.');
+}
 
 // --- DATABASE SETUP (ROBUST PERSISTENCE) ---
 let dbPath = process.env.DB_PATH;
@@ -343,7 +352,23 @@ app.post('/forgot_password', (req, res, next) => {
 
             // MVP: Log link (DEEP LINK / FRONTEND URL)
             const link = `driverflow://reset-password?token=${token}`;
-            console.log(`[RESET LINK] For ${user.contacto}: ${link}`);
+
+            if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
+                const msg = {
+                    to: contact,
+                    from: process.env.FROM_EMAIL || 'noreply@driverflow.com',
+                    subject: 'DriverFlow: Reset Password',
+                    text: `Reset your password here: ${link}`,
+                    html: `<p>Click here to reset your password:</p><a href="${link}">Reset Password</a>`,
+                };
+                sgMail.send(msg).then(() => {
+                    console.log(`[EMAIL] Sent to ${contact}`);
+                }).catch((error) => {
+                    console.error('[EMAIL ERROR]', error);
+                });
+            } else {
+                console.log(`[RESET LINK] For ${user.contacto}: ${link}`);
+            }
         }
 
         res.json({ success: true, message: 'If the account exists, a recovery email was sent.' });
@@ -413,6 +438,11 @@ app.get('/admin/force-migrate', (req, res) => {
     if (req.query.key !== ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
     initDb(); // Re-run init
     res.json({ success: true, message: 'Tables verified/created.' });
+});
+
+// Global 404 Handler (Strict JSON)
+app.use((req, res, next) => {
+    res.status(404).json({ error: 'NOT_FOUND', message: 'Endpoint not found' });
 });
 
 // Global Error Handler
