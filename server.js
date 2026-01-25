@@ -231,7 +231,7 @@ app.post('/register', async (req, res, next) => {
     try {
         const { type, nombre, password, ...extras } = req.body;
         // 1. Normalize identifier (Priority: contacto > email > contact > phone)
-        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim();
+        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim().toLowerCase();
 
         // 2. Dev Logging (Safe)
         if (process.env.NODE_ENV !== 'production') {
@@ -268,7 +268,7 @@ app.post('/login', async (req, res, next) => {
     try {
         const { type, password } = req.body;
         // 1. Normalize identifier
-        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim();
+        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim().toLowerCase();
 
         // 2. Dev Logging (Safe)
         if (process.env.NODE_ENV !== 'production') {
@@ -279,7 +279,7 @@ app.post('/login', async (req, res, next) => {
         if (!contacto) return res.status(400).json({ error: 'CONTACT_REQUIRED' });
         if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
         const table = type === 'driver' ? 'drivers' : 'empresas';
-        const row = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(contacto);
+        const row = db.prepare(`SELECT * FROM ${table} WHERE lower(contacto) = ?`).get(contacto);
 
         if (!row) return res.status(401).json({ error: 'Usuario no encontrado' });
         if (await bcrypt.compare(password, row.password_hash)) {
