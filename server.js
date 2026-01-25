@@ -82,6 +82,7 @@ const initDb = () => {
             estado TEXT NOT NULL DEFAULT 'DISPONIBLE' CHECK(estado IN ('DISPONIBLE', 'OCUPADO', 'SUSPENDED')),
             search_status TEXT DEFAULT 'ON',
             rating_avg REAL DEFAULT 5.0,
+            email_verified INTEGER DEFAULT 0,
             fecha_registro DATETIME DEFAULT (datetime('now'))
         );
 
@@ -97,6 +98,7 @@ const initDb = () => {
             contact_phone TEXT,
             search_status TEXT DEFAULT 'OFF',
             account_state TEXT DEFAULT 'REGISTERED',
+            email_verified INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT (datetime('now'))
         );
 
@@ -191,7 +193,34 @@ const initDb = () => {
             used_at INTEGER,
             created_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS email_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_type TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER,
+            created_at INTEGER NOT NULL
+        );
     `);
+
+    // Helper to safely add columns if they don't exist (SQLite has no IF NOT EXISTS for columns)
+    const safeAddColumn = (table, column, definition) => {
+        try {
+            db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+            console.log(`[DB] Added column ${column} to ${table}`);
+        } catch (err) {
+            // Ignore error if column exists
+            if (!err.message.includes('duplicate column name')) {
+                console.error(`[DB] Error adding column ${column} to ${table}:`, err.message);
+            }
+        }
+    };
+
+    safeAddColumn('drivers', 'email_verified', 'INTEGER DEFAULT 0');
+    safeAddColumn('empresas', 'email_verified', 'INTEGER DEFAULT 0');
+
     console.log('[DB] Tables Verified.');
 };
 
@@ -246,6 +275,43 @@ app.get('/debug/db', (req, res) => {
     }
 });
 
+// Helper for sending verification email
+const sendVerificationEmail = async (userType, userId, email, nombre) => {
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+    // Invalidate old tokens
+    db.prepare('DELETE FROM email_verifications WHERE user_id = ? AND user_type = ?').run(userId, userType);
+
+    db.prepare('INSERT INTO email_verifications (user_type, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(userType, userId, tokenHash, expiresAt, Date.now());
+
+    const deepLinkBase = process.env.APP_DEEPLINK_BASE || 'driverflow://';
+    // Ensure base ends with slash or valid scheme separator if missing (simplistic check)
+    // Actually user says APP_DEEPLINK_BASE="driverflow://" so we construct carefully
+    const link = `${deepLinkBase}verify-email?token=${token}`;
+
+    console.log(`[VERIFY EMAIL] Generated for ${email}: ${link}`);
+
+    if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
+        const msg = {
+            to: email,
+            from: process.env.FROM_EMAIL || 'noreply@driverflow.com',
+            subject: 'DriverFlow: Verify your email',
+            text: `Welcome ${nombre}! Please verify your email here: ${link}`,
+            html: `<p>Welcome ${nombre}!</p><p>Please <a href="${link}">click here to verify your email</a>.</p>`,
+        };
+        try {
+            await sgMail.send(msg);
+            console.log(`[EMAIL] Verification sent to ${email}`);
+        } catch (error) {
+            console.error('[EMAIL ERROR] SendGrid failed:', error);
+            // Don't throw, let flow continue (soft fail)
+        }
+    }
+};
+
 // 1. Register
 app.post('/register', async (req, res, next) => {
     try {
@@ -263,6 +329,18 @@ app.post('/register', async (req, res, next) => {
         if (!password || !confirm_password) return res.status(400).json({ error: 'PASSWORD_REQUIRED' });
         if (password !== confirm_password) return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
 
+        // Email format validation (basic)
+        if (!contacto.includes('@')) {
+            // If we really want to enforce email (since phone doesn't support email verification logic nicely)
+            // Requirement says "Verificación de correo obligatoria". So must be email.
+            // But existing code supported phone? "contact or phone".
+            // We will assume for this robust phase, we prefer email. If phone provided, we can't send email.
+            // Let's Warn or Reject. User said "Forgot password request JSON ... aceptar email, si llega phone rechazar".
+            // For register, likely same.
+            // Let's assume strict email for now or allow it but skip verification if it looks like phone? NO, Requisito B says "Obligatoria".
+            return res.status(400).json({ error: 'EMAIL_REQUIRED_FOR_VERIFICATION' });
+        }
+
         if (type === 'driver') {
             // Check existence first to return clear 409
             const existing = db.prepare('SELECT id FROM drivers WHERE lower(contacto) = ?').get(contacto);
@@ -272,9 +350,14 @@ app.post('/register', async (req, res, next) => {
             const { tipo_licencia } = extras;
             if (!['A', 'B', 'C'].includes(tipo_licencia)) return res.status(400).json({ error: 'Licencia inválida' });
 
-            const stmt = db.prepare('INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia) VALUES (?, ?, ?, ?)');
+            const stmt = db.prepare('INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, email_verified) VALUES (?, ?, ?, ?, 0)');
             const info = stmt.run(nombre, contacto, hashedPassword, tipo_licencia);
-            return res.status(201).json({ id: info.lastInsertRowid, type: 'driver', message: 'Driver registrado' });
+
+            // Send Verification
+            await sendVerificationEmail('driver', info.lastInsertRowid, contacto, nombre);
+
+            return res.status(201).json({ id: info.lastInsertRowid, type: 'driver', message: 'Account created. Please verify your email.' });
+
         } else if (type === 'empresa') {
             // Check existence first
             const existing = db.prepare('SELECT id FROM empresas WHERE lower(contacto) = ?').get(contacto);
@@ -282,9 +365,13 @@ app.post('/register', async (req, res, next) => {
 
             // Simplified for brevity, assume similar robust logic for company
             const hashedPassword = await bcrypt.hash(password, 10);
-            const stmt = db.prepare('INSERT INTO empresas (nombre, contacto, password_hash, ciudad, legal_name, address_line1, contact_person, contact_phone, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            const stmt = db.prepare('INSERT INTO empresas (nombre, contacto, password_hash, ciudad, legal_name, address_line1, contact_person, contact_phone, created_at, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)');
             const info = stmt.run(nombre, contacto, hashedPassword, extras.address_city, extras.legal_name, extras.address_line1, extras.contact_person, extras.contact_phone, nowIso());
-            return res.status(201).json({ id: info.lastInsertRowid, type: 'empresa' });
+
+            // Send Verification
+            await sendVerificationEmail('empresa', info.lastInsertRowid, contacto, nombre);
+
+            return res.status(201).json({ id: info.lastInsertRowid, type: 'empresa', message: 'Account created. Please verify your email.' });
         }
         res.status(400).json({ error: 'Invalid type' });
     } catch (err) {
@@ -312,7 +399,13 @@ app.post('/login', async (req, res, next) => {
         const row = db.prepare(`SELECT * FROM ${table} WHERE lower(contacto) = ?`).get(contacto);
 
         if (!row) return res.status(401).json({ error: 'Usuario no encontrado' });
+
         if (await bcrypt.compare(password, row.password_hash)) {
+            // BLOCK IF NOT VERIFIED
+            if (row.email_verified === 0) {
+                return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED', message: 'Please verify your email address.' });
+            }
+
             const token = jwt.sign({ id: row.id, type }, SECRET_KEY, { expiresIn: '24h' });
             res.json({ token, type, id: row.id, nombre: row.nombre });
         } else {
@@ -323,14 +416,72 @@ app.post('/login', async (req, res, next) => {
     }
 });
 
+// 2.5 Verify Verification Email
+app.post('/verify_email', async (req, res, next) => {
+    try {
+        const { token } = req.body;
+        if (!token) return res.status(400).json({ error: 'MISSING_FIELDS' });
+
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const record = db.prepare('SELECT * FROM email_verifications WHERE token_hash = ? AND used_at IS NULL').get(tokenHash);
+
+        if (!record) {
+            return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
+        }
+        if (Date.now() > record.expires_at) {
+            return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
+        }
+
+        // Mark user verified
+        const table = record.user_type === 'driver' ? 'drivers' : 'empresas';
+        db.transaction(() => {
+            db.prepare(`UPDATE ${table} SET email_verified = 1 WHERE id = ?`).run(record.user_id);
+            db.prepare('UPDATE email_verifications SET used_at = ? WHERE id = ?').run(Date.now(), record.id);
+        })();
+
+        res.json({ success: true, message: 'Email verified successfully.' });
+
+    } catch (err) {
+        next(err);
+    }
+});
+
+// 2.6 Resend Verification
+app.post('/resend_verification', async (req, res, next) => {
+    try {
+        const { type, contact } = req.body;
+        const email = (contact || "").trim().toLowerCase();
+
+        if (!email || !['driver', 'empresa'].includes(type)) {
+            return res.status(400).json({ error: 'INVALID_REQUEST' });
+        }
+
+        const table = type === 'driver' ? 'drivers' : 'empresas';
+        const user = db.prepare(`SELECT id, nombre, email_verified FROM ${table} WHERE lower(contacto) = ?`).get(email);
+
+        if (user && user.email_verified === 0) {
+            await sendVerificationEmail(type, user.id, email, user.nombre);
+        }
+        // Always return success
+        res.json({ success: true, message: 'If account exists and is unverified, email sent.' });
+
+    } catch (err) {
+        next(err);
+    }
+});
+
+
 // 3. Forgot Password
 app.post('/forgot_password', (req, res, next) => {
     try {
         const { type } = req.body;
         const contact = (req.body.contact || req.body.email || req.body.phone || req.body.contacto || "").trim().toLowerCase();
 
-        if (!contact || !['driver', 'empresa'].includes(type)) {
-            // Always return success to prevent enumeration, unless input is blatantly malformed
+        if (!contact || !contact.includes('@') || !['driver', 'empresa'].includes(type)) {
+            // Requisito 2: Phone rechazar
+            if (contact && !contact.includes('@')) {
+                return res.status(400).json({ error: 'EMAIL_REQUIRED', message: 'Recovery requires a valid email.' });
+            }
             return res.json({ success: true, message: 'If the account exists, a recovery email was sent.' });
         }
 
@@ -350,8 +501,8 @@ app.post('/forgot_password', (req, res, next) => {
             db.prepare('INSERT INTO password_resets (user_type, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
                 .run(type, user.id, tokenHash, expiresAt, Date.now());
 
-            // MVP: Log link (DEEP LINK / FRONTEND URL)
-            const link = `driverflow://reset-password?token=${token}`;
+            const deepLinkBase = process.env.APP_DEEPLINK_BASE || 'driverflow://';
+            const link = `${deepLinkBase}reset-password?token=${token}`;
 
             if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
                 const msg = {
@@ -387,6 +538,9 @@ app.post('/reset_password', async (req, res, next) => {
         }
         if (new_password !== confirm_password) {
             return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
+        }
+        if (new_password.length < 8) {
+            return res.status(400).json({ error: 'PASSWORD_TOO_SHORT', message: 'Minimum 8 characters.' });
         }
 
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
