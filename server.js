@@ -390,6 +390,91 @@ app.post('/reset_password', async (req, res, next) => {
     }
 });
 
+// 4.5 Reset Password Page (HTML)
+app.get('/reset', (req, res) => {
+    const token = req.query.token;
+    if (!token) return res.send('Invalid Request: Missing Token');
+
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Reset Password - DriverFlow</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; background: #f0f2f5; }
+            .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+            input { width: 90%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }
+            button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+            button:hover { background: #0056b3; }
+            .error { color: red; margin-bottom: 10px; display: none; }
+            .success { color: green; margin-bottom: 10px; display: none; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Reset Password</h2>
+            <div id="error" class="error"></div>
+            <div id="success" class="success">Password reset successfully! You can now login to the app.</div>
+            <form id="resetForm">
+                <input type="hidden" id="token" value="${token}">
+                <input type="password" id="new_password" placeholder="New Password" required minlength="6">
+                <input type="password" id="confirm_password" placeholder="Confirm Password" required minlength="6">
+                <button type="submit">Set New Password</button>
+            </form>
+        </div>
+        <script>
+            document.getElementById('resetForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const errorDiv = document.getElementById('error');
+                const successDiv = document.getElementById('success');
+                const btn = e.target.querySelector('button');
+                
+                errorDiv.style.display = 'none';
+                successDiv.style.display = 'none';
+                
+                const p1 = document.getElementById('new_password').value;
+                const p2 = document.getElementById('confirm_password').value;
+                
+                if (p1 !== p2) {
+                    errorDiv.textContent = 'Passwords do not match';
+                    errorDiv.style.display = 'block';
+                    return;
+                }
+                
+                btn.disabled = true;
+                btn.textContent = 'Updating...';
+                
+                try {
+                    const res = await fetch('/reset_password', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            token: document.getElementById('token').value,
+                            new_password: p1,
+                            confirm_password: p2
+                        })
+                    });
+                    
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.error || 'Failed to reset');
+                    
+                    successDiv.style.display = 'block';
+                    e.target.style.display = 'none';
+                } catch (err) {
+                    errorDiv.textContent = err.message;
+                    errorDiv.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Set New Password';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    `;
+    res.send(html);
+});
+
 // 5. Debug Password Resets
 app.get('/debug/password_resets', (req, res) => {
     const hasSecret = req.headers['x-admin-secret'] === ADMIN_SECRET;
