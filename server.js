@@ -231,7 +231,7 @@ app.post('/register', async (req, res, next) => {
     try {
         const { type, nombre, password, ...extras } = req.body;
         // 1. Normalize identifier (Priority: contacto > email > contact > phone)
-        const contacto = req.body.contacto || req.body.email || req.body.contact || req.body.phone;
+        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim();
 
         // 2. Dev Logging (Safe)
         if (process.env.NODE_ENV !== 'production') {
@@ -268,7 +268,7 @@ app.post('/login', async (req, res, next) => {
     try {
         const { type, password } = req.body;
         // 1. Normalize identifier
-        const contacto = req.body.contacto || req.body.email || req.body.contact || req.body.phone;
+        const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim();
 
         // 2. Dev Logging (Safe)
         if (process.env.NODE_ENV !== 'production') {
