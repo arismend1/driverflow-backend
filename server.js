@@ -341,8 +341,8 @@ app.post('/forgot_password', (req, res, next) => {
             db.prepare('INSERT INTO password_resets (user_type, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
                 .run(type, user.id, tokenHash, expiresAt, Date.now());
 
-            // MVP: Log link
-            const link = `https://driverflow.com/reset?token=${token}`; // Adjust base URL as needed or keep generic
+            // MVP: Log link (DEEP LINK / FRONTEND URL)
+            const link = `driverflow://reset-password?token=${token}`;
             console.log(`[RESET LINK] For ${user.contacto}: ${link}`);
         }
 
