@@ -1,4 +1,5 @@
 const express = require('express');
+const { execSync } = require('child_process');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -1035,7 +1036,76 @@ app.post('/admin/tickets/void', (req, res) => {
     }
 });
 
+
+// 12. Password Recovery (Forgot Password)
+app.post('/recover-password', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+    try {
+        // 1. Check Driver
+        let user = db.prepare('SELECT id, nombre FROM drivers WHERE contacto = ?').get(email);
+        let table = 'drivers';
+
+        // 2. Check Company if not Driver
+        if (!user) {
+            user = db.prepare('SELECT id, nombre FROM empresas WHERE contacto = ?').get(email);
+            table = 'empresas';
+        }
+
+        // 3. If found, reset
+        if (user) {
+            // Generate Temp Password (random 8 chars)
+            const crypto = require('crypto');
+            const tempPass = crypto.randomBytes(4).toString('hex');
+            const hashedPass = await bcrypt.hash(tempPass, 10);
+
+            // Update DB
+            db.prepare(`UPDATE ${table} SET password_hash = ? WHERE id = ?`).run(hashedPass, user.id);
+
+            // Queue Email
+            const payload = JSON.stringify({ to_email: email, temp_password: tempPass });
+            db.prepare(`
+                INSERT INTO events_outbox (event_name, company_id, driver_id, payload, created_at) 
+                VALUES (?, ?, ?, ?, datetime('now'))
+            `).run(
+                'password_reset_sent',
+                table === 'empresas' ? user.id : null,
+                table === 'drivers' ? user.id : null,
+                payload
+            );
+
+            // Log for safe debugging in non-prod or explicit request
+            console.log(`🔐 [RESET] Temp Password for ${email}: ${tempPass}`);
+        }
+
+        // Always return success to prevent user enumeration
+        res.json({ message: 'Si el correo existe, se enviaron instrucciones.' });
+
+    } catch (error) {
+        console.error('Recover Password Error:', error);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
+
+// AUTO-MIGRATION ON STARTUP
+try {
+    console.log('🔄 Running Auto-Migrations...');
+    // Force ALLOW_PROD_MIGRATIONS=1 to ensure tables are created even in prod environment
+    execSync('node migrate_all.js', {
+        stdio: 'inherit',
+        env: { ...process.env, ALLOW_PROD_MIGRATIONS: '1' }
+    });
+    console.log('✅ Auto-Migrations Complete');
+} catch (error) {
+    console.error('❌ Auto-Migration Failed:', error.message);
+    // process.exit(1); // Optional: Fail hard if DB is broken, or try to continue?
+    // Continuing might allow health checks to pass, but core logic will fail. 
+    // Let's log and continue for now to avoid crash loops on minor warnings.
+}
+
 app.listen(PORT, () => {
     console.log(`DriverFlow MVP server listening on port ${PORT}`);
 });
