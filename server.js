@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 // ⚠️ TIME AND ACCESS CONTROL IMPORTS
@@ -171,6 +172,16 @@ const initDb = () => {
         CREATE TABLE IF NOT EXISTS credit_notes (id INTEGER PRIMARY KEY, invoice_id INTEGER, amount_cents INTEGER, reason TEXT, created_at DATETIME);
         CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, action TEXT, admin_user TEXT, target_id INTEGER, reason TEXT, created_at DATETIME);
         CREATE TABLE IF NOT EXISTS request_visibility (request_id INTEGER, driver_id INTEGER, ronda INTEGER, PRIMARY KEY (request_id, driver_id));
+
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_type TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER,
+            created_at INTEGER NOT NULL
+        );
     `);
     console.log('[DB] Tables Verified.');
 };
@@ -229,7 +240,7 @@ app.get('/debug/db', (req, res) => {
 // 1. Register
 app.post('/register', async (req, res, next) => {
     try {
-        const { type, nombre, password, ...extras } = req.body;
+        const { type, nombre, password, confirm_password, ...extras } = req.body;
         // 1. Normalize identifier (Priority: contacto > email > contact > phone)
         const contacto = (req.body.contacto || req.body.email || req.body.contact || req.body.phone || "").trim().toLowerCase();
 
@@ -240,8 +251,14 @@ app.post('/register', async (req, res, next) => {
 
         // 3. Strict Validation
         if (!contacto) return res.status(400).json({ error: 'CONTACT_REQUIRED' });
+        if (!password || !confirm_password) return res.status(400).json({ error: 'PASSWORD_REQUIRED' });
+        if (password !== confirm_password) return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
 
         if (type === 'driver') {
+            // Check existence first to return clear 409
+            const existing = db.prepare('SELECT id FROM drivers WHERE lower(contacto) = ?').get(contacto);
+            if (existing) return res.status(409).json({ error: 'USER_ALREADY_EXISTS' });
+
             const hashedPassword = await bcrypt.hash(password, 10);
             const { tipo_licencia } = extras;
             if (!['A', 'B', 'C'].includes(tipo_licencia)) return res.status(400).json({ error: 'Licencia inválida' });
@@ -250,6 +267,10 @@ app.post('/register', async (req, res, next) => {
             const info = stmt.run(nombre, contacto, hashedPassword, tipo_licencia);
             return res.status(201).json({ id: info.lastInsertRowid, type: 'driver', message: 'Driver registrado' });
         } else if (type === 'empresa') {
+            // Check existence first
+            const existing = db.prepare('SELECT id FROM empresas WHERE lower(contacto) = ?').get(contacto);
+            if (existing) return res.status(409).json({ error: 'USER_ALREADY_EXISTS' });
+
             // Simplified for brevity, assume similar robust logic for company
             const hashedPassword = await bcrypt.hash(password, 10);
             const stmt = db.prepare('INSERT INTO empresas (nombre, contacto, password_hash, ciudad, legal_name, address_line1, contact_person, contact_phone, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -258,7 +279,7 @@ app.post('/register', async (req, res, next) => {
         }
         res.status(400).json({ error: 'Invalid type' });
     } catch (err) {
-        if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Contacto ya registrado' });
+        if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'USER_ALREADY_EXISTS' });
         next(err);
     }
 });
@@ -290,6 +311,95 @@ app.post('/login', async (req, res, next) => {
         }
     } catch (err) {
         next(err);
+    }
+});
+
+// 3. Forgot Password
+app.post('/forgot_password', (req, res, next) => {
+    try {
+        const { type } = req.body;
+        const contact = (req.body.contact || req.body.email || req.body.phone || req.body.contacto || "").trim().toLowerCase();
+
+        if (!contact || !['driver', 'empresa'].includes(type)) {
+            // Always return success to prevent enumeration, unless input is blatantly malformed
+            return res.json({ success: true, message: 'If the account exists, a recovery email was sent.' });
+        }
+
+        const table = type === 'driver' ? 'drivers' : 'empresas';
+        const user = db.prepare(`SELECT id, contacto FROM ${table} WHERE lower(contacto) = ?`).get(contact);
+
+        if (user) {
+            // Generate secure token
+            const token = crypto.randomBytes(32).toString('hex');
+            const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+            const expiresAt = Date.now() + 30 * 60 * 1000; // 30 mins
+
+            // Invalidate old tokens
+            db.prepare('DELETE FROM password_resets WHERE user_id = ? AND user_type = ?').run(user.id, type);
+
+            // Store new token
+            db.prepare('INSERT INTO password_resets (user_type, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+                .run(type, user.id, tokenHash, expiresAt, Date.now());
+
+            // MVP: Log link
+            const link = `https://driverflow.com/reset?token=${token}`; // Adjust base URL as needed or keep generic
+            console.log(`[RESET LINK] For ${user.contacto}: ${link}`);
+        }
+
+        res.json({ success: true, message: 'If the account exists, a recovery email was sent.' });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// 4. Reset Password
+app.post('/reset_password', async (req, res, next) => {
+    try {
+        const { token, new_password, confirm_password } = req.body;
+
+        if (!token || !new_password || !confirm_password) {
+            return res.status(400).json({ error: 'MISSING_FIELDS' });
+        }
+        if (new_password !== confirm_password) {
+            return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
+        }
+
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const record = db.prepare('SELECT * FROM password_resets WHERE token_hash = ? AND used_at IS NULL').get(tokenHash);
+
+        if (!record) {
+            return res.status(401).json({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+        }
+
+        if (Date.now() > record.expires_at) {
+            return res.status(401).json({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+        }
+
+        // Update password
+        const hashedPassword = await bcrypt.hash(new_password, 10);
+        const table = record.user_type === 'driver' ? 'drivers' : 'empresas';
+
+        db.transaction(() => {
+            db.prepare(`UPDATE ${table} SET password_hash = ? WHERE id = ?`).run(hashedPassword, record.user_id);
+            db.prepare('UPDATE password_resets SET used_at = ? WHERE id = ?').run(Date.now(), record.id);
+        })();
+
+        res.json({ success: true });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// 5. Debug Password Resets
+app.get('/debug/password_resets', (req, res) => {
+    const hasSecret = req.headers['x-admin-secret'] === ADMIN_SECRET;
+    if (!hasSecret) return res.status(403).json({ error: 'Forbidden' });
+
+    try {
+        const rows = db.prepare('SELECT * FROM password_resets ORDER BY created_at DESC LIMIT 50').all();
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
