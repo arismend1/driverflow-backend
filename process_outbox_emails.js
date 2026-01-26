@@ -40,7 +40,10 @@ async function sendEmailSendGrid(to, subject, textBody) {
     personalizations: [{ to: [{ email: to }] }],
     from: { email: FROM_EMAIL, name: FROM_NAME },
     subject,
-    content: [{ type: "text/plain", value: textBody }]
+    content: [{ type: "text/plain", value: textBody }],
+    tracking_settings: {
+      click_tracking: { enable: false, enable_text: false }
+    }
   };
 
   const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
