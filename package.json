@@ -1,6 +1,6 @@
 {
   "name": "driverflow-mvp",
-  "version": "1.2.0",
+  "version": "1.0.4",
   "description": "DriverFlow MVP - Phase 3 (Production Ready)",
   "main": "server.js",
   "scripts": {
