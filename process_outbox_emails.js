@@ -6,7 +6,7 @@ const db = new Database(DB_PATH);
 // Config
 const DRY_RUN = process.env.DRY_RUN === "1";
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
-const FROM_EMAIL = process.env.SENDGRID_FROM || process.env.EMAIL_FROM_BILLING || "";
+const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SENDGRID_FROM || process.env.EMAIL_FROM_BILLING || "";
 const FROM_NAME = process.env.SENDGRID_FROM_NAME || "DriverFlow";
 
 // Logging

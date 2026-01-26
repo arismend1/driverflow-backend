@@ -49,7 +49,7 @@ app.get('/health', (req, res) => {
 });
 
 // Configuración
-const SECRET_KEY = process.env.JWT_SECRET || 'driverflow_secret_key_mvp'; // Prod usa ENV
+const SECRET_KEY = process.env.SECRET_KEY || process.env.JWT_SECRET || 'dev_secret_key_123'; // Prod usa ENV
 const REQUEST_DURATION_MINUTES = 30;
 
 // --- Middleware Auth ---
