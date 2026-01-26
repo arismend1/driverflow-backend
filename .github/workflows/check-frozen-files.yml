@@ -1,0 +1,51 @@
+name: Enforce Frozen Logic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  check-frozen-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes in Frozen Files
+        id: check_files
+        run: |
+          # Define Frozen Files
+          FROZEN_FILES="delinquency.js generate_weekly_invoices.js process_outbox_emails.js check_delinquency.js"
+          
+          # Get list of changed files in this PR
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          
+          VIOLATION=false
+          for FROZEN in $FROZEN_FILES; do
+            if echo "$CHANGED_FILES" | grep -q "$FROZEN"; then
+              echo "::error::CRITICAL: Attempting to modify frozen file: $FROZEN"
+              VIOLATION=true
+            fi
+          done
+          
+          echo "violation=$VIOLATION" >> $GITHUB_OUTPUT
+
+      - name: Validate Override Token
+        if: steps.check_files.outputs.violation == 'true'
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "Checking PR Title for override token..."
+          
+          if [[ "$PR_TITLE" == *"[OVERRIDE-FROZEN]"* ]]; then
+            echo "::notice::Override token detected. Proceeding with extreme caution."
+            exit 0
+          else
+            echo "::error::FROZEN FILES CHANGED without override token."
+            echo "::error::You modified critical business logic validation files."
+            echo "::error::To proceed, you MUST add '[OVERRIDE-FROZEN]' to the PR title and provide justification."
+            exit 1
+          fi

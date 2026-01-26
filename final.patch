@@ -1,0 +1,211 @@
+diff --git a/migrate_auth_fix.js b/migrate_auth_fix.js
+index 103aa1c..18df9eb 100644
+--- a/migrate_auth_fix.js
++++ b/migrate_auth_fix.js
+@@ -31,10 +31,84 @@ const schema = [
+     { table: 'empresas', col: 'verification_token', type: 'TEXT' },
+     { table: 'empresas', col: 'verification_expires', type: 'TEXT' },
+     { table: 'empresas', col: 'reset_token', type: 'TEXT' },
+-    { table: 'empresas', col: 'reset_expires', type: 'TEXT' }
++    { table: 'empresas', col: 'reset_expires', type: 'TEXT' },
++    { table: 'empresas', col: 'search_status', type: 'TEXT', def: "'ON'" },
++    { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' }
+ ];
+ 
+ db.transaction(() => {
++    // 1. Ensure Tables Exist (Base Schema)
++    db.exec(`
++        CREATE TABLE IF NOT EXISTS drivers (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            nombre TEXT,
++            contacto TEXT UNIQUE,
++            password_hash TEXT,
++            tipo_licencia TEXT,
++            experience_level TEXT,
++            status TEXT DEFAULT 'active',
++            estado TEXT DEFAULT 'DISPONIBLE',
++            search_status TEXT DEFAULT 'ON',
++            created_at TEXT
++        );
++        CREATE TABLE IF NOT EXISTS empresas (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            nombre TEXT,
++            contacto TEXT UNIQUE,
++            password_hash TEXT,
++            legal_name TEXT,
++            address_line1 TEXT,
++            city TEXT,
++            search_status TEXT DEFAULT 'ON',
++            created_at TEXT
++        );
++        CREATE TABLE IF NOT EXISTS events_outbox (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            event_name TEXT NOT NULL,
++            created_at TEXT NOT NULL,
++            company_id INTEGER,
++            driver_id INTEGER,
++            request_id INTEGER,
++            ticket_id INTEGER,
++            metadata TEXT,
++            processed_at TEXT,
++            process_status TEXT DEFAULT 'pending',
++            last_error TEXT,
++            send_attempts INTEGER DEFAULT 0
++        );
++        CREATE TABLE IF NOT EXISTS tickets (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             company_id INTEGER,
++             driver_id INTEGER,
++             request_id INTEGER,
++             price_cents INTEGER,
++             currency TEXT,
++             billing_status TEXT DEFAULT 'unbilled', 
++             created_at TEXT,
++             updated_at TEXT
++        );
++        CREATE TABLE IF NOT EXISTS solicitudes (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            empresa_id INTEGER,
++            driver_id INTEGER,
++            licencia_req TEXT,
++            ubicacion TEXT,
++            tiempo_estimado TEXT,
++            estado TEXT DEFAULT 'PENDIENTE',
++            ronda_actual INTEGER DEFAULT 1,
++            fecha_inicio_ronda TEXT,
++            fecha_expiracion TEXT,
++            fecha_cierre TEXT,
++            cancelado_por TEXT
++        );
++         CREATE TABLE IF NOT EXISTS request_visibility (
++            request_id INTEGER,
++            driver_id INTEGER,
++            ronda INTEGER
++         );
++    `);
++
++    // 2. Add Columns
+     for (const item of schema) {
+         addColumn(item.table, item.col, item.type, item.def);
+     }
+diff --git a/package.json b/package.json
+index 9e1265d..013e1d7 100644
+--- a/package.json
++++ b/package.json
+@@ -4,9 +4,9 @@
+   "description": "DriverFlow MVP - Phase 3 (Production Ready)",
+   "main": "server.js",
+   "scripts": {
+-    "start": "node migrate_auth_fix.js && node migrate_verification.js && node migrate_reset.js && node server.js",
++    "start": "node server.js",
+     "start:worker": "node process_outbox_emails.js",
+-    "migrate": "node migrate_phase1.js && node migrate_phase2.js && node migrate_phase3.js",
++    "migrate": "node migrate_auth_fix.js",
+     "test": "node --test \"tests/**/*.test.js\"",
+     "test:match": "node --test tests/match_confirmed.test.js",
+     "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\""
+diff --git a/process_outbox_emails.js b/process_outbox_emails.js
+index 5d3cb72..6da0736 100644
+--- a/process_outbox_emails.js
++++ b/process_outbox_emails.js
+@@ -6,7 +6,7 @@ const db = new Database(DB_PATH);
+ // Config
+ const DRY_RUN = process.env.DRY_RUN === "1";
+ const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
+-const FROM_EMAIL = "no-reply@driverflow.app"; // STRICT
++const FROM_EMAIL = process.env.FROM_EMAIL || "";
+ const FROM_NAME = "DriverFlow";
+ const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
+ 
+@@ -21,6 +21,10 @@ if (!DRY_RUN) {
+     console.error("❌ FATAL: Missing/invalid SENDGRID_API_KEY.");
+     process.exit(1);
+   }
++  if (FROM_EMAIL !== "no-reply@driverflow.app") {
++    console.error(`❌ FATAL: FROM_EMAIL must be exactly 'no-reply@driverflow.app'. Got: '${FROM_EMAIL}'`);
++    process.exit(1);
++  }
+ }
+ 
+ function nowSql() {
+diff --git a/schema.sql b/schema.sql
+new file mode 100644
+index 0000000..eaf4ab6
+--- /dev/null
++++ b/schema.sql
+@@ -0,0 +1,49 @@
++CREATE TABLE IF NOT EXISTS drivers (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    nombre TEXT,
++    contacto TEXT UNIQUE,
++    password_hash TEXT,
++    tipo_licencia TEXT,
++    experience_level TEXT,
++    status TEXT DEFAULT 'active',
++    estado TEXT DEFAULT 'DISPONIBLE',
++    search_status TEXT DEFAULT 'ON',
++    created_at TEXT,
++    verified INTEGER DEFAULT 0,
++    verification_token TEXT,
++    verification_expires TEXT,
++    reset_token TEXT,
++    reset_expires TEXT
++);
++
++CREATE TABLE IF NOT EXISTS empresas (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    nombre TEXT,
++    contacto TEXT UNIQUE,
++    password_hash TEXT,
++    legal_name TEXT,
++    address_line1 TEXT,
++    city TEXT,
++    search_status TEXT DEFAULT 'ON',
++    created_at TEXT,
++    verified INTEGER DEFAULT 0,
++    verification_token TEXT,
++    verification_expires TEXT,
++    reset_token TEXT,
++    reset_expires TEXT
++);
++
++CREATE TABLE IF NOT EXISTS events_outbox (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    event_name TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    company_id INTEGER,
++    driver_id INTEGER,
++    request_id INTEGER,
++    ticket_id INTEGER,
++    metadata TEXT,
++    processed_at TEXT,
++    process_status TEXT DEFAULT 'pending',
++    last_error TEXT,
++    send_attempts INTEGER DEFAULT 0
++);
+diff --git a/server.js b/server.js
+index e441ca1..eca348a 100644
+--- a/server.js
++++ b/server.js
+@@ -11,7 +11,7 @@ const { enforceCompanyCanOperate } = require('./access_control');
+ 
+ // --- Producción: Strict Env Validation ---
+ if (process.env.NODE_ENV === 'production') {
+-    const requiredEnv = ['PORT', 'JWT_SECRET', 'DB_PATH'];
++    const requiredEnv = ['PORT', 'JWT_SECRET', 'DB_PATH', 'SENDGRID_API_KEY', 'FROM_EMAIL'];
+     const missing = requiredEnv.filter(key => !process.env[key]);
+ 
+     if (missing.length > 0) {
+@@ -175,11 +175,7 @@ app.all('/verify-email', (req, res) => {
+     const table = user.type === 'driver' ? 'drivers' : 'empresas';
+     db.prepare(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`).run(user.id);
+ 
+-    if (req.method === 'GET') {
+-        res.send(`<h1 style="color:green">Email Verificado con Éxito</h1><p>Ya puedes iniciar sesión en DriverFlow.</p>`);
+-    } else {
+-        res.json({ ok: true });
+-    }
++    res.send(`<h1 style="color:green">Email Verificado con Éxito</h1><p>Ya puedes iniciar sesión en DriverFlow.</p>`);
+ });
+ 
+ // --- Resend Verification (Anti-Enumeration) ---

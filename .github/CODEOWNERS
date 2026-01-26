@@ -1,0 +1,8 @@
+# Critical Business Logic - Requires Senior Review
+delinquency.js              @BillingTeam @TechLead
+generate_weekly_invoices.js  @BillingTeam @TechLead
+process_outbox_emails.js     @BillingTeam @TechLead
+check_delinquency.js         @BillingTeam @TechLead
+
+# Validation: 
+# Ensure "Require review from Code Owners" is enabled in Branch Protection settings.

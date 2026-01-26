@@ -1,0 +1,42 @@
+const Database = require("better-sqlite3");
+const db = new Database(process.env.DB_PATH || "driverflow.db");
+
+const companyId = Number(process.argv[2] || 1);
+
+// Detectar columnas reales
+const cols = db.prepare(`PRAGMA table_info(company_match_prefs)`).all();
+const colNames = new Set(cols.map(c => c.name));
+
+// Armamos INSERT solo con columnas que existan
+const fields = [];
+const placeholders = [];
+const values = [];
+
+function add(name, value) {
+  if (colNames.has(name)) {
+    fields.push(name);
+    placeholders.push("?");
+    values.push(value);
+  }
+}
+
+// mínimos esperados por tu sistema (según lo que vienes usando)
+add("company_id", companyId);
+add("req_license", "B");
+add("req_experience", "Any");
+
+// por si existen otros campos típicos (no pasa nada si no existen)
+add("team_driving", 0);
+add("available_start", null);
+add("restrictions", null);
+
+if (!fields.includes("company_id")) {
+  console.log("❌ ERROR: company_match_prefs NO tiene company_id. No puedo continuar.");
+  process.exit(1);
+}
+
+const sql = `INSERT INTO company_match_prefs (${fields.join(", ")}) VALUES (${placeholders.join(", ")})`;
+db.prepare(sql).run(...values);
+
+console.log("✅ OK. Prefs creados para company_id =", companyId);
+db.close();
