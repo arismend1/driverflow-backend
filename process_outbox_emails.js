@@ -21,9 +21,12 @@ if (!DRY_RUN) {
     console.error("❌ FATAL: Missing/invalid SENDGRID_API_KEY.");
     process.exit(1);
   }
-  if (FROM_EMAIL !== "no-reply@driverflow.app") {
-    console.error(`❌ FATAL: FROM_EMAIL must be EXACTLY 'no-reply@driverflow.app'. Got: '${FROM_EMAIL}'`);
+  if (!FROM_EMAIL.includes("@")) {
+    console.error(`❌ FATAL: Invalid FROM_EMAIL: '${FROM_EMAIL}'`);
     process.exit(1);
+  }
+  if (FROM_EMAIL !== "no-reply@driverflow.app") {
+    console.warn(`⚠️ WARNING: Using custom FROM_EMAIL: '${FROM_EMAIL}'. Ensure it is verified in SendGrid.`);
   }
 }
 
