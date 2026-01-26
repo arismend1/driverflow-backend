@@ -26,7 +26,8 @@ if (!DRY_RUN) {
     process.exit(1);
   }
   if (FROM_EMAIL !== "no-reply@driverflow.app") {
-    console.warn(`⚠️ WARNING: Using custom FROM_EMAIL: '${FROM_EMAIL}'. Ensure it is verified in SendGrid.`);
+    console.error(`❌ FATAL: FROM_EMAIL must be EXACTLY 'no-reply@driverflow.app'. Got: '${FROM_EMAIL}'`);
+    process.exit(1);
   }
 }
 

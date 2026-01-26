@@ -43,7 +43,20 @@ const db = require('better-sqlite3')(dbPath);
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+
+// CORS Configuration
+const corsOptions = {
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    }
+};
+app.use(cors(corsOptions));
 
 // Root Endpoint (Health/Connectivity)
 app.get("/", (req, res) => {
@@ -60,8 +73,40 @@ app.get('/health', (req, res) => {
 });
 
 // Configuración
+// Configuración
 const SECRET_KEY = process.env.SECRET_KEY || process.env.JWT_SECRET || 'dev_secret_key_123'; // Prod usa ENV
 const REQUEST_DURATION_MINUTES = 30;
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
+
+// --- Rate Limiter (In-Memory) ---
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 5;
+
+function checkRateLimit(ip, type) {
+    const key = `${ip}:${type}`;
+    const now = Date.now();
+    let record = rateLimitMap.get(key);
+
+    if (!record || now > record.expiry) {
+        record = { count: 0, expiry: now + RATE_LIMIT_WINDOW };
+    }
+
+    if (record.count >= RATE_LIMIT_MAX) return false;
+
+    record.count++;
+    rateLimitMap.set(key, record);
+    return true;
+}
+
+// --- Password Validator ---
+function isStrongPassword(password) {
+    if (!password || password.length < 8) return false;
+    if (!/[A-Z]/.test(password)) return false;
+    if (!/[a-z]/.test(password)) return false;
+    if (!/[0-9]/.test(password)) return false;
+    return true;
+}
 
 // --- INTEGRATED WORKER SEAMLESS START ---
 // Esto asegura que el mismo proceso que escribe en la DB también envíe los correos.
@@ -100,6 +145,14 @@ app.post('/register', async (req, res) => {
     // Common Val
     if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
     if (!nombre || !contacto || !password) return res.status(400).json({ error: 'Missing basic fields' });
+
+    // Password Policy
+    if (req.body.confirm_password && req.body.confirm_password !== password) {
+        return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
+    }
+    if (!isStrongPassword(password)) {
+        return res.status(400).json({ error: 'WEAK_PASSWORD', message: 'Password must be 8+ chars, 1 uppercase, 1 lowercase, 1 number.' });
+    }
 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
@@ -198,6 +251,9 @@ app.post(['/resend-verification', '/resend_verification'], (req, res) => {
     // Always 200 OK
     if (!target) return res.json({ ok: true });
 
+    // Rate Limit
+    if (!checkRateLimit(req.ip, 'resend')) return res.status(429).json({ error: 'RATE_LIMITED' });
+
     const table = type === 'driver' ? 'drivers' : 'empresas';
     const user = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(target);
 
@@ -223,6 +279,9 @@ app.post('/forgot_password', (req, res) => {
     const target = (contact || email || '').trim();
 
     if (!target) return res.json({ ok: true });
+
+    // Rate Limit
+    if (!checkRateLimit(req.ip, 'forgot')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const table = type === 'driver' ? 'drivers' : 'empresas';
     const user = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(target);
@@ -316,6 +375,14 @@ app.post('/reset_password', async (req, res) => {
 
     if (!user) return res.status(400).json({ error: 'Token inválido' });
     if (new Date(user.reset_expires) < new Date()) return res.status(400).json({ error: 'Token expirado' });
+
+    // Password Policy
+    if (req.body.confirm_new_password && req.body.confirm_new_password !== new_password) {
+        return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
+    }
+    if (!isStrongPassword(new_password)) {
+        return res.status(400).json({ error: 'WEAK_PASSWORD' });
+    }
 
     const hashedPassword = await bcrypt.hash(new_password, 10);
     const table = user.type === 'driver' ? 'drivers' : 'empresas';
