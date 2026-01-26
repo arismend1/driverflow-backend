@@ -230,7 +230,7 @@ app.post('/forgot_password', (req, res) => {
     if (user) {
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
-        const expires = new Date(Date.now() + 1 * 3600000).toISOString();
+        const expires = new Date(Date.now() + 1 * 3600000).toISOString(); // 1 Hour Expiry
 
         db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
 
@@ -240,6 +240,70 @@ app.post('/forgot_password', (req, res) => {
     }
 
     res.json({ ok: true, message: 'Si existe, se envió correo.' });
+});
+
+// --- Web Form for Reset Password (GET) ---
+app.get('/reset-password-web', (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.status(400).send('<h3>Error: Enlace inválido o sin token.</h3>');
+
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Restablecer Contraseña - DriverFlow</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: sans-serif; padding: 20px; max-width: 400px; margin: 0 auto; }
+                input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+                button { width: 100%; padding: 10px; background: #000; color: #fff; border: none; cursor: pointer; }
+                .success { color: green; }
+                .error { color: red; }
+            </style>
+        </head>
+        <body>
+            <h2>Restablecer Contraseña</h2>
+            <form id="resetForm">
+                <input type="hidden" id="token" value="${token}" />
+                <label>Nueva Contraseña:</label>
+                <input type="password" id="password" required placeholder="Ingresa tu nueva clave" minlength="6"/>
+                <button type="submit">Guardar Nueva Contraseña</button>
+                <p id="msg"></p>
+            </form>
+            <script>
+                document.getElementById('resetForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const token = document.getElementById('token').value;
+                    const new_password = document.getElementById('password').value;
+                    const msg = document.getElementById('msg');
+                    msg.textContent = 'Procesando...';
+                    msg.className = '';
+
+                    try {
+                        const res = await fetch('/reset_password', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ token, new_password })
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            msg.textContent = '✅ Contraseña actualizada. Ya puedes entrar a la App.';
+                            msg.className = 'success';
+                            document.getElementById('password').value = '';
+                            document.querySelector('button').disabled = true;
+                        } else {
+                            msg.textContent = '❌ ' + (data.error || 'Error al actualizar');
+                            msg.className = 'error';
+                        }
+                    } catch (err) {
+                        msg.textContent = '❌ Error de conexión';
+                        msg.className = 'error';
+                    }
+                });
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 // --- Reset Password ---

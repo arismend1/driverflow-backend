@@ -30,6 +30,7 @@ const schema = [
     { table: 'drivers', col: 'status', type: 'TEXT', def: "'active'" },
     { table: 'drivers', col: 'search_status', type: 'TEXT', def: "'ON'" },
     { table: 'drivers', col: 'estado', type: 'TEXT', def: "'DISPONIBLE'" },
+    { table: 'drivers', col: 'created_at', type: 'TEXT' }, // Fix for legacy schema mismatch
 
     // EMPRESAS
     { table: 'empresas', col: 'verified', type: 'INTEGER', def: 0 },
@@ -38,6 +39,7 @@ const schema = [
     { table: 'empresas', col: 'reset_token', type: 'TEXT' },
     { table: 'empresas', col: 'reset_expires', type: 'TEXT' },
     { table: 'empresas', col: 'search_status', type: 'TEXT', def: "'ON'" },
+    { table: 'empresas', col: 'created_at', type: 'TEXT' }, // Fix for legacy schema mismatch
 
     // OUTBOX
     { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' }
