@@ -63,6 +63,17 @@ app.get('/health', (req, res) => {
 const SECRET_KEY = process.env.SECRET_KEY || process.env.JWT_SECRET || 'dev_secret_key_123'; // Prod usa ENV
 const REQUEST_DURATION_MINUTES = 30;
 
+// --- INTEGRATED WORKER SEAMLESS START ---
+// Esto asegura que el mismo proceso que escribe en la DB también envíe los correos.
+// Soluciona el problema de discos separados en Render.
+try {
+    const emailWorker = require('./process_outbox_emails');
+    console.log('--- Starting Integrated Email Worker ---');
+    emailWorker.startWorker(); // Run in background (non-blocking)
+} catch (e) {
+    console.error('Failed to start integrated worker:', e);
+}
+
 // --- Middleware Auth ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];

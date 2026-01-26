@@ -121,6 +121,7 @@ async function runOnce() {
 }
 
 // Poll Loop
+// Poll Loop
 const POLL_MS = 10000;
 async function startWorker() {
   console.log(`Worker polling every ${POLL_MS}ms...`);
@@ -130,4 +131,10 @@ async function startWorker() {
   }
 }
 
-startWorker();
+// Export for usage in server.js
+module.exports = { startWorker };
+
+// Auto-start if run directly (e.g. node process_outbox_emails.js)
+if (require.main === module) {
+  startWorker();
+}
