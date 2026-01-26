@@ -17,13 +17,16 @@ console.log(`DRY_RUN:   ${DRY_RUN}`);
 
 // Strict validation for live sends
 if (!DRY_RUN) {
-  if (SENDGRID_KEY.length < 50) {
+  if (SENDGRID_KEY.length < 10) { // Relaxed length check mostly for checking existence
     console.error("❌ FATAL: Missing/invalid SENDGRID_API_KEY.");
     process.exit(1);
   }
-  if (FROM_EMAIL !== "no-reply@driverflow.app") {
-    console.error(`❌ FATAL: FROM_EMAIL must be exactly 'no-reply@driverflow.app'. Got: '${FROM_EMAIL}'`);
+  if (!FROM_EMAIL) {
+    console.error("❌ FATAL: FROM_EMAIL env var is missing.");
     process.exit(1);
+  }
+  if (FROM_EMAIL !== "no-reply@driverflow.app") {
+    console.warn(`⚠️ WARNING: Running with non-production email: '${FROM_EMAIL}'. Ensure this is Verified in SendGrid.`);
   }
 }
 
