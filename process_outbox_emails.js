@@ -6,7 +6,7 @@ const db = new Database(DB_PATH);
 // Config
 const DRY_RUN = process.env.DRY_RUN === "1";
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
-const FROM_EMAIL = process.env.FROM_EMAIL || "";
+const FROM_EMAIL = process.env.FROM_EMAIL || "no-reply@driverflow.app";
 const FROM_NAME = "DriverFlow";
 const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
 
@@ -19,10 +19,6 @@ console.log(`DRY_RUN:   ${DRY_RUN}`);
 if (!DRY_RUN) {
   if (SENDGRID_KEY.length < 10) { // Relaxed length check mostly for checking existence
     console.error("❌ FATAL: Missing/invalid SENDGRID_API_KEY.");
-    process.exit(1);
-  }
-  if (!FROM_EMAIL) {
-    console.error("❌ FATAL: FROM_EMAIL env var is missing.");
     process.exit(1);
   }
   if (FROM_EMAIL !== "no-reply@driverflow.app") {
