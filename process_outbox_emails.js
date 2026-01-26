@@ -238,7 +238,7 @@ async function run() {
       messages.push({
         to: email,
         subject: "Verify your email - DriverFlow",
-        body: `Hola ${name},\n\nGracias por registrarte en DriverFlow.\n\nTu codigo de verificacion es: ${token}\n\nO usa este enlace (simulado): driverflow://verify?token=${token}\n`
+        body: `Hola ${name},\n\nGracias por registrarte en DriverFlow.\n\nPara activar tu cuenta, toca el siguiente enlace:\n\ndriverflow://verify-email?token=${token}&type=${meta.user_type || 'driver'}\n\nSi no funciona, usa tu token manual: ${token}\n`
       });
     }
 
@@ -257,7 +257,7 @@ async function run() {
       messages.push({
         to: email,
         subject: "Recuperar Contraseña - DriverFlow",
-        body: `Hola ${name},\n\nRecibimos una solicitud para restablecer tu contraseña.\n\nUsa este enlace para crear una nueva contraseña:\n\ndriverflow://reset?token=${token}\n\nSi no solicitaste esto, ignora este correo.\n`
+        body: `Hola ${name},\n\nRecibimos una solicitud para restablecer tu contraseña.\n\nToca aquí para crear una nueva:\n\ndriverflow://reset-password?token=${token}\n\nSi no solicitaste esto, ignora este mensaje.\n`
       });
     }
 

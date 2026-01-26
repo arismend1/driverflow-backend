@@ -102,7 +102,8 @@ app.post('/register', async (req, res) => {
             });
 
             const result = registerTx();
-            return res.status(201).json({ id: result.id, type: 'driver', require_email_verification: true, message: 'Registro exitoso. Verifique su correo.' });
+            // NO TOKEN RETURNED - Require verification
+            return res.status(200).json({ ok: true, require_email_verification: true, message: 'Registro exitoso. Verifique su correo.' });
         } catch (err) {
             if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Contacto ya registrado' });
             return res.status(500).json({ error: err.message });
@@ -191,7 +192,8 @@ app.post('/register', async (req, res) => {
 
         try {
             const result = registerTx();
-            return res.status(201).json({ id: result.id, type: 'empresa', require_email_verification: true, message: 'Empresa registrada. Verifique su correo.' });
+            // NO TOKEN RETURNED - Require verification
+            return res.status(200).json({ ok: true, require_email_verification: true, message: 'Empresa registrada. Verifique su correo.' });
         } catch (err) {
             if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Contacto ya registrado' });
             return res.status(500).json({ error: err.message });
@@ -290,7 +292,7 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
     const row = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(contacto);
 
-    if (!row) return res.status(401).json({ error: 'Usuario no encontrado' });
+    if (!row) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' }); // Generic error
 
     // Check Verification
     if (row.verified === 0) {
@@ -298,16 +300,15 @@ app.post('/login', async (req, res) => {
     }
 
     if (await bcrypt.compare(password, row.password_hash)) {
-        // Token incluye ID, Tipo y Licencia (si es driver) para facilitar lógica
         const payload = {
             id: row.id,
             type: type,
             licencia: type === 'driver' ? row.tipo_licencia : null
         };
         const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
-        res.json({ token, type, id: row.id, nombre: row.nombre });
+        res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
     } else {
-        res.status(401).json({ error: 'Contraseña incorrecta' });
+        res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     }
 });
 
@@ -956,18 +957,15 @@ app.post('/verify-email', (req, res) => {
 });
 
 // 1.4 Forgot Password
+// 1.4 Forgot Password (Anti-Enumeration)
 app.post('/forgot_password', (req, res) => {
     const { type, contact, email } = req.body;
     const target = contact || email;
-    if (!target) return res.status(400).json({ error: 'Email/Contact required' });
+    // Return 200 even if missing params to avoid probing? Maybe too strict.
+    if (!target) return res.status(400).json({ error: 'Email required' });
 
-    // We try to find in both if type not specified, or specific if specified
-    // For MVP security, we won't reveal if user exists or not, always return success.
-    // But we need to define which table.
-
-    // Simple logic: Try user supplied type or search both
+    // Search logic (Internal)
     let usersFound = [];
-
     if (type === 'driver' || !type) {
         const u = db.prepare("SELECT id, nombre, contacto, 'driver' as type FROM drivers WHERE contacto = ?").get(target);
         if (u) usersFound.push(u);
@@ -982,11 +980,10 @@ app.post('/forgot_password', (req, res) => {
         const table = user.type === 'driver' ? 'drivers' : 'empresas';
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
-        const expires = new Date(Date.now() + 1 * 3600000).toISOString(); // 1 hour
+        const expires = new Date(Date.now() + 1 * 3600000).toISOString();
 
         db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
 
-        // Emit Event
         const idCol = user.type === 'driver' ? 'driver_id' : 'company_id';
         db.prepare(`
             INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata)
@@ -994,8 +991,49 @@ app.post('/forgot_password', (req, res) => {
         `).run('recovery_email', now, user.id, JSON.stringify({ token, email: user.contacto, name: user.nombre, user_type: user.type }));
     }
 
-    // Always 200
-    res.json({ success: true, message: 'If account exists, email sent.' });
+    // Always 200 OK
+    res.json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
+});
+
+// 1.2 Resend Verification (Anti-Enumeration)
+app.post(['/resend-verification', '/resend_verification'], (req, res) => {
+    const { type, contact, email } = req.body;
+    const targetEmail = contact || email;
+    if (!targetEmail) return res.status(400).json({ error: 'Email required' });
+
+    let user = null;
+    let table = '';
+
+    // Check Driver
+    if (!type || type === 'driver') {
+        const d = db.prepare('SELECT id, nombre, verified, contacto FROM drivers WHERE contacto = ?').get(targetEmail);
+        if (d) { user = d; table = 'drivers'; }
+    }
+    // Check Company
+    if (!user && (!type || type === 'empresa' || type === 'company')) {
+        const c = db.prepare('SELECT id, nombre, verified, contacto FROM empresas WHERE contacto = ?').get(targetEmail);
+        if (c) { user = c; table = 'empresas'; }
+    }
+
+    // If user found & NOT verified -> Send Email
+    if (user && user.verified === 0) {
+        const token = crypto.randomBytes(32).toString('hex');
+        const now = nowIso();
+        const expires = new Date(Date.now() + 24 * 3600000).toISOString();
+
+        const sendTx = db.transaction(() => {
+            db.prepare(`UPDATE ${table} SET verification_token = ?, verification_expires = ? WHERE id = ?`).run(token, expires, user.id);
+            const idCol = (table === 'drivers') ? 'driver_id' : 'company_id';
+            db.prepare(`
+                INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata)
+                VALUES (?, ?, ?, ?)
+            `).run('verification_email', now, user.id, JSON.stringify({ token, email: user.contacto, name: user.nombre }));
+        });
+        sendTx();
+    }
+
+    // Always 200 OK
+    res.json({ ok: true, message: 'Si la cuenta existe y requiere verificación, se envió el correo.' });
 });
 
 // 1.5 Reset Password
