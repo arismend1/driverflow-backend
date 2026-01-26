@@ -286,6 +286,10 @@ app.post('/forgot_password', (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
     const user = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(target);
 
+    if (!user) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
     if (user) {
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
@@ -298,7 +302,7 @@ app.post('/forgot_password', (req, res) => {
             .run('recovery_email', now, user.id, JSON.stringify({ token, email: target, name: user.nombre, user_type: type }));
     }
 
-    res.json({ ok: true, message: 'Si existe, se envió correo.' });
+    res.json({ ok: true, message: 'Correo de recuperación enviado.' });
 });
 
 // --- Web Form for Reset Password (GET) ---
@@ -326,6 +330,8 @@ app.get('/reset-password-web', (req, res) => {
                 <input type="hidden" id="token" value="${token}" />
                 <label>Nueva Contraseña:</label>
                 <input type="password" id="password" required placeholder="Ingresa tu nueva clave" minlength="6"/>
+                <label>Confirmar Contraseña:</label>
+                <input type="password" id="confirm_password" required placeholder="Repite tu nueva clave" minlength="6"/>
                 <button type="submit">Guardar Nueva Contraseña</button>
                 <p id="msg"></p>
             </form>
@@ -334,7 +340,15 @@ app.get('/reset-password-web', (req, res) => {
                     e.preventDefault();
                     const token = document.getElementById('token').value;
                     const new_password = document.getElementById('password').value;
+                    const confirm_new_password = document.getElementById('confirm_password').value;
                     const msg = document.getElementById('msg');
+                    
+                    if (new_password !== confirm_new_password) {
+                        msg.textContent = '❌ Las contraseñas no coinciden.';
+                        msg.className = 'error';
+                        return;
+                    }
+
                     msg.textContent = 'Procesando...';
                     msg.className = '';
 
@@ -342,7 +356,7 @@ app.get('/reset-password-web', (req, res) => {
                         const res = await fetch('/reset_password', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ token, new_password })
+                            body: JSON.stringify({ token, new_password, confirm_new_password })
                         });
                         const data = await res.json();
                         if (res.ok) {
