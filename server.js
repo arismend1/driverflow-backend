@@ -12,6 +12,7 @@ const Database = require('better-sqlite3');
 const { nowIso, nowEpochMs } = require('./time_provider');
 const { enforceCompanyCanOperate } = require('./access_control');
 const sgMail = require('@sendgrid/mail'); // SendGrid Integration
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(express.json());
@@ -219,7 +220,12 @@ const initDb = () => {
     };
 
     safeAddColumn('drivers', 'email_verified', 'INTEGER DEFAULT 0');
+    safeAddColumn('drivers', 'email_verification_token_hash', 'TEXT');
+    safeAddColumn('drivers', 'email_verification_expires_at', 'INTEGER');
+
     safeAddColumn('empresas', 'email_verified', 'INTEGER DEFAULT 0');
+    safeAddColumn('empresas', 'email_verification_token_hash', 'TEXT');
+    safeAddColumn('empresas', 'email_verification_expires_at', 'INTEGER');
 
     console.log('[DB] Tables Verified.');
 };
@@ -239,6 +245,20 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+// --- RATE LIMITERS ---
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20, // Limit each IP to 20 requests per windowMs
+    message: { error: 'TOO_MANY_REQUESTS', message: 'Too many attempts, please try again later.' }
+});
+
+const emailLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5, // Limit resend/forgot to 5 per hour per IP
+    message: { error: 'TOO_MANY_REQUESTS', message: 'Email limit reached. Try again later.' }
+});
+
 
 // --- ENDPOINTS ---
 
@@ -275,39 +295,41 @@ app.get('/debug/db', (req, res) => {
     }
 });
 
-// Helper for sending verification email
+// Helper for sending verification email (DB Columns Approach)
 const sendVerificationEmail = async (userType, userId, email, nombre) => {
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
 
-    // Invalidate old tokens
-    db.prepare('DELETE FROM email_verifications WHERE user_id = ? AND user_type = ?').run(userId, userType);
-
-    db.prepare('INSERT INTO email_verifications (user_type, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(userType, userId, tokenHash, expiresAt, Date.now());
+    // Update User Row
+    const table = userType === 'driver' ? 'drivers' : 'empresas';
+    db.prepare(`UPDATE ${table} SET email_verification_token_hash = ?, email_verification_expires_at = ? WHERE id = ?`)
+        .run(tokenHash, expiresAt, userId);
 
     const deepLinkBase = process.env.APP_DEEPLINK_BASE || 'driverflow://';
-    // Ensure base ends with slash or valid scheme separator if missing (simplistic check)
-    // Actually user says APP_DEEPLINK_BASE="driverflow://" so we construct carefully
     const link = `${deepLinkBase}verify-email?token=${token}`;
+    const fromEmail = process.env.FROM_EMAIL || 'no-reply@driverflow.app';
 
     console.log(`[VERIFY EMAIL] Generated for ${email}: ${link}`);
 
     if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
         const msg = {
             to: email,
-            from: process.env.FROM_EMAIL || 'noreply@driverflow.com',
+            from: fromEmail,
             subject: 'DriverFlow: Verify your email',
             text: `Welcome ${nombre}! Please verify your email here: ${link}`,
-            html: `<p>Welcome ${nombre}!</p><p>Please <a href="${link}">click here to verify your email</a>.</p>`,
+            html: `<div style="font-family: Arial, sans-serif; padding: 20px;"><h2>Welcome ${nombre}!</h2><p>Please verify your email on your <strong>mobile device</strong>:</p><p><a href="${link}" style="background-color: #007BFF; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Verify Email</a></p><p style="font-size: 12px; color: #666;">(If on desktop, please open on your phone.)</p><p style="font-size: 12px; color: #999;">Link: ${link}</p></div>`,
         };
         try {
             await sgMail.send(msg);
             console.log(`[EMAIL] Verification sent to ${email}`);
         } catch (error) {
-            console.error('[EMAIL ERROR] SendGrid failed:', error);
-            // Don't throw, let flow continue (soft fail)
+            console.error('[EMAIL ERROR] SendGrid failed:', error.response ? error.response.body : error);
+            // Don't throw, let flow continue (soft fail, but logged)
+        }
+    } else {
+        if (process.env.NODE_ENV === 'production') {
+            console.error('[CRITICAL] Missing or Invalid SENDGRID_API_KEY in Production! Email not sent.');
         }
     }
 };
@@ -356,7 +378,12 @@ app.post('/register', async (req, res, next) => {
             // Send Verification
             await sendVerificationEmail('driver', info.lastInsertRowid, contacto, nombre);
 
-            return res.status(201).json({ id: info.lastInsertRowid, type: 'driver', message: 'Account created. Please verify your email.' });
+            return res.status(201).json({
+                id: info.lastInsertRowid,
+                type: 'driver',
+                message: 'Account created. Please verify your email.',
+                require_email_verification: true
+            });
 
         } else if (type === 'empresa') {
             // Check existence first
@@ -371,7 +398,12 @@ app.post('/register', async (req, res, next) => {
             // Send Verification
             await sendVerificationEmail('empresa', info.lastInsertRowid, contacto, nombre);
 
-            return res.status(201).json({ id: info.lastInsertRowid, type: 'empresa', message: 'Account created. Please verify your email.' });
+            return res.status(201).json({
+                id: info.lastInsertRowid,
+                type: 'empresa',
+                message: 'Account created. Please verify your email.',
+                require_email_verification: true
+            });
         }
         res.status(400).json({ error: 'Invalid type' });
     } catch (err) {
@@ -416,28 +448,37 @@ app.post('/login', async (req, res, next) => {
     }
 });
 
-// 2.5 Verify Verification Email
+// 2.5 Verify Verification Email (Column Approach)
 app.post('/verify_email', async (req, res, next) => {
     try {
         const { token } = req.body;
         if (!token) return res.status(400).json({ error: 'MISSING_FIELDS' });
 
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-        const record = db.prepare('SELECT * FROM email_verifications WHERE token_hash = ? AND used_at IS NULL').get(tokenHash);
 
-        if (!record) {
+        // Search in Drivers then Empresas
+        let user = db.prepare('SELECT id, "driver" as type, email_verification_expires_at as expires, email_verified FROM drivers WHERE email_verification_token_hash = ?').get(tokenHash);
+
+        if (!user) {
+            user = db.prepare('SELECT id, "empresa" as type, email_verification_expires_at as expires, email_verified FROM empresas WHERE email_verification_token_hash = ?').get(tokenHash);
+        }
+
+        if (!user) {
             return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
         }
-        if (Date.now() > record.expires_at) {
+
+        if (user.email_verified === 1) {
+            return res.json({ success: true, message: 'Already verified.' });
+        }
+
+        if (Date.now() > user.expires) {
             return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
         }
 
         // Mark user verified
-        const table = record.user_type === 'driver' ? 'drivers' : 'empresas';
-        db.transaction(() => {
-            db.prepare(`UPDATE ${table} SET email_verified = 1 WHERE id = ?`).run(record.user_id);
-            db.prepare('UPDATE email_verifications SET used_at = ? WHERE id = ?').run(Date.now(), record.id);
-        })();
+        const table = user.type === 'driver' ? 'drivers' : 'empresas';
+
+        const info = db.prepare(`UPDATE ${table} SET email_verified = 1, email_verification_token_hash = NULL, email_verification_expires_at = NULL WHERE id = ?`).run(user.id);
 
         res.json({ success: true, message: 'Email verified successfully.' });
 
