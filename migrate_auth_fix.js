@@ -40,6 +40,9 @@ const schema = [
     { table: 'empresas', col: 'reset_expires', type: 'TEXT' },
     { table: 'empresas', col: 'search_status', type: 'TEXT', def: "'ON'" },
     { table: 'empresas', col: 'created_at', type: 'TEXT' }, // Fix for legacy schema mismatch
+    { table: 'empresas', col: 'legal_name', type: 'TEXT' },
+    { table: 'empresas', col: 'address_line1', type: 'TEXT' },
+    { table: 'empresas', col: 'city', type: 'TEXT' },
 
     // OUTBOX
     { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' }

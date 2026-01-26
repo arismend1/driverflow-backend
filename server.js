@@ -125,10 +125,10 @@ app.post('/register', async (req, res) => {
             // Empresa
             const { legal_name, address_line1, address_city } = extras; // minimal fields for strictness
             const stmt = db.prepare(`
-                INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, verified, verification_token, verification_expires, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             `);
-            const info = stmt.run(nombre, contacto, hashedPassword, legal_name || nombre, address_line1 || '', address_city || '', token, expires, now);
+            const info = stmt.run(nombre, contacto, hashedPassword, legal_name || nombre, address_line1 || '', address_city || '', address_city || '', token, expires, now);
 
             // Outbox
             db.prepare(`
