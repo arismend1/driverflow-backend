@@ -81,7 +81,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGIN
 // --- Rate Limiter (In-Memory) ---
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
-const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX) || 5;
 
 function checkRateLimit(ip, type) {
     const key = `${ip}:${type}`;
@@ -146,6 +146,15 @@ app.post('/register', async (req, res) => {
     if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
     if (!nombre || !contacto || !password) return res.status(400).json({ error: 'Missing basic fields' });
 
+    // Rate Limit
+    if (!checkRateLimit(req.ip, 'register')) return res.status(429).json({ error: 'RATE_LIMITED' });
+
+    // Strict Email Regex
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(contacto)) {
+        return res.status(400).json({ error: 'INVALID_EMAIL_FORMAT' });
+    }
+
     // Password Policy
     if (req.body.confirm_password && req.body.confirm_password !== password) {
         return res.status(400).json({ error: 'PASSWORDS_DO_NOT_MATCH' });
@@ -207,8 +216,17 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
     const row = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(contacto);
 
+    // Rate Limit
+    if (!checkRateLimit(req.ip, 'login')) return res.status(429).json({ error: 'RATE_LIMITED' });
+
     // Generic error for security
     if (!row) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+    // LOCKOUT CHECK
+    if (row.lockout_until && new Date(row.lockout_until) > new Date()) {
+        const remaining = Math.ceil((new Date(row.lockout_until) - new Date()) / 60000);
+        return res.status(403).json({ error: 'ACCOUNT_LOCKED', message: `Cuenta bloqueada temporalmente. Intenta en ${remaining} min.` });
+    }
 
     // STRICT VERIFICATION CHECK
     if (row.verified !== 1) {
@@ -216,10 +234,30 @@ app.post('/login', async (req, res) => {
     }
 
     if (await bcrypt.compare(password, row.password_hash)) {
+        // RESET LOCKOUT ON SUCCESS
+        if (row.failed_attempts > 0 || row.lockout_until) {
+            db.prepare(`UPDATE ${table} SET failed_attempts = 0, lockout_until = NULL WHERE id = ?`).run(row.id);
+        }
+
         const payload = { id: row.id, type: type };
         const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
         res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
     } else {
+        // INCREMENT FAILED ATTEMPTS
+        const newAttempts = (row.failed_attempts || 0) + 1;
+        let updateSql = `UPDATE ${table} SET failed_attempts = ?`;
+        const params = [newAttempts];
+
+        if (newAttempts >= 5) {
+            const lockoutTime = new Date(Date.now() + 15 * 60000).toISOString();
+            updateSql += `, lockout_until = ?`;
+            params.push(lockoutTime);
+        }
+        updateSql += ` WHERE id = ?`;
+        params.push(row.id);
+
+        db.prepare(updateSql).run(...params);
+
         res.status(401).json({ error: 'Credenciales inválidas' });
     }
 });
@@ -404,6 +442,36 @@ app.post('/reset_password', async (req, res) => {
     db.prepare(`UPDATE ${table} SET password_hash = ?, reset_token = NULL WHERE id = ?`).run(hashedPassword, user.id);
 
     res.json({ ok: true });
+});
+
+// --- Delete Account (Soft Delete + Anonymize) ---
+app.post('/delete_account', authenticateToken, async (req, res) => {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Password required' });
+
+    const table = req.user.type === 'driver' ? 'drivers' : 'empresas';
+    const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(req.user.id);
+
+    if (!row) return res.sendStatus(404);
+
+    if (!(await bcrypt.compare(password, row.password_hash))) {
+        return res.status(401).json({ error: 'Contraseña incorrecta' });
+    }
+
+    const now = nowIso();
+    const anonContact = `deleted_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+    db.prepare(`
+        UPDATE ${table} 
+        SET status = 'DELETED', 
+            contacto = ?, 
+            nombre = 'Deleted User', 
+            password_hash = '', 
+            search_status = 'OFF' 
+        WHERE id = ?
+    `).run(anonContact, req.user.id);
+
+    res.json({ success: true, message: 'Cuenta eliminada correctamente.' });
 });
 
 // 1.1 Activation / Search Status Toggle - NEW

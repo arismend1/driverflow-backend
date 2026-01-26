@@ -43,6 +43,12 @@ const schema = [
     { table: 'empresas', col: 'legal_name', type: 'TEXT' },
     { table: 'empresas', col: 'address_line1', type: 'TEXT' },
     { table: 'empresas', col: 'city', type: 'TEXT' },
+    { table: 'empresas', col: 'failed_attempts', type: 'INTEGER', def: 0 },
+    { table: 'empresas', col: 'lockout_until', type: 'TEXT' },
+
+    // DRIVERS (Append missing lockout cols)
+    { table: 'drivers', col: 'failed_attempts', type: 'INTEGER', def: 0 },
+    { table: 'drivers', col: 'lockout_until', type: 'TEXT' },
 
     // OUTBOX
     { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' }
