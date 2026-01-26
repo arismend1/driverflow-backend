@@ -955,6 +955,73 @@ app.post('/verify-email', (req, res) => {
     res.json({ success: true, message: 'Email verified successfully.' });
 });
 
+// 1.4 Forgot Password
+app.post('/forgot_password', (req, res) => {
+    const { type, contact, email } = req.body;
+    const target = contact || email;
+    if (!target) return res.status(400).json({ error: 'Email/Contact required' });
+
+    // We try to find in both if type not specified, or specific if specified
+    // For MVP security, we won't reveal if user exists or not, always return success.
+    // But we need to define which table.
+
+    // Simple logic: Try user supplied type or search both
+    let usersFound = [];
+
+    if (type === 'driver' || !type) {
+        const u = db.prepare("SELECT id, nombre, contacto, 'driver' as type FROM drivers WHERE contacto = ?").get(target);
+        if (u) usersFound.push(u);
+    }
+    if (type === 'empresa' || (!type && usersFound.length === 0)) {
+        const u = db.prepare("SELECT id, nombre, contacto, 'empresa' as type FROM empresas WHERE contacto = ?").get(target);
+        if (u) usersFound.push(u);
+    }
+
+    if (usersFound.length > 0) {
+        const user = usersFound[0];
+        const table = user.type === 'driver' ? 'drivers' : 'empresas';
+        const token = crypto.randomBytes(32).toString('hex');
+        const now = nowIso();
+        const expires = new Date(Date.now() + 1 * 3600000).toISOString(); // 1 hour
+
+        db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
+
+        // Emit Event
+        const idCol = user.type === 'driver' ? 'driver_id' : 'company_id';
+        db.prepare(`
+            INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata)
+            VALUES (?, ?, ?, ?)
+        `).run('recovery_email', now, user.id, JSON.stringify({ token, email: user.contacto, name: user.nombre, user_type: user.type }));
+    }
+
+    // Always 200
+    res.json({ success: true, message: 'If account exists, email sent.' });
+});
+
+// 1.5 Reset Password
+app.post('/reset_password', async (req, res) => {
+    const { token, new_password } = req.body;
+    if (!token || !new_password) return res.status(400).json({ error: 'Missing token or password' });
+
+    let user = db.prepare("SELECT id, 'driver' as type, reset_expires FROM drivers WHERE reset_token = ?").get(token);
+    if (!user) {
+        user = db.prepare("SELECT id, 'empresa' as type, reset_expires FROM empresas WHERE reset_token = ?").get(token);
+    }
+
+    if (!user) return res.status(404).json({ error: 'Invalid or expired token' });
+
+    if (new Date(user.reset_expires) < new Date()) {
+        return res.status(400).json({ error: 'Token expired' });
+    }
+
+    const hashedPassword = await bcrypt.hash(new_password, 10);
+    const table = user.type === 'driver' ? 'drivers' : 'empresas';
+
+    db.prepare(`UPDATE ${table} SET password_hash = ?, reset_token = NULL, reset_expires = NULL WHERE id = ?`).run(hashedPassword, user.id);
+
+    res.json({ success: true, message: 'Password updated. Login now.' });
+});
+
 // 8. Payment Webhook (Stripe/Provider) - NEW
 // 8. Payment Webhook (Stripe/Provider) - SECURE & IDEMPOTENT (REQ 3)
 app.post('/webhooks/payment', (req, res) => {

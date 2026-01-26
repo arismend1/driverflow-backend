@@ -242,6 +242,25 @@ async function run() {
       });
     }
 
+    // --- 5. Recovery Email (Forgotten Password) ---
+    else if (ev.event_name === 'recovery_email') {
+      const meta = JSON.parse(ev.metadata || "{}");
+      const token = meta.token;
+      const email = meta.email;
+      const name = meta.name || "Usuario";
+
+      if (!token || !email) {
+        sqlMarkFailed.run(nowSql(), "Missing token/email for recovery", ev.id);
+        continue;
+      }
+
+      messages.push({
+        to: email,
+        subject: "Recuperar Contraseña - DriverFlow",
+        body: `Hola ${name},\n\nRecibimos una solicitud para restablecer tu contraseña.\n\nUsa este enlace para crear una nueva contraseña:\n\ndriverflow://reset?token=${token}\n\nSi no solicitaste esto, ignora este correo.\n`
+      });
+    }
+
 
     // --- Execute Sending ---
 
