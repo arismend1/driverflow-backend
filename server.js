@@ -930,14 +930,41 @@ app.post('/resend-verification', (req, res) => {
     }
 });
 
-// 1.3 Verify Email
+// 1.3 Verify Email (WEB GET) - NEW
+app.get('/verify-email', (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.send('<h1>Error: Missing Token</h1>');
+
+    let user = db.prepare("SELECT id, 'driver' as type, verification_expires FROM drivers WHERE verification_token = ?").get(token);
+    if (!user) {
+        user = db.prepare("SELECT id, 'empresa' as type, verification_expires FROM empresas WHERE verification_token = ?").get(token);
+    }
+
+    if (!user) return res.send('<h1>Error: Invalid or Expired Token</h1>');
+
+    if (new Date(user.verification_expires) < new Date()) {
+        return res.send('<h1>Error: Token Expired</h1>');
+    }
+
+    const table = user.type === 'driver' ? 'drivers' : 'empresas';
+    db.prepare(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`).run(user.id);
+
+    // Deep Link Redirect or simple Success Page
+    res.send(`
+        <html>
+            <body>
+                <h1 style="color:green">Email Verified!</h1>
+                <p>You can now login to the app.</p>
+                <script>window.location.href = "driverflow://login";</script>
+            </body>
+        </html>
+    `);
+});
+
+// 1.3 Verify Email (API POST)
 app.post('/verify-email', (req, res) => {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Missing token' });
-
-    // Check both tables (naive but effective for small scale)
-    // Actually standard flow would pass type/id? Or just unique token?
-    // Let's search both.
 
     let user = db.prepare("SELECT id, 'driver' as type, verification_expires FROM drivers WHERE verification_token = ?").get(token);
     if (!user) {
@@ -958,20 +985,29 @@ app.post('/verify-email', (req, res) => {
 
 // 1.4 Forgot Password
 // 1.4 Forgot Password (Anti-Enumeration)
+// 1.4 Forgot Password (Anti-Enumeration)
 app.post('/forgot_password', (req, res) => {
-    const { type, contact, email } = req.body;
-    const target = contact || email;
-    // Return 200 even if missing params to avoid probing? Maybe too strict.
-    if (!target) return res.status(400).json({ error: 'Email required' });
+    let { type, contact, email } = req.body;
+
+    // Normalization
+    type = (type || '').trim().toLowerCase();
+    if (type === 'company') type = 'empresa'; // Alias
+
+    let target = contact || email;
+    if (target) target = target.trim().toLowerCase();
+
+    // Return 200 even if missing params to avoid probing
+    if (!target) return res.status(200).json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
 
     // Search logic (Internal)
     let usersFound = [];
     if (type === 'driver' || !type) {
-        const u = db.prepare("SELECT id, nombre, contacto, 'driver' as type FROM drivers WHERE contacto = ?").get(target);
+        // Try exact match first
+        const u = db.prepare("SELECT id, nombre, contacto, 'driver' as type FROM drivers WHERE lower(contacto) = ?").get(target);
         if (u) usersFound.push(u);
     }
-    if (type === 'empresa' || (!type && usersFound.length === 0)) {
-        const u = db.prepare("SELECT id, nombre, contacto, 'empresa' as type FROM empresas WHERE contacto = ?").get(target);
+    if ((type === 'empresa' || !type) && usersFound.length === 0) {
+        const u = db.prepare("SELECT id, nombre, contacto, 'empresa' as type FROM empresas WHERE lower(contacto) = ?").get(target);
         if (u) usersFound.push(u);
     }
 
@@ -996,27 +1032,36 @@ app.post('/forgot_password', (req, res) => {
 });
 
 // 1.2 Resend Verification (Anti-Enumeration)
+// 1.2 Resend Verification (Anti-Enumeration)
 app.post(['/resend-verification', '/resend_verification'], (req, res) => {
-    const { type, contact, email } = req.body;
-    const targetEmail = contact || email;
-    if (!targetEmail) return res.status(400).json({ error: 'Email required' });
+    let { type, contact, email } = req.body;
+
+    // Normalization
+    type = (type || '').trim().toLowerCase();
+    if (type === 'company') type = 'empresa';
+
+    let targetEmail = contact || email;
+    if (targetEmail) targetEmail = targetEmail.trim().toLowerCase();
+
+    if (!targetEmail) return res.status(200).json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
 
     let user = null;
     let table = '';
 
     // Check Driver
     if (!type || type === 'driver') {
-        const d = db.prepare('SELECT id, nombre, verified, contacto FROM drivers WHERE contacto = ?').get(targetEmail);
+        const d = db.prepare('SELECT id, nombre, verified, contacto, verification_token FROM drivers WHERE lower(contacto) = ?').get(targetEmail);
         if (d) { user = d; table = 'drivers'; }
     }
     // Check Company
-    if (!user && (!type || type === 'empresa' || type === 'company')) {
-        const c = db.prepare('SELECT id, nombre, verified, contacto FROM empresas WHERE contacto = ?').get(targetEmail);
+    if (!user && (!type || type === 'empresa')) {
+        const c = db.prepare('SELECT id, nombre, verified, contacto, verification_token FROM empresas WHERE lower(contacto) = ?').get(targetEmail);
         if (c) { user = c; table = 'empresas'; }
     }
 
     // If user found & NOT verified -> Send Email
     if (user && user.verified === 0) {
+        // Idempotency: don't regenerate if recent? For MVP regenerate is safer.
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
         const expires = new Date(Date.now() + 24 * 3600000).toISOString();

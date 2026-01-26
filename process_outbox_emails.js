@@ -95,7 +95,10 @@ const sqlRequeue = db.prepare(`
 `);
 
 // Main
-async function run() {
+// Main Polling Loop
+const POLL_INTERVAL_MS = 10000; // 10 seconds
+
+async function runOnce() {
   const events = db.prepare(`
     SELECT * FROM events_outbox
     WHERE process_status='pending'
@@ -103,8 +106,9 @@ async function run() {
     LIMIT 50
   `).all();
 
-  console.log(`Found ${events.length} pending events.`);
-  if (events.length === 0) return;
+  if (events.length > 0) {
+    console.log(`Found ${events.length} pending events.`);
+  }
 
   for (const ev of events) {
     console.log(`\nProcessing Event #${ev.id} [${ev.event_name}]`);
@@ -121,6 +125,7 @@ async function run() {
 
     // List of emails to send for this event
     let messages = []; // { to, subject, body }
+    const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
 
     // --- 1. Company Events ---
     if (["company_registered", "invoice_generated", "invoice_paid", "potential_match_company"].includes(ev.event_name)) {
@@ -235,10 +240,11 @@ async function run() {
         continue;
       }
 
+      const link = `${API_URL}/verify-email?token=${token}`;
       messages.push({
         to: email,
         subject: "Verify your email - DriverFlow",
-        body: `Hola ${name},\n\nGracias por registrarte en DriverFlow.\n\nPara activar tu cuenta, toca el siguiente enlace:\n\ndriverflow://verify-email?token=${token}&type=${meta.user_type || 'driver'}\n\nSi no funciona, usa tu token manual: ${token}\n`
+        body: `Hola ${name},\n\nGracias por registrarte en DriverFlow.\n\nPara activar tu cuenta, toca el siguiente enlace:\n\n${link}\n\nSi no funciona, usa tu token manual: ${token}\n(Deep Link App: driverflow://verify-email?token=${token})\n`
       });
     }
 
@@ -254,10 +260,11 @@ async function run() {
         continue;
       }
 
+      const link = `${API_URL}/reset-password-web?token=${token}`;
       messages.push({
         to: email,
         subject: "Recuperar Contraseña - DriverFlow",
-        body: `Hola ${name},\n\nRecibimos una solicitud para restablecer tu contraseña.\n\nToca aquí para crear una nueva:\n\ndriverflow://reset-password?token=${token}\n\nSi no solicitaste esto, ignora este mensaje.\n`
+        body: `Hola ${name},\n\nRecibimos una solicitud para restablecer tu contraseña.\n\nToca aquí para crear una nueva:\n\n${link}\n\n(Deep Link App: driverflow://reset-password?token=${token})\n\nSi no solicitaste esto, ignora este mensaje.\n`
       });
     }
 
@@ -305,8 +312,7 @@ async function run() {
         if (msg.includes("CRITICAL_AUTH_FAIL") || msg.includes("SENDER_IDENTITY_FAIL")) {
           sqlMarkFailed.run(nowSql(), msg, ev.id);
           console.error("⛔ FATAL CONFIG ERROR. Aborting batch.");
-          process.exitCode = 1;
-          return;
+          return; // Stop processing current batch, wait for next poll (or could exit)
         }
 
         // Retryable?
@@ -331,11 +337,16 @@ async function run() {
   }
 }
 
-run()
-  .catch(e => {
-    console.error("Global Error:", e);
-    process.exitCode = 1;
-  })
-  .finally(() => {
-    try { db.close(); } catch { }
-  });
+async function startWorker() {
+  console.log(`Worker started with poll interval ${POLL_INTERVAL_MS}ms`);
+  while (true) {
+    try {
+      await runOnce();
+    } catch (e) {
+      console.error("Worker Global Error:", e);
+    }
+    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
+
+startWorker();
