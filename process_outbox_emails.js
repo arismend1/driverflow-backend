@@ -222,22 +222,23 @@ async function run() {
       // Important: continue fallback logic down below to send
     }
 
-    // --- 4. Password Reset ---
-    else if (ev.event_name === 'password_reset_sent') {
-      const rawPayload = ev.payload || ev.payload_json || ev.event_payload || ev.metadata || "{}";
-      let p = {};
-      try { p = JSON.parse(rawPayload); } catch (_) { p = {}; }
+    // --- 4. Verification Email (NEW) ---
+    else if (ev.event_name === 'verification_email') {
+      const meta = JSON.parse(ev.metadata || "{}");
+      const token = meta.token;
+      const email = meta.email;
+      const name = meta.name || "User";
 
-      if (!p.to_email || !p.temp_password) {
-        sqlMarkFailed.run(nowSql(), "Missing email or temp_password", ev.id);
-        console.log("❌ Failed: Missing payload data for reset");
+      if (!token || !email) {
+        sqlMarkFailed.run(nowSql(), "Missing token or email in metadata", ev.id);
+        console.log("❌ Failed: Missing verification data");
         continue;
       }
 
       messages.push({
-        to: p.to_email,
-        subject: "DriverFlow: Recuperación de Contraseña",
-        body: `Hola,\n\nHas solicitado restablecer tu contraseña.\n\nTu nueva contraseña temporal es: ${p.temp_password}\n\nPor favor, inicia sesión y cámbiala lo antes posible.\n`
+        to: email,
+        subject: "Verify your email - DriverFlow",
+        body: `Hola ${name},\n\nGracias por registrarte en DriverFlow.\n\nTu codigo de verificacion es: ${token}\n\nO usa este enlace (simulado): driverflow://verify?token=${token}\n`
       });
     }
 
