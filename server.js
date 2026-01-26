@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 // ⚠️ TIME AND ACCESS CONTROL IMPORTS
-// Assumes these files exist. If not, logic inside them is skipped for this file overwrite.
 const { nowIso, nowEpochMs } = require('./time_provider');
 const { enforceCompanyCanOperate } = require('./access_control');
 const sgMail = require('@sendgrid/mail'); // SendGrid Integration
@@ -23,6 +22,18 @@ const SECRET_KEY = process.env.JWT_SECRET || 'driverflow_secret_key_mvp';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'driverflow_admin_secret_123';
 const REQUEST_DURATION_MINUTES = 30;
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@driverflow.app';
+
+// 1. SendGrid Configuration Check (Blindaje en Producción)
+if (process.env.NODE_ENV === 'production') {
+    if (!SENDGRID_API_KEY || !SENDGRID_API_KEY.startsWith('SG.')) {
+        console.error('\x1b[31m%s\x1b[0m', '[CRITICAL] SENDGRID_API_KEY Missing or Invalid in Production!');
+        console.error('Email functionality will fail. Please set SENDGRID_API_KEY in Render.');
+    }
+    if (process.env.FROM_EMAIL && process.env.FROM_EMAIL.toLowerCase() !== 'no-reply@driverflow.app') {
+        console.warn('\x1b[33m%s\x1b[0m', '[WARNING] FROM_EMAIL should ideally be "no-reply@driverflow.app" securely verified.');
+    }
+}
 
 if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
     sgMail.setApiKey(SENDGRID_API_KEY);
@@ -37,8 +48,6 @@ let dbPath = process.env.DB_PATH;
 if (process.env.NODE_ENV === 'production') {
     // 1. Enforce Absolute Path in Production
     if (!dbPath) {
-        // Fallback requested by user. 
-        // NOTE: Ensure your Render Disk is mounted at /var/data or /data via Dashboard.
         dbPath = '/var/data/driverflow.db';
         console.log(`[DB] DB_PATH not set. Defaulting to: ${dbPath}`);
     }
@@ -220,12 +229,10 @@ const initDb = () => {
     };
 
     safeAddColumn('drivers', 'email_verified', 'INTEGER DEFAULT 0');
-    safeAddColumn('drivers', 'email_verification_token_hash', 'TEXT');
-    safeAddColumn('drivers', 'email_verification_expires_at', 'INTEGER');
+    safeAddColumn('drivers', 'email_verification_token', 'TEXT');
 
     safeAddColumn('empresas', 'email_verified', 'INTEGER DEFAULT 0');
-    safeAddColumn('empresas', 'email_verification_token_hash', 'TEXT');
-    safeAddColumn('empresas', 'email_verification_expires_at', 'INTEGER');
+    safeAddColumn('empresas', 'email_verification_token', 'TEXT');
 
     console.log('[DB] Tables Verified.');
 };
@@ -295,47 +302,58 @@ app.get('/debug/db', (req, res) => {
     }
 });
 
-// Helper for sending verification email (DB Columns Approach)
-const sendVerificationEmail = async (userType, userId, email, nombre) => {
+// Helper for sending verification email (GET Link Approach)
+const sendVerificationEmail = async (userType, userId, email, nombre, req) => {
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
 
     // Update User Row
     const table = userType === 'driver' ? 'drivers' : 'empresas';
-    db.prepare(`UPDATE ${table} SET email_verification_token_hash = ?, email_verification_expires_at = ? WHERE id = ?`)
-        .run(tokenHash, expiresAt, userId);
+    db.prepare(`UPDATE ${table} SET email_verification_token = ? WHERE id = ?`)
+        .run(tokenHash, userId);
 
-    const deepLinkBase = process.env.APP_DEEPLINK_BASE || 'driverflow://';
-    const link = `${deepLinkBase}verify-email?token=${token}`;
-    const fromEmail = process.env.FROM_EMAIL || 'no-reply@driverflow.app';
+    // Build HTTPS Link (API_URL)
+    const host = req.get('host');
+    const protocol = req.protocol;
+    const baseUrl = process.env.API_URL || `${protocol}://${host}`;
+    const link = `${baseUrl}/verify-email?token=${token}&type=${userType}`;
 
     console.log(`[VERIFY EMAIL] Generated for ${email}: ${link}`);
 
     if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
         const msg = {
             to: email,
-            from: fromEmail,
-            subject: 'DriverFlow: Verify your email',
-            text: `Welcome ${nombre}! Please verify your email here: ${link}`,
-            html: `<div style="font-family: Arial, sans-serif; padding: 20px;"><h2>Welcome ${nombre}!</h2><p>Please verify your email on your <strong>mobile device</strong>:</p><p><a href="${link}" style="background-color: #007BFF; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Verify Email</a></p><p style="font-size: 12px; color: #666;">(If on desktop, please open on your phone.)</p><p style="font-size: 12px; color: #999;">Link: ${link}</p></div>`,
+            from: FROM_EMAIL,
+            subject: 'DriverFlow: Confirma tu cuenta',
+            text: `Hola ${nombre}, confirma tu cuenta aquí: ${link}`,
+            html: `<div style="font-family: Arial, sans-serif; padding: 20px;">
+                    <h2>¡Bienvenido a DriverFlow!</h2>
+                    <p>Hola ${nombre},</p>
+                    <p>Gracias por registrarte. Para comenzar, por favor confirma tu dirección de correo electrónico:</p>
+                    <p>
+                        <a href="${link}" style="background-color: #28a745; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Confirmar Cuenta</a>
+                    </p>
+                    <p style="font-size: 12px; color: #666;">
+                        Si el botón no funciona, copia y pega este enlace en tu navegador:<br>
+                        ${link}
+                    </p>
+                   </div>`,
         };
         try {
             await sgMail.send(msg);
             console.log(`[EMAIL] Verification sent to ${email}`);
         } catch (error) {
             console.error('[EMAIL ERROR] SendGrid failed:', error.response ? error.response.body : error);
-            // Don't throw, let flow continue (soft fail, but logged)
         }
     } else {
         if (process.env.NODE_ENV === 'production') {
-            console.error('[CRITICAL] Missing or Invalid SENDGRID_API_KEY in Production! Email not sent.');
+            console.error('[CRITICAL-RUNTIME] Sending failed: No API Key.');
         }
     }
 };
 
 // 1. Register
-app.post('/register', async (req, res, next) => {
+app.post('/register', authLimiter, async (req, res, next) => {
     try {
         const { type, nombre, password, confirm_password, ...extras } = req.body;
         // 1. Normalize identifier (Priority: contacto > email > contact > phone)
@@ -353,13 +371,6 @@ app.post('/register', async (req, res, next) => {
 
         // Email format validation (basic)
         if (!contacto.includes('@')) {
-            // If we really want to enforce email (since phone doesn't support email verification logic nicely)
-            // Requirement says "Verificación de correo obligatoria". So must be email.
-            // But existing code supported phone? "contact or phone".
-            // We will assume for this robust phase, we prefer email. If phone provided, we can't send email.
-            // Let's Warn or Reject. User said "Forgot password request JSON ... aceptar email, si llega phone rechazar".
-            // For register, likely same.
-            // Let's assume strict email for now or allow it but skip verification if it looks like phone? NO, Requisito B says "Obligatoria".
             return res.status(400).json({ error: 'EMAIL_REQUIRED_FOR_VERIFICATION' });
         }
 
@@ -376,13 +387,10 @@ app.post('/register', async (req, res, next) => {
             const info = stmt.run(nombre, contacto, hashedPassword, tipo_licencia);
 
             // Send Verification
-            await sendVerificationEmail('driver', info.lastInsertRowid, contacto, nombre);
+            await sendVerificationEmail('driver', info.lastInsertRowid, contacto, nombre, req);
 
             return res.status(201).json({
-                id: info.lastInsertRowid,
-                type: 'driver',
-                message: 'Account created. Please verify your email.',
-                require_email_verification: true
+                message: 'Registro exitoso. Revisa tu correo para confirmar tu cuenta.'
             });
 
         } else if (type === 'empresa') {
@@ -396,13 +404,10 @@ app.post('/register', async (req, res, next) => {
             const info = stmt.run(nombre, contacto, hashedPassword, extras.address_city, extras.legal_name, extras.address_line1, extras.contact_person, extras.contact_phone, nowIso());
 
             // Send Verification
-            await sendVerificationEmail('empresa', info.lastInsertRowid, contacto, nombre);
+            await sendVerificationEmail('empresa', info.lastInsertRowid, contacto, nombre, req);
 
             return res.status(201).json({
-                id: info.lastInsertRowid,
-                type: 'empresa',
-                message: 'Account created. Please verify your email.',
-                require_email_verification: true
+                message: 'Registro exitoso. Revisa tu correo para confirmar tu cuenta.'
             });
         }
         res.status(400).json({ error: 'Invalid type' });
@@ -413,7 +418,7 @@ app.post('/register', async (req, res, next) => {
 });
 
 // 2. Login
-app.post('/login', async (req, res, next) => {
+app.post('/login', authLimiter, async (req, res, next) => {
     try {
         const { type, password } = req.body;
         // 1. Normalize identifier
@@ -448,52 +453,52 @@ app.post('/login', async (req, res, next) => {
     }
 });
 
-// 2.5 Verify Verification Email (Column Approach)
-app.post('/verify_email', async (req, res, next) => {
+// 2.5 Verify Email (GET Endpoint for Browser Link)
+app.get('/verify-email', async (req, res, next) => {
     try {
-        const { token } = req.body;
-        if (!token) return res.status(400).json({ error: 'MISSING_FIELDS' });
+        const { token, type } = req.query; // GET params
+        if (!token || !type) return res.status(400).send('Faltan parámetros (token o type).');
 
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const table = type === 'driver' ? 'drivers' : (type === 'empresa' ? 'empresas' : null);
 
-        // Search in Drivers then Empresas
-        let user = db.prepare('SELECT id, "driver" as type, email_verification_expires_at as expires, email_verified FROM drivers WHERE email_verification_token_hash = ?').get(tokenHash);
+        if (!table) return res.status(400).send('Tipo de usuario inválido.');
+
+        // Find user by token hash
+        const user = db.prepare(`SELECT id, email_verified FROM ${table} WHERE email_verification_token = ?`).get(tokenHash);
 
         if (!user) {
-            user = db.prepare('SELECT id, "empresa" as type, email_verification_expires_at as expires, email_verified FROM empresas WHERE email_verification_token_hash = ?').get(tokenHash);
-        }
-
-        if (!user) {
-            return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
+            return res.status(400).send('<h1>Enlace inválido o expirado.</h1>');
         }
 
         if (user.email_verified === 1) {
-            return res.json({ success: true, message: 'Already verified.' });
+            return res.send('<h1>Tu cuenta ya está verificada. Puedes iniciar sesión en la app.</h1>');
         }
 
-        if (Date.now() > user.expires) {
-            return res.status(401).json({ error: 'TOKEN_INVALID_OR_EXPIRED' });
-        }
+        // Mark verified and clear token
+        db.prepare(`UPDATE ${table} SET email_verified = 1, email_verification_token = NULL WHERE id = ?`)
+            .run(user.id);
 
-        // Mark user verified
-        const table = user.type === 'driver' ? 'drivers' : 'empresas';
-
-        const info = db.prepare(`UPDATE ${table} SET email_verified = 1, email_verification_token_hash = NULL, email_verification_expires_at = NULL WHERE id = ?`).run(user.id);
-
-        res.json({ success: true, message: 'Email verified successfully.' });
+        res.send(`
+            <div style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #28a745;">¡Cuenta Verificada!</h1>
+                <p>Tu correo ha sido confirmado exitosamente.</p>
+                <p>Ya puedes volver a la aplicación DriverFlow e iniciar sesión.</p>
+            </div>
+        `);
 
     } catch (err) {
         next(err);
     }
 });
 
-// 2.6 Resend Verification
-app.post('/resend_verification', async (req, res, next) => {
+// 2.6 Resend Verification (Refactored for GET flow support)
+app.post('/resend_verification', emailLimiter, async (req, res, next) => {
     try {
         const { type, contact } = req.body;
         const email = (contact || "").trim().toLowerCase();
 
-        if (!email || !['driver', 'empresa'].includes(type)) {
+        if (!email || !['driver', 'empresa'].includes(type) || !req) {
             return res.status(400).json({ error: 'INVALID_REQUEST' });
         }
 
@@ -501,10 +506,9 @@ app.post('/resend_verification', async (req, res, next) => {
         const user = db.prepare(`SELECT id, nombre, email_verified FROM ${table} WHERE lower(contacto) = ?`).get(email);
 
         if (user && user.email_verified === 0) {
-            await sendVerificationEmail(type, user.id, email, user.nombre);
+            await sendVerificationEmail(type, user.id, email, user.nombre, req);
         }
-        // Always return success
-        res.json({ success: true, message: 'If account exists and is unverified, email sent.' });
+        res.json({ success: true, message: 'Si la cuenta existe, se ha enviado un nuevo correo.' });
 
     } catch (err) {
         next(err);
@@ -513,7 +517,7 @@ app.post('/resend_verification', async (req, res, next) => {
 
 
 // 3. Forgot Password
-app.post('/forgot_password', (req, res, next) => {
+app.post('/forgot_password', emailLimiter, (req, res, next) => {
     try {
         const { type } = req.body;
         const contact = (req.body.contact || req.body.email || req.body.phone || req.body.contacto || "").trim().toLowerCase();
@@ -548,7 +552,7 @@ app.post('/forgot_password', (req, res, next) => {
             if (SENDGRID_API_KEY && SENDGRID_API_KEY.startsWith('SG.')) {
                 const msg = {
                     to: contact,
-                    from: process.env.FROM_EMAIL || 'noreply@driverflow.com',
+                    from: FROM_EMAIL,
                     subject: 'DriverFlow: Reset Password',
                     text: `Reset your password here: ${link}`,
                     html: `<p>Click here to reset your password:</p><a href="${link}">Reset Password</a>`,
@@ -570,7 +574,7 @@ app.post('/forgot_password', (req, res, next) => {
 });
 
 // 4. Reset Password
-app.post('/reset_password', async (req, res, next) => {
+app.post('/reset_password', authLimiter, async (req, res, next) => {
     try {
         const { token, new_password, confirm_password } = req.body;
 
