@@ -21,18 +21,24 @@ try {
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT,
-                idempotency_key TEXT UNIQUE
+                idempotency_key TEXT UNIQUE,
+                source_event_id INTEGER
             )
         `).run();
 
         // 1.1 Check for Schema Drift (source_event_id)
-        // 1.1 Check for Schema Drift (source_event_id)
-        const jqInfo = db.prepare("PRAGMA table_info(jobs_queue)").all();
-        if (!jqInfo.find(c => c.name === 'source_event_id')) {
-            db.prepare("ALTER TABLE jobs_queue ADD COLUMN source_event_id INTEGER").run();
-            // Add unique index separately
+        try {
+            const jqInfo = db.prepare("PRAGMA table_info(jobs_queue)").all();
+            if (!jqInfo.find(c => c.name === 'source_event_id')) {
+                db.prepare("ALTER TABLE jobs_queue ADD COLUMN source_event_id INTEGER").run();
+                console.log('✅ Added source_event_id to jobs_queue (ALTER)');
+            }
+
+            // Ensure Index exists (Safe to run even if column exists)
             db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_source_event ON jobs_queue(source_event_id)").run();
-            console.log('✅ Added source_event_id to jobs_queue');
+
+        } catch (e) {
+            console.warn('⚠️ Minor Schema Drift Warning (Ignored):', e.message);
         }
 
         // 2. Indices
