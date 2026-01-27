@@ -15,7 +15,7 @@ const metrics = require('./metrics');
 
 // --- Producción: Strict Env Validation ---
 if (process.env.NODE_ENV === 'production') {
-    const requiredEnv = ['PORT', 'JWT_SECRET', 'DB_PATH', 'SENDGRID_API_KEY', 'FROM_EMAIL'];
+    const requiredEnv = ['PORT', 'JWT_SECRET', 'DB_PATH']; // SendGrid made optional to prevent boot-loop on limits
     const missing = requiredEnv.filter(key => !process.env[key]);
 
     if (missing.length > 0) {
