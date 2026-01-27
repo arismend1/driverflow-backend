@@ -1,0 +1,44 @@
+--- Running Auto-Migration (migrate_auth_fix.js) ---
+[AUTH MIGRATION] Starting on DB: driverflow.db 
+ℹ️  drivers.verified exists
+ℹ️  drivers.verification_token exists
+ℹ️  drivers.verification_expires exists
+ℹ️  drivers.reset_token exists
+ℹ️  drivers.reset_expires exists
+ℹ️  drivers.status exists
+ℹ️  drivers.search_status exists
+ℹ️  drivers.estado exists
+ℹ️  drivers.created_at exists
+ℹ️  empresas.verified exists
+ℹ️  empresas.verification_token exists
+ℹ️  empresas.verification_expires exists
+ℹ️  empresas.reset_token exists
+ℹ️  empresas.reset_expires exists
+ℹ️  empresas.search_status exists
+ℹ️  empresas.created_at exists
+ℹ️  empresas.legal_name exists
+ℹ️  empresas.address_line1 exists
+ℹ️  empresas.city exists
+ℹ️  empresas.failed_attempts exists
+ℹ️  empresas.lockout_until exists
+ℹ️  drivers.failed_attempts exists
+ℹ️  drivers.lockout_until exists
+ℹ️  events_outbox.ticket_id exists
+[AUTH MIGRATION] Completed Successfully.
+--- Migration Complete ---
+{"ts":"2026-01-26T13:28:50.150Z","level":"INFO","msg":"--- Email Processor Started ---","event":"worker_start"}
+{"ts":"2026-01-26T13:28:50.150Z","level":"INFO","msg":"DB Config","event":"worker_config","db_path":"driverflow.db ","dry_run":false}
+{"ts":"2026-01-26T13:28:50.153Z","level":"INFO","msg":"DB Check OK","event":"db_open_ok","count":65}
+--- Starting Integrated Email Worker ---
+{"ts":"2026-01-26T13:28:50.153Z","level":"INFO","msg":"Worker polling started","event":"worker_loop_start","interval_ms":30000}
+{"ts":"2026-01-26T13:28:50.153Z","level":"ERROR","msg":"Loop Error","event":"worker_loop_error","err":{"message":"no such table: worker_heartbeat","stack":"SqliteError: no such table: worker_heartbeat\n    at Database.prepare (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\better-sqlite3\\lib\\methods\\wrappers.js:5:21)\n    at Object.startWorker (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\process_outbox_emails.js:160:10)\n    at Object.<anonymous> (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\server.js:228:17)\n    at Module._compile (node:internal/modules/cjs/loader:1761:14)\n    at Object..js (node:internal/modules/cjs/loader:1893:10)\n    at Module.load (node:internal/modules/cjs/loader:1481:32)\n    at Module._load (node:internal/modules/cjs/loader:1300:12)\n    at TracingChannel.traceSync (node:diagnostics_channel:328:14)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:245:24)\n    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)","code":"SQLITE_ERROR"}}
+DriverFlow MVP server listening on port 3000
+{"ts":"2026-01-26T13:29:01.156Z","level":"INFO","msg":"HTTP Request","request_id":"90124949-e480-41bb-abe4-4f08c3475477","route":"/healthz","method":"GET","status":200,"duration_ms":"5.03","event":"http_request"}
+{"ts":"2026-01-26T13:29:01.163Z","level":"ERROR","msg":"Readiness Check Failed","event":"readyz_fail","err":{"message":"no such table: worker_heartbeat","stack":"SqliteError: no such table: worker_heartbeat\n    at Database.prepare (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\better-sqlite3\\lib\\methods\\wrappers.js:5:21)\n    at C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\server.js:154:23\n    at Layer.handleRequest (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\lib\\layer.js:152:17)\n    at next (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\lib\\route.js:157:13)\n    at Route.dispatch (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\lib\\route.js:117:3)\n    at handle (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\index.js:435:11)\n    at Layer.handleRequest (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\lib\\layer.js:152:17)\n    at C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\index.js:295:15\n    at processParams (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\index.js:582:12)\n    at next (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\router\\index.js:291:5)","code":"SQLITE_ERROR"}}
+{"ts":"2026-01-26T13:29:01.164Z","level":"INFO","msg":"HTTP Request","request_id":"c2133132-558f-4c63-a7db-783d22ab6809","route":"/readyz","method":"GET","status":503,"duration_ms":"3.41","event":"http_request"}
+{"ts":"2026-01-26T13:29:01.167Z","level":"INFO","msg":"HTTP Request","request_id":"eba7b076-6bb1-46e8-8653-e32dff2ceafb","route":"/metrics","method":"GET","status":200,"duration_ms":"0.93","event":"http_request"}
+{"ts":"2026-01-26T13:29:01.169Z","level":"INFO","msg":"HTTP Request","request_id":"2cb43f7a-fca3-45e2-9cce-273a352de424","route":"/metrics","method":"GET","status":200,"duration_ms":"0.41","event":"http_request"}
+{"ts":"2026-01-26T13:29:20.161Z","level":"ERROR","msg":"Loop Error","event":"worker_loop_error","err":{"message":"no such table: worker_heartbeat","stack":"SqliteError: no such table: worker_heartbeat\n    at Database.prepare (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\better-sqlite3\\lib\\methods\\wrappers.js:5:21)\n    at Object.startWorker (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\process_outbox_emails.js:160:10)\n    at runNextTicks (node:internal/process/task_queues:64:5)\n    at listOnTimeout (node:internal/timers:567:9)\n    at process.processTimers (node:internal/timers:541:7)","code":"SQLITE_ERROR"}}
+{"ts":"2026-01-26T13:29:50.167Z","level":"ERROR","msg":"Loop Error","event":"worker_loop_error","err":{"message":"no such table: worker_heartbeat","stack":"SqliteError: no such table: worker_heartbeat\n    at Database.prepare (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\node_modules\\better-sqlite3\\lib\\methods\\wrappers.js:5:21)\n    at Object.startWorker (C:\\Users\\dj23\\Desktop\\DriverFlow\\driverflow-mvp\\process_outbox_emails.js:160:10)\n    at runNextTicks (node:internal/process/task_queues:64:5)\n    at listOnTimeout (node:internal/timers:567:9)\n    at process.processTimers (node:internal/timers:541:7)","code":"SQLITE_ERROR"}}
+{"ts":"2026-01-26T13:30:20.176Z","level":"INFO","msg":"Worker Poll","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:30:20.177Z","level":"INFO","msg":"Processing 6 events...","event":"worker_poll_batch","count":6}

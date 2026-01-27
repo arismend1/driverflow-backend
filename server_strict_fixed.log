@@ -1,0 +1,125 @@
+--- Running Auto-Migration (migrate_auth_fix.js) ---
+[AUTH MIGRATION] Starting on DB: driverflow.db
+ℹ️  drivers.verified exists
+ℹ️  drivers.verification_token exists
+ℹ️  drivers.verification_expires exists
+ℹ️  drivers.reset_token exists
+ℹ️  drivers.reset_expires exists
+ℹ️  drivers.status exists
+ℹ️  drivers.search_status exists
+ℹ️  drivers.estado exists
+ℹ️  drivers.created_at exists
+ℹ️  empresas.verified exists
+ℹ️  empresas.verification_token exists
+ℹ️  empresas.verification_expires exists
+ℹ️  empresas.reset_token exists
+ℹ️  empresas.reset_expires exists
+ℹ️  empresas.search_status exists
+ℹ️  empresas.created_at exists
+ℹ️  empresas.legal_name exists
+ℹ️  empresas.address_line1 exists
+ℹ️  empresas.city exists
+ℹ️  empresas.failed_attempts exists
+ℹ️  empresas.lockout_until exists
+ℹ️  drivers.failed_attempts exists
+ℹ️  drivers.lockout_until exists
+ℹ️  events_outbox.ticket_id exists
+[AUTH MIGRATION] Completed Successfully.
+--- Running Auto-Migration (migrate_phase3_observability.js) ---
+Base de datos DriverFlow inicializada.
+--- Migrating: Phase 3 Observability (Strict) ---
+⚠️  Table exists but schema mismatch (using old "name" pk?). Dropping and recreating...
+✅ Recreated worker_heartbeat table (Strict Schema).
+--- Migration Complete ---
+{"ts":"2026-01-26T13:43:40.252Z","level":"INFO","msg":"--- Email Processor Started ---","service":"worker","event":"worker_start"}
+{"ts":"2026-01-26T13:43:40.254Z","level":"INFO","msg":"DB Config","service":"worker","event":"worker_config","db_path":"driverflow.db","dry_run":false}
+{"ts":"2026-01-26T13:43:40.258Z","level":"INFO","msg":"DB Check OK","service":"api","event":"db_open_ok","count":65}
+--- Starting Integrated Email Worker ---
+{"ts":"2026-01-26T13:43:40.259Z","level":"INFO","msg":"Worker polling started","service":"api","event":"worker_loop_start","interval_ms":30000}
+{"ts":"2026-01-26T13:43:40.262Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:43:40.263Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+DriverFlow MVP server listening on port 3000
+{"ts":"2026-01-26T13:43:46.412Z","level":"INFO","msg":"HTTP Request","service":"api","request_id":"d151faf7-699d-491f-8932-ffaa6a8e7469","route":"/healthz","method":"GET","status":200,"duration_ms":"5.54","event":"http_request"}
+{"ts":"2026-01-26T13:43:46.418Z","level":"INFO","msg":"HTTP Request","service":"api","request_id":"a0f1d52f-7b6e-4186-ab25-76518371d75b","route":"/readyz","method":"GET","status":200,"duration_ms":"1.84","event":"http_request"}
+{"ts":"2026-01-26T13:43:46.420Z","level":"INFO","msg":"HTTP Request","service":"api","request_id":"772ec553-4f72-43d7-a668-2c1d5e5c011b","route":"/metrics","method":"GET","status":200,"duration_ms":"0.91","event":"http_request"}
+{"ts":"2026-01-26T13:43:46.423Z","level":"INFO","msg":"HTTP Request","service":"api","request_id":"f9ccec02-3e10-4171-b88c-655c9b2ee077","route":"/metrics","method":"GET","status":200,"duration_ms":"0.87","event":"http_request"}
+{"ts":"2026-01-26T13:44:10.271Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:44:10.271Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:44:40.279Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:44:40.280Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:45:10.282Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:45:10.282Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:45:40.309Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:45:40.309Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:46:10.322Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:46:10.323Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:46:40.336Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:46:40.337Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:47:10.345Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:47:10.345Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:47:40.352Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:47:40.352Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:48:10.364Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:48:10.364Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:48:40.378Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:48:40.378Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:49:10.381Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:49:10.381Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T13:49:40.389Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T13:49:40.389Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T16:50:10.120Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T16:50:10.120Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:35:55.016Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:35:55.017Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:36:25.031Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:36:25.031Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:36:55.047Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:36:55.047Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:37:25.056Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:37:25.057Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:37:55.063Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:37:55.064Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:38:25.070Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:38:25.070Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:38:55.085Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:38:55.086Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:39:25.100Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:39:25.101Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:39:55.106Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:39:55.107Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:40:25.112Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:40:25.113Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:40:55.128Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:40:55.129Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:41:25.137Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:41:25.138Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:41:55.152Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:41:55.153Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:42:25.168Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:42:25.168Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:42:55.182Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:42:55.183Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:43:25.197Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:43:25.198Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:43:55.210Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:43:55.211Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:44:25.212Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:44:25.212Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:44:55.216Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:44:55.216Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:45:25.226Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:45:25.227Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:45:55.231Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:45:55.232Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:46:25.247Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:46:25.248Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:46:55.263Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:46:55.263Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:47:25.265Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:47:25.266Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:47:55.285Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:47:55.286Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:48:25.287Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:48:25.288Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}
+{"ts":"2026-01-26T17:48:55.293Z","level":"INFO","msg":"Worker Poll","service":"worker","event":"worker_poll","pending_count":6}
+{"ts":"2026-01-26T17:48:55.293Z","level":"INFO","msg":"Processing 6 events...","service":"worker","event":"worker_poll_batch","count":6}

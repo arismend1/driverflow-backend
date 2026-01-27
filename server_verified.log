@@ -1,0 +1,32 @@
+--- Running Auto-Migration (migrate_auth_fix.js) ---
+[AUTH MIGRATION] Starting on DB: driverflow.db 
+ℹ️  drivers.verified exists
+ℹ️  drivers.verification_token exists
+ℹ️  drivers.verification_expires exists
+✅ Added drivers.reset_token
+✅ Added drivers.reset_expires
+✅ Added drivers.status
+ℹ️  drivers.search_status exists
+ℹ️  drivers.estado exists
+✅ Added drivers.created_at
+ℹ️  empresas.verified exists
+ℹ️  empresas.verification_token exists
+ℹ️  empresas.verification_expires exists
+✅ Added empresas.reset_token
+✅ Added empresas.reset_expires
+ℹ️  empresas.search_status exists
+ℹ️  empresas.created_at exists
+ℹ️  empresas.legal_name exists
+ℹ️  empresas.address_line1 exists
+✅ Added empresas.city
+✅ Added empresas.failed_attempts
+✅ Added empresas.lockout_until
+✅ Added drivers.failed_attempts
+✅ Added drivers.lockout_until
+ℹ️  events_outbox.ticket_id exists
+[AUTH MIGRATION] Completed Successfully.
+--- Migration Complete ---
+--- Email Processor Started ---
+DB_PATH:   driverflow.db 
+DRY_RUN:   false
+❌ FATAL: FROM_EMAIL must be EXACTLY 'no-reply@driverflow.app'. Got: 'no-reemail@driverflow.app'

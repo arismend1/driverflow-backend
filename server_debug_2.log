@@ -1,0 +1,29 @@
+--- Running Auto-Migration (migrate_auth_fix.js) ---
+[AUTH MIGRATION] Starting on DB: C:\DriverFlow\data\driverflow_prod.db
+ℹ️  drivers.verified exists
+ℹ️  drivers.verification_token exists
+ℹ️  drivers.verification_expires exists
+ℹ️  drivers.reset_token exists
+ℹ️  drivers.reset_expires exists
+ℹ️  drivers.status exists
+ℹ️  drivers.search_status exists
+ℹ️  drivers.estado exists
+ℹ️  drivers.created_at exists
+ℹ️  empresas.verified exists
+ℹ️  empresas.verification_token exists
+ℹ️  empresas.verification_expires exists
+ℹ️  empresas.reset_token exists
+ℹ️  empresas.reset_expires exists
+ℹ️  empresas.search_status exists
+ℹ️  empresas.created_at exists
+ℹ️  empresas.legal_name exists
+ℹ️  empresas.address_line1 exists
+ℹ️  empresas.city exists
+ℹ️  empresas.failed_attempts exists
+ℹ️  empresas.lockout_until exists
+ℹ️  drivers.failed_attempts exists
+ℹ️  drivers.lockout_until exists
+ℹ️  events_outbox.ticket_id exists
+[AUTH MIGRATION] Completed Successfully.
+--- Migration Complete ---
+FATAL: Attempting to access PRODUCTION DB in DEV mode. Aborting. Path: C:\DriverFlow\data\driverflow_prod.db

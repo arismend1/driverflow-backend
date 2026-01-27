@@ -18,8 +18,11 @@ async function testSend() {
     const payload = {
         personalizations: [{ to: [{ email: process.argv[2] || TO_EMAIL }] }],
         from: { email: FROM_EMAIL, name: "DriverFlow Test" },
-        subject: "Prueba de Diagnostico DriverFlow",
-        content: [{ type: "text/plain", value: "Si lees esto, SendGrid funciona correctamente." }]
+        subject: "Prueba de Diagnostico DriverFlow (Link Tracking OFF)",
+        content: [{ type: "text/plain", value: "Si lees esto, SendGrid acepta tracking_settings: false." }],
+        tracking_settings: {
+            click_tracking: { enable: false, enable_text: false }
+        }
     };
 
     try {

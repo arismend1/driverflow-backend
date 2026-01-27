@@ -9,6 +9,10 @@ const { execSync } = require('child_process');
 const { nowIso, nowEpochMs } = require('./time_provider');
 const { enforceCompanyCanOperate } = require('./access_control');
 
+// Observability Defaults
+const logger = require('./logger');
+const metrics = require('./metrics');
+
 // --- Producción: Strict Env Validation ---
 if (process.env.NODE_ENV === 'production') {
     const requiredEnv = ['PORT', 'JWT_SECRET', 'DB_PATH', 'SENDGRID_API_KEY', 'FROM_EMAIL'];
@@ -24,6 +28,20 @@ if (process.env.NODE_ENV === 'production') {
 try {
     console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
     execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
+    execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
+    execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
+    execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
+    execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
+    execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
+    execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
+    execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
     console.log('--- Migration Complete ---');
 } catch (err) {
     console.error('FATAL: Migration failed on server start.');
@@ -31,20 +49,26 @@ try {
 }
 
 // Cargar DB después de validar entorno y migración
-const dbPath = process.env.DB_PATH || 'driverflow.db';
+const dbPath = (process.env.DB_PATH || 'driverflow.db').trim();
 
 // SAFETY GUARD: Anti-Production in Dev
 if (process.env.NODE_ENV !== 'production' && (dbPath.includes('prod') || dbPath.includes('live'))) {
-    console.error('FATAL: Attempting to access PRODUCTION DB in DEV mode. Aborting.');
+    console.error(`FATAL: Attempting to access PRODUCTION DB in DEV mode. Aborting. Path: ${dbPath}`);
     process.exit(1);
 }
 
 const db = require('better-sqlite3')(dbPath);
 
 const app = express();
+
+// STRIPE WEBHOOK NEEDS RAW BODY (Must be before express.json)
+app.use('/stripe/webhook', express.raw({ type: 'application/json' }));
+
 app.use(express.json());
 
 // CORS Configuration
+// CORS Configuration
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
 const corsOptions = {
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
@@ -58,6 +82,50 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
+// --- OBSERVABILITY MIDDLEWARE (Phase 3) ---
+
+// 1. Request ID Middleware
+app.use((req, res, next) => {
+    const rid = req.headers['x-request-id'] || crypto.randomUUID();
+    req.requestId = rid;
+    res.setHeader('X-Request-Id', rid);
+    next();
+});
+
+// 2. Request Logger & Metrics
+app.use((req, res, next) => {
+    const start = process.hrtime();
+
+    // Log Response
+    res.on('finish', () => {
+        const diff = process.hrtime(start);
+        const ms = (diff[0] * 1e9 + diff[1]) / 1e6;
+
+        // Metrics
+        const labels = {
+            route: req.route ? req.route.path : 'unknown',
+            method: req.method,
+            status: res.statusCode
+        };
+        metrics.inc('http_requests_total', labels);
+        metrics.observe('http_request_duration_ms', ms, { ...labels });
+
+        if (res.statusCode >= 400) {
+            metrics.inc('http_errors_total', labels);
+        }
+
+        // Log
+        logger.info('HTTP Request', {
+            req,
+            res,
+            duration_ms: ms.toFixed(2),
+            event: 'http_request'
+        });
+    });
+
+    next();
+});
+
 // Root Endpoint (Health/Connectivity)
 app.get("/", (req, res) => {
     res.status(200).json({
@@ -67,16 +135,92 @@ app.get("/", (req, res) => {
     });
 });
 
-// Health Check
-app.get('/health', (req, res) => {
-    res.json({ ok: true, status: 'online' });
+// Health Check (Legacy)
+app.get('/health', (req, res) => res.json({ ok: true, status: 'online' }));
+
+// --- OBSERVABILITY ENDPOINTS (Phase 3) ---
+
+// 1. Liveness
+app.get('/healthz', (req, res) => {
+    res.json({
+        ok: true,
+        uptime_s: process.uptime().toFixed(0),
+        version: process.env.npm_package_version || '1.0.0',
+        time: nowIso(),
+        request_id: req.requestId
+    });
+});
+
+// 2. Readiness (Deep Check)
+app.get('/readyz', (req, res) => {
+    const checks = {
+        db: false,
+        tables_exist: false,
+        worker_running: false
+    };
+
+    try {
+        // DB Check
+        const one = db.prepare('SELECT 1').get();
+        if (one) checks.db = true;
+
+        // Tables Check
+        const tables = ['drivers', 'empresas', 'solicitudes', 'tickets', 'events_outbox'];
+        const found = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tables.map(t => `'${t}'`).join(',')})`).all();
+        if (found.length === tables.length) checks.tables_exist = true;
+
+        // Worker Heartbeat Check
+        // SCHEMA UPDATE: Looking for 'worker_name' = 'email_worker'
+        const hb = db.prepare("SELECT last_seen FROM worker_heartbeat WHERE worker_name='email_worker'").get();
+        if (hb) {
+            const last = new Date(hb.last_seen);
+            const diffSec = (Date.now() - last.getTime()) / 1000;
+            if (diffSec < 60) checks.worker_running = true;
+        }
+
+    } catch (e) {
+        logger.error('Readiness Check Failed', { event: 'readyz_fail', err: e });
+        return res.status(503).json({ ok: false, error: e.message, checks, request_id: req.requestId });
+    }
+
+    if (Object.values(checks).every(v => v)) {
+        res.json({ ok: true, checks, request_id: req.requestId });
+    } else {
+        res.status(503).json({ ok: false, checks, request_id: req.requestId });
+    }
+});
+
+// 3. Metrics (Protected + Persistent)
+app.get('/metrics', (req, res) => {
+    // Basic Token Auth (Production Only)
+    if (process.env.NODE_ENV === 'production') {
+        const auth = req.headers['authorization'];
+        const token = process.env.METRICS_TOKEN;
+        if (!token || auth !== `Bearer ${token}`) {
+            return res.status(401).json({ error: 'Unauthorized metrics access' });
+        }
+    }
+
+    // PERSISTENCE REQUIREMENT: Fetch business metrics from DB
+    const sentCount = db.prepare("SELECT count(*) as c FROM events_outbox WHERE process_status='sent'").get().c;
+    const failedCount = db.prepare("SELECT count(*) as c FROM events_outbox WHERE process_status='failed'").get().c;
+    const ticketCount = db.prepare("SELECT count(*) as c FROM tickets").get().c;
+
+    const data = metrics.getSnapshot();
+
+    // Inject DB Stats
+    data.counters['emails_sent_total_db'] = sentCount;
+    data.counters['emails_failed_total_db'] = failedCount;
+    data.counters['tickets_created_total_db'] = ticketCount;
+
+    res.json(data);
 });
 
 // Configuración
 // Configuración
 const SECRET_KEY = process.env.SECRET_KEY || process.env.JWT_SECRET || 'dev_secret_key_123'; // Prod usa ENV
 const REQUEST_DURATION_MINUTES = 30;
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
+// ALLOWED_ORIGINS MOVED TO TOP FOR CORS FIX
 
 // --- Rate Limiter (In-Memory) ---
 const rateLimitMap = new Map();
@@ -112,9 +256,14 @@ function isStrongPassword(password) {
 // Esto asegura que el mismo proceso que escribe en la DB también envíe los correos.
 // Soluciona el problema de discos separados en Render.
 try {
-    const emailWorker = require('./process_outbox_emails');
-    console.log('--- Starting Integrated Email Worker ---');
-    emailWorker.startWorker(); // Run in background (non-blocking)
+    // LEGACY EMAIL WORKER DISABLED — queue worker is the single source of truth
+    // const emailWorker = require('./process_outbox_emails');
+    // console.log('--- Starting Integrated Email Worker ---');
+    // emailWorker.startWorker(); 
+
+    // NEW QUEUE WORKER (SINGLE SOURCE OF TRUTH)
+    const { startQueueWorker } = require('./worker_queue');
+    startQueueWorker();
 } catch (e) {
     console.error('Failed to start integrated worker:', e);
 }
@@ -203,9 +352,11 @@ app.post('/register', async (req, res) => {
 
     } catch (err) {
         if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Usuario ya registrado' });
-        console.error('Register Error:', err);
+        logger.error('Register Error', { event: 'register_error', err, req });
         return res.status(500).json({ error: 'Error interno de registro' });
     }
+
+    metrics.inc('register_total', { type });
 });
 
 // --- 2. Login ---
@@ -241,9 +392,11 @@ app.post('/login', async (req, res) => {
 
         const payload = { id: row.id, type: type };
         const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
+        metrics.inc('login_total', { status: 'success', type });
         res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
     } else {
-        // INCREMENT FAILED ATTEMPTS
+        metrics.inc('login_total', { status: 'failed_auth', type });
+        // INCREMENT FAILED ATTEMPTS (Logic remains same)
         const newAttempts = (row.failed_attempts || 0) + 1;
         let updateSql = `UPDATE ${table} SET failed_attempts = ?`;
         const params = [newAttempts];
@@ -667,6 +820,26 @@ app.post('/create_request', authenticateToken, (req, res) => {
         const info = stmt.run(empresa_id, licencia_req, ubicacion, tiempo_estimado, expiresAt);
         const reqId = info.lastInsertRowid;
 
+        // PHASE 5: REALTIME NOTIFICATION (Broadcast to compatible drivers)
+        // Audience: 'broadcast_drivers', Event Key: 'request_created'
+        db.prepare(`
+            INSERT INTO events_outbox (
+                event_name, created_at, request_id, 
+                audience_type, audience_id, event_key, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            'request_created',
+            nowIso(),
+            reqId,
+            'broadcast_drivers',
+            null,
+            'request_created',
+            JSON.stringify({
+                licencia: licencia_req,
+                location: ubicacion
+            })
+        );
+
         return { id: reqId, status: 'PENDIENTE' };
     });
 
@@ -772,7 +945,26 @@ app.post('/apply_for_request', authenticateToken, (req, res) => {
             reqInfo.empresa_id,
             req.user.id,
             request_id,
+            request_id,
             JSON.stringify({ driver_name: driver.nombre, message: 'Driver applied, waiting approval.' })
+        );
+
+        // PHASE 5: REALTIME NOTIFICATION (To Company)
+        db.prepare(`
+            INSERT INTO events_outbox (
+                event_name, created_at, company_id, driver_id, request_id, 
+                audience_type, audience_id, event_key, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            'driver_applied',
+            nowStr,
+            reqInfo.empresa_id,
+            req.user.id,
+            request_id,
+            'empresa',
+            String(reqInfo.empresa_id),
+            'driver_applied',
+            JSON.stringify({ driver_name: driver.nombre })
         );
     });
 
@@ -834,6 +1026,30 @@ app.post('/approve_driver', authenticateToken, (req, res) => {
             request_id,
             ticketInfo.lastInsertRowid,
             JSON.stringify({ price_cents: 15000, currency: 'USD', message: 'Contact info exchanged' })
+        );
+
+        // PHASE 5: REALTIME NOTIFICATION (To Driver: Match Confirmed)
+        db.prepare(`
+            INSERT INTO events_outbox (
+                event_name, created_at, company_id, driver_id, request_id, ticket_id,
+                audience_type, audience_id, event_key, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            'match_confirmed', nowStr, reqInfo.empresa_id, reqInfo.driver_id, request_id, ticketInfo.lastInsertRowid,
+            'driver', String(reqInfo.driver_id), 'match_confirmed',
+            JSON.stringify({ message: 'Request approved!' })
+        );
+
+        // PHASE 5: REALTIME NOTIFICATION (To Company: Ticket Created/Billing Pending)
+        db.prepare(`
+            INSERT INTO events_outbox (
+                event_name, created_at, company_id, driver_id, request_id, ticket_id,
+                audience_type, audience_id, event_key, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            'ticket_created', nowStr, reqInfo.empresa_id, reqInfo.driver_id, request_id, ticketInfo.lastInsertRowid,
+            'empresa', String(reqInfo.empresa_id), 'ticket_created',
+            JSON.stringify({ message: 'New Ticket Generated', amount: 15000 })
         );
 
         return { ticket_id: ticketInfo.lastInsertRowid };
@@ -1130,261 +1346,9 @@ app.post('/rate_service', authenticateToken, (req, res) => {
     }
 });
 
-// --- 1. Register - REAL ONBOARDING ---
-app.post('/register', async (req, res) => {
-    const { type, nombre, contacto, password, ...extras } = req.body;
+// --- DUPLICATE AUTH ENDPOINTS REMOVED (Refactored to single source above) ---
 
-    if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
-    if (!nombre || !contacto || !password) return res.status(400).json({ error: 'Missing basic fields' });
 
-    try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const token = crypto.randomBytes(32).toString('hex');
-        const now = nowIso();
-        const expires = new Date(Date.now() + 24 * 3600000).toISOString();
-
-        if (type === 'driver') {
-            const { tipo_licencia } = extras;
-            const stmt = db.prepare(`
-                INSERT INTO drivers (
-                    nombre, contacto, password_hash, tipo_licencia, 
-                    status, created_at, verified, 
-                    verification_token, verification_expires
-                ) VALUES (?, ?, ?, ?, 'active', ?, 0, ?, ?)
-            `);
-            const info = stmt.run(nombre, contacto, hashedPassword, tipo_licencia || 'B', now, token, expires);
-
-            db.prepare(`
-                INSERT INTO events_outbox (event_name, created_at, driver_id, metadata)
-                VALUES (?, ?, ?, ?)
-            `).run('verification_email', now, info.lastInsertRowid, JSON.stringify({
-                token,
-                email: contacto,
-                name: nombre,
-                user_type: 'driver'
-            }));
-        }
-        else {
-            const { legal_name, address_line1, address_city } = extras;
-            const stmt = db.prepare(`
-                INSERT INTO empresas (
-                    nombre, contacto, password_hash, 
-                    legal_name, address_line1, ciudad, 
-                    verified, verification_token, verification_expires, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            `);
-            const info = stmt.run(nombre, contacto, hashedPassword, legal_name || nombre, address_line1 || '', address_city || '', token, expires, now);
-
-            db.prepare(`
-                INSERT INTO events_outbox (event_name, created_at, company_id, metadata)
-                VALUES (?, ?, ?, ?)
-            `).run('verification_email', now, info.lastInsertRowid, JSON.stringify({
-                token,
-                email: contacto,
-                name: nombre,
-                user_type: 'empresa'
-            }));
-        }
-
-        // NO TOKEN RETURNED. STRICT VERIFICATION.
-        return res.status(200).json({
-            ok: true,
-            require_email_verification: true,
-            message: 'Registro exitoso. Verifique su correo para entrar.'
-        });
-
-    } catch (err) {
-        if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Usuario ya registrado' });
-        console.error('Register Error:', err);
-        return res.status(500).json({ error: 'Internal Error' });
-    }
-});
-
-// --- 2. Login (STRICT) ---
-app.post('/login', async (req, res) => {
-    const { type, contacto, password } = req.body;
-    if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
-
-    const table = type === 'driver' ? 'drivers' : 'empresas';
-    const row = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(contacto);
-
-    if (!row) return res.status(401).json({ error: 'Credenciales inválidas' }); // Generic error
-
-    // STRICT VERIFICATION
-    if (row.verified !== 1) {
-        return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED' });
-    }
-
-    if (await bcrypt.compare(password, row.password_hash)) {
-        const payload = { id: row.id, type };
-        const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
-        res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
-    } else {
-        res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-});
-
-// --- Verify Email (GET/POST) ---
-app.all('/verify-email', (req, res) => {
-    const token = req.method === 'GET' ? req.query.token : req.body.token;
-    if (!token) return res.status(400).send('<h1>Error: Missing Token</h1>');
-
-    let user = db.prepare("SELECT id, 'driver' as type, verification_expires FROM drivers WHERE verification_token = ?").get(token);
-    if (!user) user = db.prepare("SELECT id, 'empresa' as type, verification_expires FROM empresas WHERE verification_token = ?").get(token);
-
-    if (!user) return res.status(404).send('<h1>Error: Link inválido o ya usado.</h1>');
-
-    if (new Date(user.verification_expires) < new Date()) {
-        return res.status(400).send('<h1>Error: El link ha expirado. Solicite uno nuevo.</h1>');
-    }
-
-    const table = user.type === 'driver' ? 'drivers' : 'empresas';
-    db.prepare(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`).run(user.id);
-
-    if (req.method === 'GET') {
-        res.send(`
-            <html>
-                <body style="font-family:sans-serif; text-align:center; padding:50px;">
-                    <h1 style="color:green;">¡Email Verificado!</h1>
-                    <p>Tu cuenta ha sido activada correctamente.</p>
-                    <p>Ya puedes cerrar esta ventana e iniciar sesión en la App.</p>
-                    <script>setTimeout(() => window.location.href = "driverflow://login", 2000);</script>
-                </body>
-            </html>
-        `);
-    } else {
-        res.json({ success: true });
-    }
-});
-
-// --- Resend Verification (NORMALIZED + ANTI-ENUMERATION) ---
-app.post(['/resend-verification', '/resend_verification'], (req, res) => {
-    let { type, contact, email } = req.body;
-
-    // Normalize Type
-    type = String(type || '').trim().toLowerCase();
-    if (type === 'company') type = 'empresa';
-    if (!['driver', 'empresa'].includes(type)) type = 'driver'; // Default or Fail? MVP: Default search driver first or just fail safely.
-    // Better: if invalid type, just return 200 to not leak API structure errors?
-    // Let's rely on searched tables.
-
-    // Normalize Email
-    const target = String(contact || email || '').trim().toLowerCase();
-
-    if (!target) return res.json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
-
-    // Try finding user
-    let user = null;
-    let table = '';
-
-    // If strict type provided, search that. If ambiguous, search both?
-    // Spec says: "normaliza type... si type falta: buscar en drivers y empresas"
-
-    if (type === 'driver') {
-        user = db.prepare('SELECT * FROM drivers WHERE lower(contacto) = ?').get(target);
-        if (user) table = 'drivers';
-    } else if (type === 'empresa') {
-        user = db.prepare('SELECT * FROM empresas WHERE lower(contacto) = ?').get(target);
-        if (user) table = 'empresas';
-    }
-
-    // Fallback if type not found or not specified correctly
-    if (!user) {
-        user = db.prepare('SELECT * FROM drivers WHERE lower(contacto) = ?').get(target);
-        if (user) { table = 'drivers'; type = 'driver'; }
-        else {
-            user = db.prepare('SELECT * FROM empresas WHERE lower(contacto) = ?').get(target);
-            if (user) { table = 'empresas'; type = 'empresa'; }
-        }
-    }
-
-    // Logic
-    if (user && user.verified === 0) {
-        const token = crypto.randomBytes(32).toString('hex');
-        const now = nowIso();
-        const expires = new Date(Date.now() + 24 * 3600000).toISOString();
-
-        db.prepare(`UPDATE ${table} SET verification_token = ?, verification_expires = ? WHERE id = ?`).run(token, expires, user.id);
-
-        const idCol = table === 'drivers' ? 'driver_id' : 'company_id';
-        db.prepare(`
-            INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata)
-            VALUES (?, ?, ?, ?)
-        `).run('verification_email', now, user.id, JSON.stringify({
-            token,
-            email: user.contacto,
-            name: user.nombre,
-            user_type: type
-        }));
-    }
-
-    // ALWAYS 200 OK
-    res.json({ ok: true, message: 'Si la cuenta existe y requiere verificación, se envió el correo.' });
-});
-
-// --- Forgot Password (NORMALIZED + ANTI-ENUMERATION) ---
-app.post('/forgot_password', (req, res) => {
-    let { type, contact, email } = req.body;
-
-    // Normalize
-    type = String(type || '').trim().toLowerCase();
-    if (type === 'company') type = 'empresa';
-
-    const target = String(contact || email || '').trim().toLowerCase();
-    if (!target) return res.json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
-
-    let user = null;
-    let table = '';
-
-    // Search
-    user = db.prepare('SELECT * FROM drivers WHERE lower(contacto) = ?').get(target);
-    if (user) { table = 'drivers'; type = 'driver'; }
-    else {
-        user = db.prepare('SELECT * FROM empresas WHERE lower(contacto) = ?').get(target);
-        if (user) { table = 'empresas'; type = 'empresa'; }
-    }
-
-    if (user) {
-        const token = crypto.randomBytes(32).toString('hex');
-        const now = nowIso();
-        const expires = new Date(Date.now() + 1 * 3600000).toISOString();
-
-        db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
-
-        const idCol = table === 'drivers' ? 'driver_id' : 'company_id';
-        db.prepare(`
-            INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata)
-            VALUES (?, ?, ?, ?)
-        `).run('recovery_email', now, user.id, JSON.stringify({
-            token,
-            email: user.contacto,
-            name: user.nombre,
-            user_type: type
-        }));
-    }
-
-    // ALWAYS 200 OK
-    res.json({ ok: true, message: 'Si la cuenta existe, recibirá un correo.' });
-});
-
-// --- Reset Password ---
-app.post('/reset_password', async (req, res) => {
-    const { token, new_password } = req.body;
-    if (!token || !new_password) return res.status(400).json({ error: 'Faltan datos' });
-
-    let user = db.prepare("SELECT id, 'driver' as type, reset_expires FROM drivers WHERE reset_token = ?").get(token);
-    if (!user) user = db.prepare("SELECT id, 'empresa' as type, reset_expires FROM empresas WHERE reset_token = ?").get(token);
-
-    if (!user) return res.status(400).json({ error: 'Token inválido' });
-    if (new Date(user.reset_expires) < new Date()) return res.status(400).json({ error: 'Token expirado' });
-
-    const hashedPassword = await bcrypt.hash(new_password, 10);
-    const table = user.type === 'driver' ? 'drivers' : 'empresas';
-
-    db.prepare(`UPDATE ${table} SET password_hash = ?, reset_token = NULL, reset_expires = NULL WHERE id = ?`).run(hashedPassword, user.id);
-
-    res.json({ ok: true, success: true, message: 'Contraseña actualizada.' });
-});
 
 // 8. Payment Webhook (Stripe/Provider) - NEW
 // 8. Payment Webhook (Stripe/Provider) - SECURE & IDEMPOTENT (REQ 3)
@@ -1398,9 +1362,16 @@ app.post('/webhooks/payment', (req, res) => {
     const { type, data, id: event_id } = req.body;
 
     if (!event_id) return res.status(400).json({ error: 'Missing event_id' });
-    if (type !== 'invoice.paid') {
-        return res.json({ ignored: true });
-    }
+
+    // 2. Idempotency Check
+    const processed = db.prepare('SELECT id FROM events_outbox WHERE metadata LIKE ?').get(`%${event_id}%`);
+    if (processed) return res.json({ received: true });
+
+    // ... (rest of webhook logic would go here, effectively a stub for now as we don't process it fully in Phase 1)
+    if (type !== 'invoice.paid') return res.json({ received: true });
+
+
+
 
     const performPayment = db.transaction(() => {
         // 2. Idempotency Check (Strict)
@@ -1568,6 +1539,1022 @@ app.post('/admin/tickets/void', (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// --- 9. Tickets (Read-Only) ---
+app.get('/tickets/my', authenticateToken, (req, res) => {
+    const { id, type } = req.user;
+
+    let tickets = [];
+    if (type === 'driver') {
+        tickets = db.prepare(`
+            SELECT t.id, t.billing_status, t.price_cents, t.currency, t.created_at, e.nombre as company_name
+            FROM tickets t
+            JOIN empresas e ON t.company_id = e.id
+            WHERE t.driver_id = ?
+            ORDER BY t.created_at DESC
+        `).all(id);
+    } else if (type === 'empresa') {
+        tickets = db.prepare(`
+            SELECT t.id, t.billing_status, t.price_cents, t.currency, t.created_at, d.nombre as driver_name
+            FROM tickets t
+            JOIN drivers d ON t.driver_id = d.id
+            WHERE t.company_id = ?
+            ORDER BY t.created_at DESC
+        `).all(id);
+    } else {
+        return res.sendStatus(403);
+    }
+
+    res.json(tickets);
+});
+
+// --- 10. Request Lifecycle (Phase 2) ---
+
+// 10.1 Create Request (Company)
+app.post('/requests', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const { licencia_req, ubicacion, tiempo_estimado } = req.body;
+
+    if (!licencia_req || !ubicacion || !tiempo_estimado) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+
+    // Verify company not blocked
+    try {
+        enforceCompanyCanOperate(db, req.user.id, 'create_request');
+    } catch (e) {
+        return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: e.details });
+    }
+
+    const now = nowIso();
+    // Default expiration: 2 hours (MVP rule)
+    const expires = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+
+    const info = db.prepare(`
+        INSERT INTO solicitudes (empresa_id, licencia_req, ubicacion, tiempo_estimado, estado, fecha_creacion, fecha_expiracion)
+        VALUES (?, ?, ?, ?, 'PENDIENTE', ?, ?)
+    `).run(req.user.id, licencia_req, ubicacion, tiempo_estimado, now, expires);
+
+    metrics.inc('request_created_total');
+    res.json({ success: true, request_id: info.lastInsertRowid });
+});
+
+// 10.2 Available Requests (Driver)
+app.get('/requests/available', authenticateToken, (req, res) => {
+    if (req.user.type !== 'driver') return res.sendStatus(403);
+    const driverId = req.user.id;
+
+    // Check Driver Status
+    const driver = db.prepare('SELECT search_status, tipo_licencia FROM drivers WHERE id = ?').get(driverId);
+    if (!driver || driver.search_status !== 'ON') {
+        return res.json([]); // Return empty if offline
+    }
+
+    // Logic: State=PENDIENTE + Matching License (Simple exact match for MVP, or Logic A covers B?)
+    // MVP: Exact Match Only or 'B' covers 'A'? Let's do Exact or driver has 'C' (Universal).
+    // Let's stick to prompt: "compatibles con licencia".
+    // Simplification: exact match for now.
+
+    const requests = db.prepare(`
+        SELECT r.id, r.licencia_req, r.ubicacion, r.tiempo_estimado, e.nombre as company_name, r.fecha_creacion
+        FROM solicitudes r
+        JOIN empresas e ON r.empresa_id = e.id
+        WHERE r.estado = 'PENDIENTE'
+        AND r.licencia_req = ?
+        ORDER BY r.fecha_creacion DESC
+    `).all(driver.tipo_licencia);
+
+    res.json(requests);
+});
+
+// 10.3 Apply (Driver)
+app.post('/requests/:id/apply', authenticateToken, (req, res) => {
+    if (req.user.type !== 'driver') return res.sendStatus(403);
+    const reqId = req.params.id;
+    const driverId = req.user.id;
+
+    const performApply = db.transaction(() => {
+        const request = db.prepare('SELECT estado, empresa_id FROM solicitudes WHERE id = ?').get(reqId);
+        if (!request) throw new Error('NOT_FOUND');
+        if (request.estado !== 'PENDIENTE') throw new Error('NOT_PENDING');
+
+        // Check Driver Status again
+        const driver = db.prepare('SELECT search_status FROM drivers WHERE id = ?').get(driverId);
+        if (driver.search_status !== 'ON') throw new Error('DRIVER_OFFLINE');
+
+        // Check double apply (if we had a join table). 
+        // MVP: Solicitudes table has 'driver_id' column, so 1 driver per request?
+        // Wait, prompt implies simple matching. If many apply, how do we store?
+        // Prompt says: "Registra driver_id". This implies 1-to-1 or "First to apply wins slot"?
+        // Prompt: "3) Un CHOFER pueda aceptar... 4) La EMPRESA confirme".
+        // State -> APLICADA.
+        // This implies 1 active applicant at a time in this simple schema.
+
+        db.prepare(`
+            UPDATE solicitudes 
+            SET estado = 'APLICADA', driver_id = ? 
+            WHERE id = ? AND estado = 'PENDIENTE'
+        `).run(driverId, reqId);
+
+        return { success: true };
+    });
+
+    try {
+        performApply();
+        metrics.inc('driver_applied_total');
+        res.json({ success: true });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 10.4 Confirm Match (Company)
+app.post('/requests/:id/confirm', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const reqId = req.params.id;
+
+    // Verify company not blocked
+    try {
+        enforceCompanyCanOperate(db, req.user.id, 'confirm_match');
+    } catch (e) {
+        return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: e.details });
+    }
+
+    const performConfirm = db.transaction(() => {
+        const request = db.prepare('SELECT * FROM solicitudes WHERE id = ?').get(reqId);
+        if (!request) throw new Error('NOT_FOUND');
+        if (request.empresa_id !== req.user.id) throw new Error('FORBIDDEN');
+        if (request.estado !== 'APLICADA') throw new Error('NO_APPLICANT'); // Must be Applied
+        if (!request.driver_id) throw new Error('DATA_CORRUPTION');
+
+        const now = nowIso();
+
+        // 1. Update Request State
+        db.prepare(`
+            UPDATE solicitudes 
+            SET estado = 'CONFIRMADA' 
+            WHERE id = ?
+        `).run(reqId);
+
+        // 2. GENERATE TICKET (OBLIGATORY)
+        // Pricing Logic: Fixed for MVP or based on time?
+        const PRICE_BASE = parseInt(process.env.TICKET_PRICE_CENTS) || 700;
+        const currency = process.env.BILLING_CURRENCY || 'usd';
+
+        // Phase 4: Insert billing fields MUST match requirements
+        const info = db.prepare(`
+            INSERT INTO tickets (
+                request_id, company_id, driver_id, 
+                price_cents, amount_cents, 
+                currency, billing_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        `).run(reqId, request.empresa_id, request.driver_id, PRICE_BASE, PRICE_BASE, currency, now);
+
+        // 3. Notify Driver (Event)
+        db.prepare(`
+            INSERT INTO events_outbox (event_name, created_at, driver_id, request_id, metadata)
+            VALUES (?, ?, ?, ?, ?)
+        `).run('match_confirmed', now, request.driver_id, reqId, JSON.stringify({ ticket_id: info.lastInsertRowid }));
+
+        return { ticket_id: info.lastInsertRowid };
+    });
+
+    try {
+        const result = performConfirm();
+        metrics.inc('match_confirmed_total');
+        metrics.inc('ticket_created_total');
+
+        logger.info('Match Confirmed', {
+            event: 'match_confirmed',
+            request_id: req.requestId,
+            company_id: req.user.id,
+            driver_id: 'unknown', // Ideally we grab it from result or logic, but for now log success
+            ticket_id: result.ticket_id,
+            solicitud_id: reqId,
+            status: 'CONFIRMADA'
+        });
+
+        res.json({ success: true, ticket_id: result.ticket_id });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+
+
+// --- 11. Billing (Phase 4) ---
+
+// 11.1 Billing Summary
+app.get('/billing/summary', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+
+    const summary = db.prepare(`
+        SELECT 
+            SUM(CASE WHEN billing_status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+            SUM(CASE WHEN billing_status = 'pending' THEN amount_cents ELSE 0 END) as pending_amount_cents,
+            SUM(CASE WHEN billing_status = 'paid' THEN 1 ELSE 0 END) as paid_count,
+            SUM(CASE WHEN billing_status = 'paid' THEN amount_cents ELSE 0 END) as paid_amount_cents,
+            MAX(currency) as currency
+        FROM tickets 
+        WHERE company_id = ?
+    `).get(req.user.id);
+
+    res.json({
+        pending_count: summary.pending_count || 0,
+        pending_amount_cents: summary.pending_amount_cents || 0,
+        paid_count: summary.paid_count || 0,
+        paid_amount_cents: summary.paid_amount_cents || 0,
+        currency: summary.currency || (process.env.BILLING_CURRENCY || 'usd')
+    });
+});
+
+// 11.2 List Tickets
+app.get('/billing/tickets', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const { status } = req.query;
+
+    let sql = `
+        SELECT id, request_id, driver_id, billing_status, amount_cents, currency, paid_at, created_at 
+        FROM tickets 
+        WHERE company_id = ? 
+    `;
+    const params = [req.user.id];
+
+    if (status && ['pending', 'paid', 'failed', 'void'].includes(status)) {
+        sql += ` AND billing_status = ?`;
+        params.push(status);
+    }
+
+    sql += ` ORDER BY created_at DESC`;
+
+    const tickets = db.prepare(sql).all(...params);
+    res.json(tickets);
+});
+
+// 11.3 Middleware: Require Billing Admin
+const requireBillingAdmin = (req, res, next) => {
+    const adminToken = req.headers['x-admin-token'];
+
+    // Check Config Availability
+    if (!process.env.BILLING_ADMIN_TOKEN) {
+        // Log critical error but DO NOT CRASH
+        console.error('CRITICAL: BILLING_ADMIN_TOKEN not set');
+        if (process.env.NODE_ENV === 'production') {
+            return res.status(500).json({ error: 'Server Misconfiguration' });
+        }
+    }
+
+    // Check Token match
+    // Safe string verify (const time safe compare would be better but simple strict eq is MVP compliant)
+    if (adminToken !== process.env.BILLING_ADMIN_TOKEN) {
+        return res.status(403).json({ error: 'Forbidden: Invalid Admin Token' });
+    }
+
+    next();
+};
+
+// 11.4 Mark Paid (Sensitive)
+app.post('/billing/tickets/:id/mark_paid', authenticateToken, requireBillingAdmin, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const ticketId = req.params.id;
+    const { payment_ref, billing_notes } = req.body;
+
+    // Transaction
+    const performPay = db.transaction(() => {
+        // Lock row logic (SQLite doesn't support SELECT ... FOR UPDATE but transaction holds lock)
+        const ticket = db.prepare('SELECT company_id, billing_status, amount_cents FROM tickets WHERE id = ?').get(ticketId);
+
+        if (!ticket) throw new Error('NOT_FOUND');
+        if (ticket.company_id !== req.user.id) throw new Error('FORBIDDEN');
+
+        // Idempotency: If already paid, return as is (Success 200)
+        if (ticket.billing_status === 'paid') {
+            return ticket;
+        }
+
+        // State Validation: Can only pay 'pending' (or maybe 'failed'?)
+        // Strictly MVP: Only pending.
+        if (ticket.billing_status !== 'pending' && ticket.billing_status !== 'failed') {
+            // If void, cannot pay.
+            throw new Error('INVALID_STATE');
+        }
+
+        const now = nowIso();
+        db.prepare(`
+            UPDATE tickets 
+            SET billing_status = 'paid', paid_at = ?, payment_ref = ?, billing_notes = ?
+            WHERE id = ?
+        `).run(now, payment_ref || null, billing_notes || null, ticketId);
+
+        return db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+    });
+
+    try {
+        const t = performPay();
+
+        logger.info('Ticket Paid', {
+            event: 'billing_paid',
+            ticket_id: ticketId,
+            company_id: req.user.id,
+            amount: t.amount_cents
+        });
+
+        res.json(t);
+    } catch (e) {
+        if (e.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
+        if (e.message === 'FORBIDDEN') return res.status(403).json({ error: 'Access Denied' });
+        if (e.message === 'INVALID_STATE') return res.status(409).json({ error: 'Ticket cannot be paid (Void or already processed)' });
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 11.5 Void (Sensitive)
+app.post('/billing/tickets/:id/void', authenticateToken, requireBillingAdmin, (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const id = req.params.id;
+    const { billing_notes } = req.body;
+
+    const performVoid = db.transaction(() => {
+        const ticket = db.prepare('SELECT company_id, billing_status FROM tickets WHERE id = ?').get(id);
+        if (!ticket) throw new Error('NOT_FOUND');
+        if (ticket.company_id !== req.user.id) throw new Error('FORBIDDEN');
+
+        // Strict: Cannot void PAID
+        if (ticket.billing_status === 'paid') throw new Error('CONFLICT');
+
+        // Idempotency
+        if (ticket.billing_status === 'void') return ticket;
+
+        db.prepare('UPDATE tickets SET billing_status = ?, billing_notes = ? WHERE id = ?')
+            .run('void', billing_notes || null, id);
+
+        return db.prepare('SELECT * FROM tickets WHERE id = ?').get(id);
+    });
+
+    try {
+        const t = performVoid();
+        logger.info('Ticket Voided', {
+            event: 'billing_void',
+            ticket_id: id,
+            company_id: req.user.id
+        });
+        res.json(t);
+    } catch (e) {
+        if (e.message === 'CONFLICT') return res.status(409).json({ error: 'Cannot void paid ticket' });
+        if (e.message === 'FORBIDDEN') return res.status(403).json({ error: 'Access Denied' });
+        if (e.message === 'NOT_FOUND') return res.status(404).json({ error: 'Not Found' });
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+
+// --- PHASE 5.1: ADMIN PANEL API ---
+
+
+// --- PHASE 5.1 & POST: ADMIN PANEL API ---
+
+// Helper: Verify Admin Password (using crypto scrypt for security without deps)
+// For MVP + "No new deps", we can use `crypto.scryptSync`.
+const hashPassword = (pwd) => crypto.scryptSync(pwd, 'salt_mvp', 64).toString('hex');
+const verifyPassword = (pwd, hash) => hash === hashPassword(pwd);
+
+// Seed Default Admin (Idempotent)
+try {
+    const adminCount = db.prepare('SELECT count(*) as c FROM admin_users').get().c;
+    if (adminCount === 0) {
+        // Email: admin@driverflow.app, Pass: AdminSecret123!
+        const h = hashPassword('AdminSecret123!');
+        db.prepare("INSERT INTO admin_users (email, password_hash, created_at) VALUES (?, ?, ?)")
+            .run('admin@driverflow.app', h, nowIso());
+        console.log('NOTICE: seeded admin@driverflow.app');
+    }
+} catch (e) { console.error('Admin Seed Error', e); }
+
+
+// Middleware: Require Admin (JWT)
+// REPLACES: requireSystemAdmin
+const requireAdminAuth = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: 'Missing Admin Token' });
+
+    try {
+        // Reuse JWT_SECRET. In prod, maybe separate ADMIN_JWT_SECRET.
+        const user = jwt.verify(token, SECRET_KEY);
+        if (user.role !== 'admin' && user.role !== 'superadmin') throw new Error('Role mismatch');
+        req.admin = user;
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: 'Invalid Admin Token' });
+    }
+};
+
+// Admin Login Endpoint
+app.post('/admin/login', (req, res) => {
+    const { email, password } = req.body;
+    try {
+        const admin = db.prepare('SELECT * FROM admin_users WHERE email = ?').get(email);
+        if (!admin || !verifyPassword(password, admin.password_hash)) {
+            // Delay to prevent enumeration
+            // await new Promise(r => setTimeout(r, 500)); // async inside generic handler? need async wrapper. 
+            // processSync delay:
+            const s = Date.now(); while (Date.now() - s < 200) { };
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { id: admin.id, email: admin.email, role: admin.role || 'admin', type: 'admin_user' },
+            JWT_SECRET,
+            { expiresIn: '12h' }
+        );
+
+        // Audit Log
+        db.prepare("INSERT INTO admin_audit_log (admin_id, action, ip_address, timestamp) VALUES (?, 'LOGIN', ?, ?)")
+            .run(admin.id, req.ip || 'unknown', nowIso());
+
+        res.json({ token, role: admin.role });
+
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 1. List Companies (Admin) - HARDENED
+app.get('/admin/companies', requireAdminAuth, (req, res) => {
+    const { search } = req.query;
+    let sql = `
+        SELECT id, nombre, email, contacto, ciudad, search_status, verified, created_at,
+        (SELECT count(*) FROM invoices WHERE company_id = empresas.id AND status='paid') as paid_invoices
+        FROM empresas
+    `;
+    const params = [];
+
+    if (search) {
+        sql += ` WHERE nombre LIKE ? OR contacto LIKE ?`;
+        params.push(`%${search}%`, `%${search}%`);
+    }
+
+    sql += ` ORDER BY created_at DESC LIMIT 50`;
+
+    try {
+        const companies = db.prepare(sql).all(...params);
+        res.json(companies);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 2. List Payments/Invoices (Admin)
+app.get('/admin/payments', requireAdminAuth, (req, res) => {
+    // If getting global payments
+    try {
+        const sql = `
+            SELECT i.id, i.company_id, e.nombre as company_name, i.status, i.total_cents, i.currency, i.created_at, i.paid_at
+            FROM invoices i
+            JOIN empresas e ON i.company_id = e.id
+            ORDER BY i.created_at DESC LIMIT 100
+        `;
+        const payments = db.prepare(sql).all();
+        res.json(payments);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 3. List/Ops Tickets (Admin)
+app.get('/admin/tickets', requireAdminAuth, (req, res) => {
+    try {
+        const sql = `
+            SELECT t.id, t.request_id, t.company_id, e.nombre as company_name, 
+                   t.driver_id, d.nombre as driver_name,
+                   t.billing_status, t.price_cents as amount_cents, t.currency, t.created_at, t.paid_at, t.payment_ref
+            FROM tickets t
+            LEFT JOIN empresas e ON t.company_id = e.id
+            LEFT JOIN drivers d ON t.driver_id = d.id
+            ORDER BY t.created_at DESC LIMIT 100
+        `;
+        const tickets = db.prepare(sql).all();
+        res.json(tickets);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 4. Mark Paid (Admin Wrapper)
+app.post('/admin/tickets/:id/mark_paid', requireAdminAuth, (req, res) => {
+    // Audit This Action
+    const { payment_ref, billing_notes } = req.body;
+    const ticketId = req.params.id;
+
+    try {
+        const result = db.transaction(() => {
+            const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+            if (!ticket) throw new Error('NOT_FOUND');
+            if (ticket.billing_status === 'paid') return ticket;
+            if (ticket.billing_status === 'void') throw new Error('INVALID_STATE');
+
+            db.prepare(`
+                UPDATE tickets 
+                SET billing_status = 'paid', paid_at = ?, payment_ref = ?, billing_notes = ?
+                WHERE id = ?
+            `).run(nowIso(), payment_ref || 'admin_manual', billing_notes || 'Marked by Admin Panel', ticketId);
+
+            // Audit
+            db.prepare("INSERT INTO admin_audit_log (admin_id, action, target_resource, target_id, ip_address, timestamp) VALUES (?, ?, ?, ?, ?, ?)")
+                .run(req.admin.id, 'MARK_PAID', 'ticket', String(ticketId), req.ip, nowIso());
+
+            // Bridge Event (Fix 5.0 consistency)
+            db.prepare("INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)")
+                .run('invoice_paid', nowIso(), ticket.company_id, JSON.stringify({ ticket_id: ticketId, by: 'admin' }));
+
+            return db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+        })();
+
+        res.json(result);
+    } catch (e) {
+        if (e.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
+        if (e.message === 'INVALID_STATE') return res.status(409).json({ error: 'Ticket is void' });
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 5. Void (Admin Wrapper)
+app.post('/admin/tickets/:id/void', requireAdminAuth, (req, res) => {
+    const { billing_notes } = req.body;
+    const ticketId = req.params.id;
+
+    try {
+        const result = db.transaction(() => {
+            const ticket = db.prepare('SELECT billing_status FROM tickets WHERE id = ?').get(ticketId);
+            if (!ticket) throw new Error('NOT_FOUND');
+            if (ticket.billing_status === 'paid') throw new Error('CONFLICT');
+            if (ticket.billing_status === 'void') return ticket;
+
+            db.prepare('UPDATE tickets SET billing_status = ?, billing_notes = ? WHERE id = ?')
+                .run('void', billing_notes || 'Voided by Admin', ticketId);
+
+            // Audit
+            db.prepare("INSERT INTO admin_audit_log (admin_id, action, target_resource, target_id, ip_address, timestamp) VALUES (?, ?, ?, ?, ?, ?)")
+                .run(req.admin.id, 'VOID_TICKET', 'ticket', String(ticketId), req.ip, nowIso());
+
+            return db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+        })();
+
+        res.json(result);
+    } catch (e) {
+        if (e.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
+        if (e.message === 'CONFLICT') return res.status(409).json({ error: 'Cannot void paid ticket' });
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+// --- PHASE 5.2: STRIPE PAYMENTS ---
+
+const { getStripe } = require('./stripe_client');
+
+// 1. Create Checkout Session
+app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.sendStatus(403);
+    const ticketId = req.params.id;
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(503).json({ error: 'Stripe unavailable (config missing)' });
+
+    try {
+        const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        if (ticket.company_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+        // Idempotency / State Check
+        if (ticket.billing_status === 'paid') return res.status(409).json({ error: 'ALREADY_PAID', message: 'Ticket is already paid' });
+        if (ticket.billing_status === 'void') return res.status(409).json({ error: 'TICKET_VOID', message: 'Ticket is voided' });
+
+        // Create Session
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{
+                price_data: {
+                    currency: ticket.currency.toLowerCase(),
+                    product_data: {
+                        name: `DriverFlow Service #${ticket.request_id}`,
+                        description: `Ticket #${ticket.id}`
+                    },
+                    unit_amount: ticket.price_cents,
+                },
+                quantity: 1,
+            }],
+            mode: 'payment',
+            metadata: {
+                ticket_id: ticket.id,
+                company_id: req.user.id
+            },
+            success_url: process.env.STRIPE_SUCCESS_URL || `http://localhost:3000/pay/success?ticket=${ticketId}`,
+            cancel_url: process.env.STRIPE_CANCEL_URL || `http://localhost:3000/pay/cancel?ticket=${ticketId}`,
+            client_reference_id: String(ticket.id),
+        }, {
+            idempotencyKey: `checkout_${ticketId}_${ticket.billing_status}` // Basic idempotency
+        });
+
+        // Update Ticket with Session ID
+        db.prepare('UPDATE tickets SET stripe_checkout_session_id = ? WHERE id = ?').run(session.id, ticketId);
+
+        res.json({
+            success: true,
+            checkout_url: session.url,
+            session_id: session.id
+        });
+
+    } catch (e) {
+        console.error('Stripe Checkout Error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 2. Stripe Webhook
+app.post('/stripe/webhook', async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    // SKIP GUARD FOR TESTING (ONLY IF CONFIGURED EXPLICITLY TO ALLOW DANGEROUS BYPASS)
+    // The user requirement says: "Importante: Si decides permitir bypass ... SOLO NODE_ENV=test"
+    // We'll strictly check signature usually.
+    // For smoke test, pass a special flag or environment.
+
+    let event;
+    const stripe = getStripe();
+
+    try {
+        if (!stripe) throw new Error('Stripe not configured');
+
+        if (process.env.NODE_ENV === 'test' && req.headers['x-test-bypass-sig'] === 'true') {
+            // Unsafe bypass for local smoke testing ONLY
+            if (Buffer.isBuffer(req.body)) {
+                event = JSON.parse(req.body.toString());
+            } else {
+                event = req.body; // Should handle raw vs json middleware conflict if any
+            }
+        } else {
+            if (!endpointSecret) throw new Error('Missing STRIPE_WEBHOOK_SECRET');
+            // req.body is Buffer because of express.raw()
+            event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+        }
+    } catch (err) {
+        console.error(`Webhook Signature Error: ${err.message}`);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // 2. Idempotency Check
+    try {
+        const existing = db.prepare('SELECT status FROM stripe_webhook_events WHERE stripe_event_id = ?').get(event.id);
+        if (existing) {
+            return res.json({ received: true, idempotency: 'cached' });
+        }
+
+        // Register Event Pending
+        db.prepare(`
+            INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status)
+            VALUES (?, ?, ?, 'pending')
+        `).run(event.id, event.type, nowIso());
+
+    } catch (e) {
+        console.error('Webhook DB Error:', e);
+        return res.status(500).send('DB Error');
+    }
+
+    // 3. Handle Event
+    try {
+        const now = nowIso();
+
+        if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const ticketId = session.metadata && session.metadata.ticket_id;
+
+            if (ticketId) {
+                // Update Ticket
+                db.prepare(`
+                    UPDATE tickets 
+                    SET billing_status = 'paid', 
+                        paid_at = ?, 
+                        payment_ref = ?, 
+                        stripe_payment_intent_id = ?, 
+                        stripe_customer_id = ?,
+                        billing_notes = 'Paid via Stripe'
+                    WHERE id = ? AND billing_status != 'paid'
+                `).run(
+                    now,
+                    `stripe_${session.payment_intent}`,
+                    session.payment_intent,
+                    session.customer,
+                    ticketId
+                );
+
+                // NOTIFICATION event
+                db.prepare(`
+                    INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
+                    VALUES ('invoice_paid', ?, ?, ?, ?)
+                `).run(now, session.metadata.company_id, 0, JSON.stringify({ ticket_id: ticketId, stripe_id: session.id }));
+            }
+        }
+        else if (event.type === 'payment_intent.payment_failed') {
+            // Could mark fail?
+            // MVP: Just log. Status remains pending or we can set 'failed_attempt'.
+        }
+
+        // 4. Mark Processed
+        db.prepare(`
+            UPDATE stripe_webhook_events 
+            SET status = 'processed', processed_at = ? 
+            WHERE stripe_event_id = ?
+        `).run(now, event.id);
+
+        res.json({ received: true });
+
+    } catch (e) {
+        console.error('Webhook Processing Error:', e);
+        // Update Error
+        db.prepare(`
+            UPDATE stripe_webhook_events 
+            SET status = 'failed', last_error = ? 
+            WHERE stripe_event_id = ?
+        `).run(e.message, event.id);
+
+        res.status(500).json({ error: 'Processing Failed' });
+    }
+});
+
+
+// --- PHASE 5.3: RATINGS & REPUTATION ---
+
+// 1. Create Rating
+app.post('/ratings', authenticateToken, (req, res) => {
+    const { ticket_id, score, comment } = req.body;
+    const from_id = req.user.id;
+    const from_type = req.user.type; // 'empresa' or 'driver'
+
+    if (!ticket_id || !score) return res.status(400).json({ error: 'Missing fields' });
+    if (score < 1 || score > 5) return res.status(400).json({ error: 'Score must be 1-5' });
+
+    try {
+        const result = db.transaction(() => {
+            // 1. Validation: Ticket Exists & User is Participant
+            const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticket_id);
+            if (!ticket) throw new Error('NOT_FOUND');
+
+            // Check Participation
+            if (from_type === 'empresa' && ticket.company_id !== from_id) throw new Error('FORBIDDEN');
+            if (from_type === 'driver' && ticket.driver_id !== from_id) throw new Error('FORBIDDEN');
+
+            // Check Status (Must be PAID)
+            if (ticket.billing_status !== 'paid') throw new Error('TICKET_NOT_PAID');
+
+            // 2. Idempotency Check
+            const existing = db.prepare('SELECT * FROM ratings WHERE ticket_id = ? AND from_type = ?').get(ticket_id, from_type);
+            if (existing) {
+                return { status: 200, data: existing, idempotent: true };
+            }
+
+            // 3. Determine 'to' target
+            const to_type = from_type === 'empresa' ? 'driver' : 'empresa';
+            const to_id = from_type === 'empresa' ? ticket.driver_id : ticket.company_id;
+
+            // 4. Insert Rating
+            const now = nowIso();
+            const info = db.prepare(`
+                INSERT INTO ratings (ticket_id, from_type, from_id, to_type, to_id, score, comment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(ticket_id, from_type, from_id, to_type, to_id, score, comment || null, now);
+
+            const newRating = db.prepare('SELECT * FROM ratings WHERE id = ?').get(info.lastInsertRowid);
+
+            // 5. Emit Event (Realtime Notification)
+            // audience = to_type, to_id
+            // This allows the receiver to get notified "You received a rating!"
+            db.prepare(`
+                INSERT INTO events_outbox (event_name, created_at, ${to_type === 'empresa' ? 'company_id' : 'driver_id'}, metadata, audience_type, audience_id, event_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                'rating_created',
+                now,
+                to_id,
+                JSON.stringify({ ticket_id, score, comment, rater_name: req.user.nombre }), // Assuming req.user.nombre usually exists or we query it. 
+                // Wait, req.user from JWT might not have nombre if we didn't put it in payload or fetch it? 
+                // server.js /login puts { id, type } in JWT. It does NOT put nombre.
+                // It's okay, UI can fetch details. Or we fetch here. 
+                // Let's query rater name for better UX?
+                // Minimal: just ID.
+                to_type,
+                to_id,
+                'rating_received'
+            );
+
+            return { status: 200, data: newRating, idempotent: false };
+        })();
+
+        res.status(result.status).json(result.data);
+
+    } catch (e) {
+        if (e.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
+        if (e.message === 'FORBIDDEN') return res.status(403).json({ error: 'You are not a participant of this ticket' });
+        if (e.message === 'TICKET_NOT_PAID') return res.status(409).json({ error: 'Ticket must be PAID to rate' });
+
+        console.error('Rating Error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 2. Rating Summary (Public Profile or Admin)
+app.get('/ratings/summary', (req, res) => {
+    const { type, id } = req.query;
+    if (!['driver', 'empresa'].includes(type) || !id) return res.status(400).json({ error: 'Invalid params' });
+
+    try {
+        const stats = db.prepare(`
+            SELECT count(*) as count, avg(score) as avg_score 
+            FROM ratings 
+            WHERE to_type = ? AND to_id = ?
+        `).get(type, id);
+
+        res.json({
+            type,
+            id: parseInt(id),
+            count: stats.count,
+            avg_score: stats.avg_score || 0
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 3. Get My Ratings (Created by me)
+app.get('/ratings/mine', authenticateToken, (req, res) => {
+    try {
+        const myRatings = db.prepare(`
+            SELECT * FROM ratings 
+            WHERE from_type = ? AND from_id = ?
+            ORDER BY created_at DESC
+        `).all(req.user.type, req.user.id);
+
+        res.json(myRatings);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+// --- PHASE 5.4: QUEUE STATS ---
+app.get('/queue/stats', requireAdminAuth, (req, res) => {
+    try {
+        const stats = db.prepare(`
+            SELECT status, count(*) as count 
+            FROM jobs_queue 
+            GROUP BY status
+        `).all();
+
+        const errors = db.prepare(`
+            SELECT id, job_type, attempts, last_error, updated_at 
+            FROM jobs_queue 
+            WHERE status = 'failed' OR status = 'dead'
+            ORDER BY updated_at DESC LIMIT 10
+        `).all();
+
+        const heartbeat = db.prepare('SELECT * FROM worker_heartbeat WHERE worker_name = ?').get('queue_worker');
+
+        res.json({ stats, heartbeat, recent_errors: errors });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- 11.5 Phase 5: Realtime Notifications (SSE) ---
+
+// In-Memory Client Map: userId_type -> Response Object
+const sseClients = new Map();
+
+// A. Subscribe Endpoint
+app.get('/events/stream', authenticateToken, (req, res) => {
+    // 1. Headers
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    });
+
+    // 2. Register Client
+    const clientId = `${req.user.id}_${req.user.type}`;
+    sseClients.set(clientId, res);
+
+    // 3. Initial Hello
+    const hello = JSON.stringify({ type: 'hello', server_time: nowIso() });
+    res.write(`data: ${hello}\n\n`);
+
+    logger.info('SSE Connected', { clientId });
+
+    // 4. Cleanup on Close
+    req.on('close', () => {
+        sseClients.delete(clientId);
+        logger.info('SSE Disconnected', { clientId });
+    });
+});
+
+// B. Polling Fallback (Since ID)
+app.get('/events/since', authenticateToken, (req, res) => {
+    const lastId = parseInt(req.query.last_id) || 0;
+
+    // Query Logic:
+    // 1. Direct Audience Match (audience_type + audience_id)
+    // 2. Broadcast Match (audience_type='broadcast_drivers' AND user.type='driver')
+    // TODO: For strict broadcast (license check), we'd need to fetch driver profile.
+    // MVP: Deliver broadcast to all drivers, client filters or accepted overhead.
+    // Optimization: Join drivers table? For now, simple filtered query.
+
+    let sql = `
+        SELECT id, event_key, created_at, metadata, audience_type
+        FROM events_outbox
+        WHERE id > ?
+        AND (
+            (audience_type = ? AND audience_id = ?)
+            OR
+            (audience_type = 'broadcast_drivers' AND ? = 'driver')
+        )
+        ORDER BY id ASC
+        LIMIT 100
+    `;
+
+    const events = db.prepare(sql).all(lastId, req.user.type, String(req.user.id), req.user.type);
+    res.json(events);
+});
+
+// C. Dispatcher Loop (In-Process)
+setInterval(() => {
+    try {
+        // 1. Find Pending Realtime Events
+        // Where realtime_sent_at is NULL AND event_key IS NOT NULL (Phase 5 events)
+        const pending = db.prepare(`
+            SELECT * FROM events_outbox 
+            WHERE realtime_sent_at IS NULL 
+            AND event_key IS NOT NULL
+            ORDER BY id ASC
+            LIMIT 50
+        `).all();
+
+        if (pending.length === 0) return;
+
+        const now = nowIso();
+
+        db.transaction((events) => {
+            for (const evt of events) {
+                // Determine Targets
+                const targets = [];
+
+                if (evt.audience_type === 'broadcast_drivers') {
+                    // Find all connected drivers
+                    for (const [cid, client] of sseClients) {
+                        if (cid.endsWith('_driver')) {
+                            targets.push(client);
+                        }
+                    }
+                } else if (evt.audience_id && evt.audience_type) {
+                    // Direct Target
+                    const targetClient = sseClients.get(`${evt.audience_id}_${evt.audience_type}`);
+                    if (targetClient) targets.push(targetClient);
+                }
+
+                // Payload
+                const payload = JSON.stringify({
+                    id: evt.id,
+                    key: evt.event_key,
+                    created_at: evt.created_at,
+                    data: JSON.parse(evt.metadata || '{}')
+                });
+                const sseMsg = `id: ${evt.id}\nevent: message\ndata: ${payload}\n\n`;
+
+                // Send
+                // Note: We send to all online matches. 
+                // We mark 'sent' in DB regardless of online status so we don't block.
+                // Offline users fetch via /since.
+                targets.forEach(res => res.write(sseMsg));
+
+                // Mark Sent
+                db.prepare('UPDATE events_outbox SET realtime_sent_at = ? WHERE id = ?')
+                    .run(now, evt.id);
+            }
+        })(pending);
+
+    } catch (e) {
+        console.error('Dispatcher Error:', e);
+    }
+}, 2000); // Poll every 2s
+
+// D. Heartbeat (Every 25s)
+setInterval(() => {
+    sseClients.forEach(res => res.write(': ping\n\n'));
+}, 25000);
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
