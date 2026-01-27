@@ -181,6 +181,13 @@ const handlers = {
 
         if (!res.ok) {
             const errText = await res.text();
+
+            // Handle Rate Limits (User Report: 100/day limit reached)
+            if (res.status === 403 || res.status === 429) {
+                logger.warn(`SendGrid Limit Reached (${res.status}). Dropping email to prevent retry loop.`, { to: payload.email });
+                return; // Treat as success/skipped to drain queue
+            }
+
             throw new Error(`SendGrid Error ${res.status}: ${errText}`);
         }
     },
