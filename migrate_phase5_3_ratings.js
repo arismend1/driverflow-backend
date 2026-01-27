@@ -22,9 +22,20 @@ try {
             )
         `).run();
 
+        // 1.1 Check Schema Drift
+        try {
+            const rInfo = db.prepare("PRAGMA table_info(ratings)").all();
+            if (!rInfo.find(c => c.name === 'ticket_id')) {
+                db.prepare("ALTER TABLE ratings ADD COLUMN ticket_id INTEGER").run();
+                console.log('✅ Added missing ticket_id to ratings');
+            }
+        } catch (e) { console.warn('Ignore schema check error:', e.message); }
+
         // 2. Indices
-        db.prepare(`CREATE INDEX IF NOT EXISTS idx_ratings_ticket ON ratings(ticket_id)`).run();
-        db.prepare(`CREATE INDEX IF NOT EXISTS idx_ratings_target ON ratings(to_type, to_id)`).run();
+        try {
+            db.prepare(`CREATE INDEX IF NOT EXISTS idx_ratings_ticket ON ratings(ticket_id)`).run();
+            db.prepare(`CREATE INDEX IF NOT EXISTS idx_ratings_target ON ratings(to_type, to_id)`).run();
+        } catch (e) { console.warn('Index creation warning:', e.message); }
 
         console.log('✅ ratings table & indices synced.');
     });
