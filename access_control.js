@@ -1,5 +1,6 @@
 // access_control.js
-const { nowIso, nowEpochMs } = require('./time_provider');
+const time = require('./time_contract');
+// const { nowIso, nowEpochMs } = require('./time_provider'); // DEPRECATED
 
 /**
  * Enforces strict operational blocking based on debt duration.
@@ -15,9 +16,9 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
     const cId = Number(companyId);
     if (!Number.isFinite(cId)) throw new Error(`Invalid companyId: ${companyId}`);
 
-    // Use nowIso() for consistent simulation time
-    const nowStr = nowIso(); // YYYY-MM-DDTHH:mm:ss.sssZ
-    const nowMs = nowEpochMs();
+    // Use time_contract for consistent simulation time
+    const nowStr = time.nowIso({ ctx: 'enforce_check' });
+    const nowMs = time.nowMs({ ctx: 'enforce_logic' });
 
     // 0. Fetch Current Status (Preserve Manual Blocks)
     const current = db.prepare('SELECT is_blocked, blocked_reason FROM empresas WHERE id = ?').get(cId);
@@ -60,7 +61,8 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
 
         if (lastPayment && lastPayment.last_paid) {
             // Anchor: Last Payment Date
-            refDateMs = new Date(lastPayment.last_paid).valueOf();
+            const d = time.parseLoose(lastPayment.last_paid, { minYear: 2000 });
+            if (d) refDateMs = d.valueOf();
         } else {
             // Never paid OR all paid invoices irrelevant? 
             // If invoices exist but pending, use oldest pending as anchor.
@@ -71,7 +73,8 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
             `).get(cId);
 
             if (oldestPending && oldestPending.oldest_date) {
-                refDateMs = new Date(oldestPending.oldest_date).valueOf();
+                const d = time.parseLoose(oldestPending.oldest_date, { minYear: 2000 });
+                if (d) refDateMs = d.valueOf();
             }
         }
 

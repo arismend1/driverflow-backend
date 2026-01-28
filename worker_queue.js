@@ -13,6 +13,7 @@ const LOCK_TTL_SEC = 300; // 5 mins
 // Note: We'll construct specific handler logic inside or require it if needed.
 // For MVP, we inline standard handlers (email, etc) or reuse existing code logic.
 const logger = require('./logger');
+const time = require('./time_contract');
 
 // DB Connection for Worker
 let db;
@@ -22,7 +23,9 @@ function getDb() {
     return db;
 }
 
-function nowIso() { return new Date().toISOString(); }
+// function nowIso() { return new Date().toISOString(); } // REPLACED BY CONTRACT
+const nowIso = () => time.nowIso({ ctx: 'worker_queue' }); // Wrapper for compatibility
+
 
 // --- ENQUEUE HELPER ---
 function enqueueJob(dbConn, type, payload, options = {}) {
@@ -283,7 +286,9 @@ async function processJobs() {
 
             // Backoff: 5s, 10s, 20s...
             const delaySec = 5 * Math.pow(2, attempts - 1);
-            const nextRun = new Date(Date.now() + delaySec * 1000).toISOString();
+            // Time Contract Usage
+            const nowMs = time.nowMs({ ctx: 'worker_retry_calc' });
+            const nextRun = new Date(nowMs + delaySec * 1000).toISOString();
 
             conn.prepare(`
                 UPDATE jobs_queue 

@@ -1,7 +1,15 @@
 ﻿// ⚠️ FROZEN LOGIC — DO NOT MODIFY
-const db = require('better-sqlite3')(process.env.DB_PATH || 'driverflow.db');
+const DB_PATH_ENV = process.env.DB_PATH || 'driverflow.db';
+console.log(`[Generator] Connecting to DB: ${DB_PATH_ENV}`);
+const db = require('better-sqlite3')(DB_PATH_ENV);
+
+if (process.env.DEBUG_DB) {
+  const list = db.prepare("PRAGMA database_list").all();
+  console.log("[DB_LIST]", JSON.stringify(list));
+}
 const { checkAndEnforceBlocking } = require('./delinquency');
-const { nowIso } = require('./time_provider');
+const time = require('./time_contract');
+// const { nowIso } = require('./time_provider'); // DEPRECATED
 
 // ISO week label (YYYY-WW) Monday-based
 function getMondayBasedWeekLabel(dateInput) {
@@ -35,7 +43,7 @@ function getFridayFromWeek(weekLabel) {
 
 const getWeekFromDateStr = (dateStr) => getMondayBasedWeekLabel(new Date(dateStr));
 
-const targetWeek = process.argv[2] || getMondayBasedWeekLabel(nowIso());
+const targetWeek = process.argv[2] || getMondayBasedWeekLabel(time.nowIso({ ctx: 'billing_cli' }));
 console.log(`--- Generating Invoices for Week: ${targetWeek} ---`);
 
 function run() {
@@ -79,7 +87,7 @@ function run() {
       db.prepare(`
         INSERT OR IGNORE INTO invoices (company_id, billing_week, issue_date, due_date, status, currency)
         VALUES (?, ?, ?, ?, 'pending', 'USD')
-      `).run(companyId, targetWeek, nowIso(), dueDate);
+      `).run(companyId, targetWeek, time.nowIso({ ctx: 'billing_insert' }), dueDate);
 
       const invoice = db.prepare(`
         SELECT id FROM invoices WHERE company_id = ? AND billing_week = ?
@@ -123,7 +131,7 @@ function run() {
         db.prepare(`
           INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
           VALUES ('invoice_generated', ?, ?, ?, ?)
-        `).run(nowIso(), companyId, invoice.id, JSON.stringify(payload));
+        `).run(time.nowIso({ ctx: 'billing_event' }), companyId, invoice.id, JSON.stringify(payload));
         console.log(`Event emitted for invoice ${invoice.id}`);
       } catch (err) {
         if (!String(err.message).includes('UNIQUE constraint failed')) throw err;

@@ -133,7 +133,7 @@ app.get("/", (req, res) => {
     res.status(200).json({
         status: "ok",
         service: "DriverFlow API",
-        timestamp: new Date().toISOString()
+        timestamp: nowIso()
     });
 });
 
@@ -176,7 +176,7 @@ app.get('/readyz', (req, res) => {
         const hb = db.prepare("SELECT last_seen FROM worker_heartbeat WHERE worker_name='email_worker'").get();
         if (hb) {
             const last = new Date(hb.last_seen);
-            const diffSec = (Date.now() - last.getTime()) / 1000;
+            const diffSec = (nowEpochMs() - last.getTime()) / 1000;
             if (diffSec < 60) checks.worker_running = true;
         }
 
@@ -231,7 +231,7 @@ const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX) || 5;
 
 function checkRateLimit(ip, type) {
     const key = `${ip}:${type}`;
-    const now = Date.now();
+    const now = nowEpochMs();
     let record = rateLimitMap.get(key);
 
     if (!record || now > record.expiry) {
@@ -329,7 +329,7 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
-        const expires = new Date(Date.now() + 24 * 3600000).toISOString();
+        const expires = new Date(nowEpochMs() + 24 * 3600000).toISOString();
 
         if (type === 'driver') {
             const { tipo_licencia } = extras;
@@ -387,8 +387,8 @@ app.post('/login', async (req, res) => {
     if (!row) return res.status(401).json({ error: 'Credenciales inválidas' });
 
     // LOCKOUT CHECK
-    if (row.lockout_until && new Date(row.lockout_until) > new Date()) {
-        const remaining = Math.ceil((new Date(row.lockout_until) - new Date()) / 60000);
+    if (row.lockout_until && new Date(row.lockout_until) > new Date(nowEpochMs())) {
+        const remaining = Math.ceil((new Date(row.lockout_until) - new Date(nowEpochMs())) / 60000);
         return res.status(403).json({ error: 'ACCOUNT_LOCKED', message: `Cuenta bloqueada temporalmente. Intenta en ${remaining} min.` });
     }
 
@@ -415,7 +415,7 @@ app.post('/login', async (req, res) => {
         const params = [newAttempts];
 
         if (newAttempts >= 5) {
-            const lockoutTime = new Date(Date.now() + 15 * 60000).toISOString();
+            const lockoutTime = new Date(nowEpochMs() + 15 * 60000).toISOString();
             updateSql += `, lockout_until = ?`;
             params.push(lockoutTime);
         }
@@ -438,7 +438,7 @@ app.all('/verify-email', (req, res) => {
     if (!user) user = db.prepare("SELECT id, 'empresa' as type, verification_expires FROM empresas WHERE verification_token = ?").get(token);
 
     if (!user) return res.status(404).send('Token Inválido o ya usado.');
-    if (new Date(user.verification_expires) < new Date()) return res.status(400).send('Token Expirado.');
+    if (new Date(user.verification_expires) < new Date(nowEpochMs())) return res.status(400).send('Token Expirado.');
 
     const table = user.type === 'driver' ? 'drivers' : 'empresas';
     db.prepare(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`).run(user.id);
@@ -497,7 +497,7 @@ app.post('/forgot_password', (req, res) => {
     if (user) {
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
-        const expires = new Date(Date.now() + 1 * 3600000).toISOString(); // 1 Hour Expiry
+        const expires = new Date(nowEpochMs() + 1 * 3600000).toISOString(); // 1 Hour Expiry
 
         db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
 
@@ -625,7 +625,7 @@ app.post('/delete_account', authenticateToken, async (req, res) => {
     }
 
     const now = nowIso();
-    const anonContact = `deleted_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const anonContact = `deleted_${nowEpochMs()}_${Math.random().toString(36).substring(7)}`;
 
     db.prepare(`
         UPDATE ${table} 
