@@ -1,0 +1,34 @@
+name: Time Contract Integrity
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-time-contract:
+    runs-on: ubuntu-latest
+    name: Validate Time Logic (Kill-Switch)
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          
+      - name: Install Dependencies
+        run: npm ci || npm install --production=false
+
+      - name: 🧪 Run Time Regression Suite
+        # This MUST PASS. If it fails, or if Kill-Switch triggers (warn->error), CI fails.
+        run: |
+          node tests/test_time_regression.js
+          
+      - name: 🛡️ Verify No Date.now() Usage Scanned
+        # Simple grep to prevent new additions of unsafe usage generally
+        # (Excluding the contract itself and known safe files/tests)
+        run: |
+          ! grep -r "Date.now()" . --include=*.js --exclude=time_contract.js --exclude-dir=node_modules --exclude=tests/* --exclude=time_provider.js
+          ! grep -r "new Date()" . --include=*.js --exclude=time_contract.js --exclude-dir=node_modules --exclude=tests/* --exclude=time_provider.js
