@@ -25,10 +25,23 @@ try {
         // 1.1 Check Schema Drift
         try {
             const rInfo = db.prepare("PRAGMA table_info(ratings)").all();
-            if (!rInfo.find(c => c.name === 'ticket_id')) {
-                db.prepare("ALTER TABLE ratings ADD COLUMN ticket_id INTEGER").run();
-                console.log('✅ Added missing ticket_id to ratings');
-            }
+
+            const ensureColumn = (colName, colDef) => {
+                if (!rInfo.find(c => c.name === colName)) {
+                    db.prepare(`ALTER TABLE ratings ADD COLUMN ${colName} ${colDef}`).run();
+                    console.log(`✅ Added missing ${colName} to ratings`);
+                }
+            };
+
+            ensureColumn('ticket_id', 'INTEGER NOT NULL DEFAULT 0'); // Default needed for existing rows
+            ensureColumn('from_type', "TEXT NOT NULL DEFAULT 'driver' CHECK (from_type IN ('empresa','driver'))");
+            ensureColumn('from_id', 'INTEGER NOT NULL DEFAULT 0');
+            ensureColumn('to_type', "TEXT NOT NULL DEFAULT 'empresa' CHECK (to_type IN ('empresa','driver'))");
+            ensureColumn('to_id', 'INTEGER NOT NULL DEFAULT 0');
+            ensureColumn('score', 'INTEGER NOT NULL DEFAULT 5 CHECK(score BETWEEN 1 AND 5)');
+            ensureColumn('comment', 'TEXT');
+            ensureColumn('created_at', "TEXT NOT NULL DEFAULT ''");
+
         } catch (e) { console.warn('Ignore schema check error:', e.message); }
 
         // 2. Indices

@@ -1,4 +1,19 @@
-node_modules
-.env
+# Dependencies
+node_modules/
+
+# Database
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Environment
+.env
