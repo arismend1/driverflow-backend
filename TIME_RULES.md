@@ -1,38 +1,37 @@
-# 🕰️ TIME RULES & ONBOARDING
+# 🕰️ TIME RULES (TECHNICAL STANDARD)
 
-> **⚠️ CRITICAL:** This project operates under a Strict Time Contract.
-> Violating these rules will cause immediate CI failure and potential production data corruption.
+> **⚠️ CRITICAL:** This project enforces a STRICT TIME CONTRACT.
+> Violations will cause CI failures and Production Incidents.
 
 ## 🚫 PROHIBITED
 - `Date.now()`
 - `new Date()` (constructor without arguments)
-- `new Date(string)` (without strict parsing validation)
+- `new Date(string)` (without strict validation)
 
-**Why?**
-These native functions are vulnerable to:
-1. **The 1970 Epoch Ghost:** Defaulting `null`/`0` to 1970-01-01, causing 50+ years of false debt.
-2. **Time Warps:** Desynchronization during simulation (`SIM_TIME=1`), leading to dates in 2084.
+**Risks:**
+- **1970 Ghost:** Dates defaulting to epoch start (`null` -> 1970).
+- **Time Warp:** Simulation desync leading to 2084 dates.
 
 ## ✅ MANDATORY
-You MUST use the specialized `time_contract` module for ALL time operations.
+Use `time_contract.js` for ALL time operations.
 
-### 1. Timestamps (Numeric)
+### 1. Get Current Time
 ```javascript
 const time = require('./time_contract');
-const now = time.nowMs({ ctx: 'my_function_reason' }); // Returns milliseconds
+const now = time.nowMs({ ctx: 'my_context' }); // Number (ms)
+const iso = time.nowIso({ ctx: 'my_context' }); // String (ISO)
 ```
 
-### 2. Dates (ISO String)
+### 2. Parse User/DB Input
 ```javascript
-const nowIso = time.nowIso({ ctx: 'db_insert_created_at' }); // Returns "2026-05-12T..."
+// Returns valid Date or NULL (if invalid/pre-2000)
+const date = time.parseLoose(inputPayload.date, { minYear: 2000 });
+if (!date) throw new Error("Invalid/Old Date");
 ```
 
-### 3. Parsing (User/DB Input)
-```javascript
-// Automatically rejects < 2000 dates (returns null)
-const validDate = time.parseLoose(inputPayload.date, { minYear: 2000 });
-if (!validDate) throw new Error("Invalid Date");
-```
+## 💥 VIOLATIONS
+If you use `Date.now()` directly:
+1.  **Locally/Production:** It behaves normally (unless monkey-patched).
+2.  **Simulation/Test:** The **Kill-Switch** activates, logging errors and failing builds.
 
-## 📚 Reference
-See [TIME_CONTRACT.md](./TIME_CONTRACT.md) for full architectural details.
+See [TIME_CONTRACT.md](./TIME_CONTRACT.md) for architecture.

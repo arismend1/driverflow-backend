@@ -1,30 +1,25 @@
-# 🚀 PRODUCTION DEPLOY CHECKLIST
+# 🚀 DEPLOY CHECKLIST (OPERATIONAL)
 
-**Target:** `driverflow-mvp` (Billing & Simulation Core)
-**Criticality:** HIGH (Financial Impact)
+**Target:** `driverflow-mvp` (Production)
 
-## 1. PRE-DEPLOY (Staging/Canary)
-- [ ] **Code Freeze:** Confirm no modifications to `time_contract.js` or `access_control.js` in the release commit.
-- [ ] **CI Verification:** Check GitHub Actions `Validate Time Logic` passed (Green).
-- [ ] **Staging Smoke Test:**
-    ```bash
-    # MUST return 0 exit code and NO "WARNING: Date.now() called"
-    node tests/test_time_regression.js
-    ```
-- [ ] **Environment Check:** ensure `SIM_TIME` is NOT set to `1` in production ENV variables (unless specifically intended for parallel sim).
+## 1. STAGING (Canary)
+- [ ] **Deploy Code:** Push to staging environment.
+- [ ] **Run Regression:** `node tests/test_time_regression.js` (MUST PASS).
+- [ ] **Log Audit:** Check logs for `"[TimeContract] ⚠️"` warnings.
+- [ ] **Config Check:** Ensure `DB_PATH` is correct.
 
-## 2. PRODUCTION DEPLOY
-- [ ] **DB Snapshot:** Backup `driverflow.db` to s3/glacier `driverflow_pre_deploy_YYYYMMDD.db`.
-- [ ] **Deploy Code:** Pull `main` / Restart Service.
-- [ ] **Health Check:** `GET /readyz` should return HTTP 200.
-- [ ] **Log Monitoring:** Tail logs for 5 mins looking for `[TimeContract] ⚠️ WARNING` or `[TimeContract] 🛑 ERROR`.
+## 2. PRODUCTION PREP
+- [ ] **Code Freeze:** Confirm `CODE_FREEZE.md` hasn't been violated.
+- [ ] **Backup:** `cp driverflow.db driverflow_backup_YYYYMMDD.db`.
 
-## 3. ROLLBACK CRITERIA
-Initiate immediate rollback if:
-- Any `Date.now()` warning appears in logs.
-- `GET /readyz` fails for > 1 min.
-- Invoice generation count = 0 on expected billing day.
+## 3. ROLLOUT
+- [ ] **Deploy:** `git pull && npm install --production`.
+- [ ] **Restart:** `pm2 restart server` (or equivalent).
+- [ ] **Health Check:** `curl localhost:port/readyz` -> `{"ok":true}`.
+- [ ] **Smoke Test:** Login with test account.
 
-## 4. POST-DEPLOY
-- [ ] Verify `access_control` logic on 1 sample user.
-- [ ] Confirm no "Ghost Debt" (invoice dates < 2025).
+## 4. ROLLBACK PLAN
+If logs show Date/Time errors or Billing fails:
+1.  Restore usage of `driverflow_backup.db`.
+2.  Revert code to previous commit.
+3.  Restart service.

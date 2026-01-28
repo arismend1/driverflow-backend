@@ -1,5 +1,5 @@
-# 🔒 CODE FREEZE: CRITICAL TIME MODULES
-# These files are restricted. Changes require explicit approval from the Principal Engineer.
+# 🔒 CORE TIME & BILLING PROTECTION
+# These files require review from the Principal Engineer.
 
 time_contract.js            @driverflow/principal-eng
 access_control.js           @driverflow/principal-eng
