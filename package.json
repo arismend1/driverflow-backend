@@ -2,14 +2,11 @@
   "name": "driverflow-mvp",
   "version": "1.2.0",
   "description": "DriverFlow MVP - Phase 3 (Production Ready)",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node migrate_auth_fix.js && node migrate_verification.js && node migrate_reset.js && node server.js",
     "start:worker": "node process_outbox_emails.js",
-    "migrate": "node migrate_auth_fix.js",
+    "migrate": "node migrate_phase1.js && node migrate_phase2.js && node migrate_phase3.js",
     "test": "node --test \"tests/**/*.test.js\"",
     "test:match": "node --test tests/match_confirmed.test.js",
     "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\""
