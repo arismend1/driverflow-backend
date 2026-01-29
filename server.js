@@ -80,7 +80,7 @@ const db = require('./db_adapter'); // Async Adapter
 const app = express();
 
 // STRIPE WEBHOOK NEEDS RAW BODY (Must be before express.json)
-app.use('/stripe/webhook', express.raw({ type: 'application/json' }));
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 
 app.use(express.json());
 
@@ -2239,6 +2239,7 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
         // Create Session
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
+            payment_method_collection: 'always', // Strict: Collect Payment Method ID
             line_items: [{
                 price_data: {
                     currency: ticket.currency.toLowerCase(),
