@@ -25,6 +25,7 @@ if (process.env.RUN_MIGRATIONS !== 'false') {
         console.log('--- Auto-Migration ---');
         execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
         execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
+        execSync('node migrate_fix_events.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
