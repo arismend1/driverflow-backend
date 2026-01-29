@@ -2238,8 +2238,8 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
 
         // Create Session
         const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            payment_method_collection: 'always', // Strict: Collect Payment Method ID
+            payment_method_types: ['card'], // STRICT: Card Only
+            // payment_method_collection: 'always', // Removed to simplify flow if not needed for card
             line_items: [{
                 price_data: {
                     currency: ticket.currency.toLowerCase(),
@@ -2260,7 +2260,7 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
             cancel_url: process.env.STRIPE_CANCEL_URL || `http://localhost:3000/pay/cancel?ticket=${ticketId}`,
             client_reference_id: String(ticket.id),
         }, {
-            idempotencyKey: `checkout_${ticketId}_${ticket.billing_status}` // Basic idempotency
+            idempotencyKey: `checkout_${ticketId}_${ticket.billing_status}`
         });
 
         // Update Ticket with Session ID
@@ -2311,26 +2311,22 @@ app.post('/api/stripe/webhook', async (req, res) => {
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // 2. Idempotency Check
+    // 2. Safe Webhook Wrapper (Always 200)
     try {
+        // Idempotency: Duplicate Check
         const existing = await db.get('SELECT status FROM stripe_webhook_events WHERE stripe_event_id = ?', event.id);
         if (existing) {
-            return res.json({ received: true, idempotency: 'cached' });
+            console.log(`[Stripe] Skipping duplicate event ${event.id} (${existing.status})`);
+            return res.json({ received: true });
         }
 
-        // Register Event Pending
+        // Register Event (Pending)
         await db.run(`
             INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status)
             VALUES (?, ?, ?, 'pending')
         `, event.id, event.type, nowIso());
 
-    } catch (e) {
-        console.error('Webhook DB Error:', e);
-        return res.status(500).send('DB Error');
-    }
-
-    // 3. Handle Event
-    try {
+        // Process Logic
         const now = nowIso();
 
         if (event.type === 'checkout.session.completed') {
@@ -2338,7 +2334,7 @@ app.post('/api/stripe/webhook', async (req, res) => {
             const ticketId = session.metadata && session.metadata.ticket_id;
 
             if (ticketId) {
-                // Update Ticket
+                console.log(`[Stripe] Payment Success for Ticket ${ticketId}`);
                 await db.run(`
                     UPDATE tickets 
                     SET billing_status = 'paid', 
@@ -2346,7 +2342,7 @@ app.post('/api/stripe/webhook', async (req, res) => {
                         payment_ref = ?, 
                         stripe_payment_intent_id = ?, 
                         stripe_customer_id = ?,
-                        billing_notes = 'Paid via Stripe'
+                        billing_notes = 'Paid via Stripe (Card)'
                     WHERE id = ? AND billing_status != 'paid'
                 `,
                     now,
@@ -2356,7 +2352,7 @@ app.post('/api/stripe/webhook', async (req, res) => {
                     ticketId
                 );
 
-                // NOTIFICATION event
+                // Notification
                 await db.run(`
                     INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
                     VALUES ('invoice_paid', ?, ?, ?, ?)
@@ -2364,29 +2360,34 @@ app.post('/api/stripe/webhook', async (req, res) => {
             }
         }
         else if (event.type === 'payment_intent.payment_failed') {
-            // Could mark fail?
-            // MVP: Just log. Status remains pending or we can set 'failed_attempt'.
+            console.warn(`[Stripe] Payment Failed: ${event.id}`);
+            // Optional: Log failure reason
         }
 
-        // 4. Mark Processed
+        // Mark Processed
         await db.run(`
             UPDATE stripe_webhook_events 
             SET status = 'processed', processed_at = ? 
             WHERE stripe_event_id = ?
         `, now, event.id);
 
-        res.json({ received: true });
+        return res.json({ received: true });
 
-    } catch (e) {
-        console.error('Webhook Processing Error:', e);
-        // Update Error
-        await db.run(`
-            UPDATE stripe_webhook_events 
-            SET status = 'failed', last_error = ? 
-            WHERE stripe_event_id = ?
-        `, e.message, event.id);
+    } catch (processErr) {
+        console.error('[Stripe Webhook Error]', processErr);
 
-        res.status(500).json({ error: 'Processing Failed' });
+        // CRITICAL: We catch the error, log it, update DB if possible, but RETURN 200 to Stripe.
+        // This prevents the infinite retry loop for buggy logic.
+        try {
+            await db.run(`
+                UPDATE stripe_webhook_events 
+                SET status = 'failed', last_error = ? 
+                WHERE stripe_event_id = ?
+            `, processErr.message, event.id);
+        } catch (dbErr) { /* ignore DB fail here */ }
+
+        // RETURN 200 OK so Stripe stops retrying
+        return res.json({ received: true, status: 'processing_failed_but_acknowledged' });
     }
 });
 
