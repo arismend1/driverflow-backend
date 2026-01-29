@@ -210,8 +210,29 @@ app.get('/readyz', async (req, res) => {
 
 // --- 10. METRICS & DASHBOARD ---
 app.get('/metrics', async (req, res) => {
-    // 1. Strict Auth
-    if (req.headers['authorization'] !== `Bearer ${process.env.METRICS_TOKEN}`) return res.sendStatus(401);
+    // 1. Strict & Robust Auth
+    const expected = (process.env.METRICS_TOKEN || '').trim();
+    if (process.env.NODE_ENV === 'production' && !expected) {
+        console.error('[Metrics] FATAL: METRICS_TOKEN missing in production');
+        return res.status(500).json({ error: 'Configuration Error' });
+    }
+
+    // Try extract token from headers
+    let token = req.headers['x-metrics-token'];
+    if (!token && req.headers['authorization']) {
+        const parts = req.headers['authorization'].split(' ');
+        if (parts.length === 2 && parts[0].match(/^Bearer$/i)) {
+            token = parts[1];
+        }
+    }
+
+    // Compare
+    const provided = (token || '').trim();
+    if (provided !== expected) {
+        console.warn(`[Metrics] Auth Failed. IP=${req.ip} UserAgent=${req.get('User-Agent')}`);
+        // Do NOT log the provided token to avoid leaking secrets in logs
+        return res.sendStatus(401);
+    }
 
     // 2. Data Gathering
     try {
