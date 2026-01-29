@@ -214,12 +214,18 @@ app.get('/sys/debug/email-status', async (req, res) => {
 
 app.post('/sys/debug/reset-jobs', async (req, res) => {
     try {
-        // Reset stuck/dead jobs to pending
-        await db.run("UPDATE jobs_queue SET status='pending', attempts=0, run_at=?, locked_by=NULL WHERE status IN ('dead', 'failed', 'processing')", nowIso());
-        // Reset old events that might be stuck
-        await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status != 'done'");
-        res.json({ ok: true, message: "Jobs and Events Reset" });
+        await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status IN ('processing', 'failed')");
+        await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status IS NULL OR queue_status='processing'");
+        res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/sys/debug/user-check', async (req, res) => {
+    const email = req.query.email;
+    if (!email) return res.json({ error: 'No email provided' });
+    const d = await db.get("SELECT * FROM drivers WHERE contact_email = ? OR contacto = ?", email, email);
+    const e = await db.get("SELECT * FROM empresas WHERE contact_email = ? OR contacto = ?", email, email);
+    res.json({ driver: d, empresa: e });
 });
 
 // 1. JWT SECRET UNIFICATION (CRITICAL)
@@ -368,7 +374,7 @@ app.post('/forgot_password', async (req, res) => {
 
             await auditLog('forgot_password_req', u.id, u.type, { email }, req);
         } else {
-            await auditLog('forgot_password_fail', 'unknown', email, { reason: 'not_found' }, req);
+            await auditLog('forgot_password_fail', 'unknown', String(email), { reason: 'not_found', body: req.body }, req);
         }
         res.json({ ok: true }); // Always 200 security
     } catch (e) {
