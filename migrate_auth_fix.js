@@ -1,7 +1,6 @@
 const db = require('./db_adapter');
-// const Database = require('better-sqlite3'); // REMOVED
+// SQLite removed
 // const dbPath = process.env.DB_PATH || 'driverflow.db';
-// const db = new Database(dbPath);
 
 console.log(`[AUTH MIGRATION] Starting Migration (Async/Adapter Mode)`);
 

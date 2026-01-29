@@ -1,7 +1,6 @@
 ﻿const db = require('./db_adapter');
-// const Database = require("better-sqlite3");
+// SQLite removed
 // const DB_PATH = (process.env.DB_PATH || "driverflow.db").trim();
-// const db = new Database(DB_PATH);
 
 // Config
 const DRY_RUN = process.env.DRY_RUN === "1";
