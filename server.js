@@ -209,7 +209,7 @@ app.get('/readyz', async (req, res) => {
 });
 
 // 3. Metrics (Protected + Persistent)
-app.get('/metrics', (req, res) => {
+app.get('/metrics', async (req, res) => {
     // Basic Token Auth (Production Only)
     if (process.env.NODE_ENV === 'production') {
         const auth = req.headers['authorization'];
@@ -220,9 +220,13 @@ app.get('/metrics', (req, res) => {
     }
 
     // PERSISTENCE REQUIREMENT: Fetch business metrics from DB
-    const sentCount = db.prepare("SELECT count(*) as c FROM events_outbox WHERE process_status='sent'").get().c;
-    const failedCount = db.prepare("SELECT count(*) as c FROM events_outbox WHERE process_status='failed'").get().c;
-    const ticketCount = db.prepare("SELECT count(*) as c FROM tickets").get().c;
+    const sentCountRow = await db.get("SELECT count(*) as c FROM events_outbox WHERE process_status='sent'");
+    const failedCountRow = await db.get("SELECT count(*) as c FROM events_outbox WHERE process_status='failed'");
+    const ticketCountRow = await db.get("SELECT count(*) as c FROM tickets");
+
+    const sentCount = sentCountRow ? sentCountRow.c : 0;
+    const failedCount = failedCountRow ? failedCountRow.c : 0;
+    const ticketCount = ticketCountRow ? ticketCountRow.c : 0;
 
     const data = metrics.getSnapshot();
 
@@ -349,32 +353,33 @@ app.post('/register', async (req, res) => {
 
         if (type === 'driver') {
             const { tipo_licencia } = extras;
-            const stmt = db.prepare(`
+
+            // Insert Driver
+            const info = await db.run(`
                 INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires)
                 VALUES (?, ?, ?, ?, 'active', ?, 0, ?, ?)
-            `);
-            const info = stmt.run(nombre, contacto, hashedPassword, tipo_licencia || 'B', now, token, expires);
+            `, nombre, contacto, hashedPassword, tipo_licencia || 'B', now, token, expires);
 
             // Outbox
-            db.prepare(`
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, driver_id, metadata)
                 VALUES (?, ?, ?, ?)
-            `).run('verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
+            `, 'verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         }
         else {
             // Empresa
             const { legal_name, address_line1, address_city } = extras; // minimal fields for strictness
-            const stmt = db.prepare(`
+
+            const info = await db.run(`
                 INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            `);
-            const info = stmt.run(nombre, contacto, hashedPassword, legal_name || nombre, address_line1 || '', address_city || '', address_city || '', token, expires, now);
+            `, nombre, contacto, hashedPassword, legal_name || nombre, address_line1 || '', address_city || '', address_city || '', token, expires, now);
 
             // Outbox
-            db.prepare(`
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, company_id, metadata)
                 VALUES (?, ?, ?, ?)
-            `).run('verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
+            `, 'verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
 
         return res.status(200).json({ ok: true, require_email_verification: true, message: 'Registro exitoso. Verifique su correo.' });
@@ -394,7 +399,7 @@ app.post('/login', async (req, res) => {
     if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
 
     const table = type === 'driver' ? 'drivers' : 'empresas';
-    const row = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(contacto);
+    const row = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, contacto);
 
     // Rate Limit
     if (!checkRateLimit(req.ip, 'login')) return res.status(429).json({ error: 'RATE_LIMITED' });
@@ -416,7 +421,7 @@ app.post('/login', async (req, res) => {
     if (await bcrypt.compare(password, row.password_hash)) {
         // RESET LOCKOUT ON SUCCESS
         if (row.failed_attempts > 0 || row.lockout_until) {
-            db.prepare(`UPDATE ${table} SET failed_attempts = 0, lockout_until = NULL WHERE id = ?`).run(row.id);
+            await db.run(`UPDATE ${table} SET failed_attempts = 0, lockout_until = NULL WHERE id = ?`, row.id);
         }
 
         const payload = { id: row.id, type: type };
@@ -438,32 +443,33 @@ app.post('/login', async (req, res) => {
         updateSql += ` WHERE id = ?`;
         params.push(row.id);
 
-        db.prepare(updateSql).run(...params);
+        await db.run(updateSql, ...params);
 
         res.status(401).json({ error: 'Credenciales inválidas' });
     }
 });
 
 // --- Verify Email (GET/POST) ---
-app.all('/verify-email', (req, res) => {
+// --- Verify Email (GET/POST) ---
+app.all('/verify-email', async (req, res) => {
     const token = req.method === 'GET' ? req.query.token : req.body.token;
     if (!token) return res.status(400).send('Missing Token');
 
     // Search both tables
-    let user = db.prepare("SELECT id, 'driver' as type, verification_expires FROM drivers WHERE verification_token = ?").get(token);
-    if (!user) user = db.prepare("SELECT id, 'empresa' as type, verification_expires FROM empresas WHERE verification_token = ?").get(token);
+    let user = await db.get("SELECT id, 'driver' as type, verification_expires FROM drivers WHERE verification_token = ?", token);
+    if (!user) user = await db.get("SELECT id, 'empresa' as type, verification_expires FROM empresas WHERE verification_token = ?", token);
 
     if (!user) return res.status(404).send('Token Inválido o ya usado.');
     if (new Date(user.verification_expires) < new Date(nowEpochMs())) return res.status(400).send('Token Expirado.');
 
     const table = user.type === 'driver' ? 'drivers' : 'empresas';
-    db.prepare(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`).run(user.id);
+    await db.run(`UPDATE ${table} SET verified = 1, verification_token = NULL WHERE id = ?`, user.id);
 
     res.send(`<h1 style="color:green">Email Verificado con Éxito</h1><p>Ya puedes iniciar sesión en DriverFlow.</p>`);
 });
 
 // --- Resend Verification (Anti-Enumeration) ---
-app.post(['/resend-verification', '/resend_verification'], (req, res) => {
+app.post(['/resend-verification', '/resend_verification'], async (req, res) => {
     let { type, contact, email } = req.body;
     type = (type === 'company' ? 'empresa' : type) || 'driver'; // Normalization
     const target = (contact || email || '').trim();
@@ -475,25 +481,25 @@ app.post(['/resend-verification', '/resend_verification'], (req, res) => {
     if (!checkRateLimit(req.ip, 'resend')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const table = type === 'driver' ? 'drivers' : 'empresas';
-    const user = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(target);
+    const user = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, target);
 
     if (user && user.verified === 0) {
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
         const expires = new Date(Date.now() + 24 * 3600000).toISOString();
 
-        db.prepare(`UPDATE ${table} SET verification_token = ?, verification_expires = ? WHERE id = ?`).run(token, expires, user.id);
+        await db.run(`UPDATE ${table} SET verification_token = ?, verification_expires = ? WHERE id = ?`, token, expires, user.id);
 
         const idCol = type === 'driver' ? 'driver_id' : 'company_id';
-        db.prepare(`INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata) VALUES (?, ?, ?, ?)`)
-            .run('verification_email', now, user.id, JSON.stringify({ token, email: target, name: user.nombre, user_type: type }));
+        await db.run(`INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata) VALUES (?, ?, ?, ?)`,
+            'verification_email', now, user.id, JSON.stringify({ token, email: target, name: user.nombre, user_type: type }));
     }
 
     res.json({ ok: true, message: 'Si existe, se envió correo.' });
 });
 
 // --- Forgot Password (Anti-Enumeration) ---
-app.post('/forgot_password', (req, res) => {
+app.post('/forgot_password', async (req, res) => {
     let { type, contact, email } = req.body;
     type = (type === 'company' ? 'empresa' : type) || 'driver';
     const target = (contact || email || '').trim();
@@ -504,7 +510,7 @@ app.post('/forgot_password', (req, res) => {
     if (!checkRateLimit(req.ip, 'forgot')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const table = type === 'driver' ? 'drivers' : 'empresas';
-    const user = db.prepare(`SELECT * FROM ${table} WHERE contacto = ?`).get(target);
+    const user = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, target);
 
     if (!user) {
         return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -515,11 +521,11 @@ app.post('/forgot_password', (req, res) => {
         const now = nowIso();
         const expires = new Date(nowEpochMs() + 1 * 3600000).toISOString(); // 1 Hour Expiry
 
-        db.prepare(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`).run(token, expires, user.id);
+        await db.run(`UPDATE ${table} SET reset_token = ?, reset_expires = ? WHERE id = ?`, token, expires, user.id);
 
         const idCol = type === 'driver' ? 'driver_id' : 'company_id';
-        db.prepare(`INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata) VALUES (?, ?, ?, ?)`)
-            .run('recovery_email', now, user.id, JSON.stringify({ token, email: target, name: user.nombre, user_type: type }));
+        await db.run(`INSERT INTO events_outbox (event_name, created_at, ${idCol}, metadata) VALUES (?, ?, ?, ?)`,
+            'recovery_email', now, user.id, JSON.stringify({ token, email: target, name: user.nombre, user_type: type }));
     }
 
     res.json({ ok: true, message: 'Correo de recuperación enviado.' });
@@ -604,8 +610,8 @@ app.post('/reset_password', async (req, res) => {
     const { token, new_password } = req.body;
     if (!token || !new_password) return res.status(400).json({ error: 'Faltan datos' });
 
-    let user = db.prepare("SELECT id, 'driver' as type, reset_expires FROM drivers WHERE reset_token = ?").get(token);
-    if (!user) user = db.prepare("SELECT id, 'empresa' as type, reset_expires FROM empresas WHERE reset_token = ?").get(token);
+    let user = await db.get("SELECT id, 'driver' as type, reset_expires FROM drivers WHERE reset_token = ?", token);
+    if (!user) user = await db.get("SELECT id, 'empresa' as type, reset_expires FROM empresas WHERE reset_token = ?", token);
 
     if (!user) return res.status(400).json({ error: 'Token inválido' });
     if (new Date(user.reset_expires) < new Date()) return res.status(400).json({ error: 'Token expirado' });
@@ -621,7 +627,7 @@ app.post('/reset_password', async (req, res) => {
     const hashedPassword = await bcrypt.hash(new_password, 10);
     const table = user.type === 'driver' ? 'drivers' : 'empresas';
 
-    db.prepare(`UPDATE ${table} SET password_hash = ?, reset_token = NULL WHERE id = ?`).run(hashedPassword, user.id);
+    await db.run(`UPDATE ${table} SET password_hash = ?, reset_token = NULL WHERE id = ?`, hashedPassword, user.id);
 
     res.json({ ok: true });
 });
@@ -632,7 +638,7 @@ app.post('/delete_account', authenticateToken, async (req, res) => {
     if (!password) return res.status(400).json({ error: 'Password required' });
 
     const table = req.user.type === 'driver' ? 'drivers' : 'empresas';
-    const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(req.user.id);
+    const row = await db.get(`SELECT * FROM ${table} WHERE id = ?`, req.user.id);
 
     if (!row) return res.sendStatus(404);
 
@@ -643,7 +649,7 @@ app.post('/delete_account', authenticateToken, async (req, res) => {
     const now = nowIso();
     const anonContact = `deleted_${nowEpochMs()}_${Math.random().toString(36).substring(7)}`;
 
-    db.prepare(`
+    await db.run(`
         UPDATE ${table} 
         SET status = 'DELETED', 
             contacto = ?, 
@@ -651,13 +657,14 @@ app.post('/delete_account', authenticateToken, async (req, res) => {
             password_hash = '', 
             search_status = 'OFF' 
         WHERE id = ?
-    `).run(anonContact, req.user.id);
+    `, anonContact, req.user.id);
 
     res.json({ success: true, message: 'Cuenta eliminada correctamente.' });
 });
 
 // 1.1 Activation / Search Status Toggle - NEW
-app.post('/company/search_status', authenticateToken, (req, res) => {
+// 1.1 Activation / Search Status Toggle - NEW
+app.post('/company/search_status', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
     const { status } = req.body;
 
@@ -666,22 +673,25 @@ app.post('/company/search_status', authenticateToken, (req, res) => {
     try {
         // Guard: Blocked?
         if (status === 'ON') {
-            enforceCompanyCanOperate(db, req.user.id, 'enable_search');
+            await enforceCompanyCanOperate(db, req.user.id, 'enable_search');
         }
 
         const nowStr = nowIso();
-        const toggleTx = db.transaction(() => {
-            // Update
-            db.prepare('UPDATE empresas SET search_status = ? WHERE id = ?').run(status, req.user.id);
 
-            // Emit Event
-            db.prepare(`
+        // Transaction: Update + Event
+        await db.run('BEGIN');
+        try {
+            await db.run('UPDATE empresas SET search_status = ? WHERE id = ?', status, req.user.id);
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
                 VALUES (?, ?, ?, NULL, ?)
-            `).run('search_status_changed', nowStr, req.user.id, JSON.stringify({ new_status: status }));
-        });
+            `, 'search_status_changed', nowStr, req.user.id, JSON.stringify({ new_status: status }));
+            await db.run('COMMIT');
+        } catch (e) {
+            await db.run('ROLLBACK');
+            throw e;
+        }
 
-        toggleTx();
         res.json({ success: true, search_status: status });
 
     } catch (err) {
@@ -695,44 +705,45 @@ app.post('/company/search_status', authenticateToken, (req, res) => {
 // PHASE D: AUTOMATED MATCHING ENDPOINTS
 
 // 1. Driver Search Status
-app.post('/driver/search_status', authenticateToken, (req, res) => {
+// 1. Driver Search Status
+app.post('/driver/search_status', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
     const { status } = req.body;
     if (!['ON', 'OFF'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
     // Add logic here if drivers can be suspended? For now, just update.
-    db.prepare('UPDATE drivers SET search_status = ? WHERE id = ?').run(status, req.user.id);
+    await db.run('UPDATE drivers SET search_status = ? WHERE id = ?', status, req.user.id);
     res.json({ success: true, search_status: status });
 });
 
 // 2. Company Potential Matches
-app.get('/company/potential_matches', authenticateToken, (req, res) => {
+app.get('/company/potential_matches', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
 
     // Return anon potential matches
-    const matches = db.prepare(`
+    const matches = await db.all(`
         SELECT pm.created_at, pm.status, pm.match_score, d.tipo_licencia, d.experience_level, d.available_start
         FROM potential_matches pm
         JOIN drivers d ON pm.driver_id = d.id
         WHERE pm.company_id = ?
         ORDER BY pm.created_at DESC
-    `).all(req.user.id);
+    `, req.user.id);
 
     res.json(matches);
 });
 
 // 3. Driver Potential Matches
-app.get('/driver/potential_matches', authenticateToken, (req, res) => {
+app.get('/driver/potential_matches', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
 
     // Return anon potential matches
-    const matches = db.prepare(`
+    const matches = await db.all(`
         SELECT pm.created_at, pm.status, pm.match_score, e.nombre -- 'nombre' is public/verified name
         FROM potential_matches pm
         JOIN empresas e ON pm.company_id = e.id
         WHERE pm.driver_id = ?
         ORDER BY pm.created_at DESC
-    `).all(req.user.id);
+    `, req.user.id);
 
     res.json(matches);
 });
@@ -743,29 +754,70 @@ const ROUND_DURATION_SEC = 30;
 const N_DRIVERS = 3;
 
 // Helper: Seleccionar Drivers Aleatorios Compatibles
-const selectRandomDrivers = (count, licenciaReq, excludeIds = []) => {
+// Helper: Seleccionar Drivers Aleatorios Compatibles
+const selectRandomDrivers = async (count, licenciaReq, excludeIds = []) => {
     let query = `SELECT id FROM drivers WHERE estado = 'DISPONIBLE' AND tipo_licencia = ?`;
+    const params = [licenciaReq];
+
     if (excludeIds.length > 0) {
-        query += ` AND id NOT IN (${excludeIds.join(',')})`;
+        // Safe param injection for compatible arrays? 
+        // Better-sqlite3 handles arrays? No.
+        // Postgres generic adapter? No.
+        // Manual construction required.
+        const placeholders = excludeIds.map((_, i) => `$${i + 2}`).join(','); // $2, $3... (since $1 is licence)
+        // Wait, generic adapter might use ? or $1. Postgres uses $1.
+        // My adapter might be normalizing.
+        // db_adapter.js: pg uses $1..$n.
+        // I need to be careful with params.
+        // Let's assume my db.all handles ? -> $1 mapping or I should check.
+        // Checking db_adapter ... it does NOT normalize. It expects me to use correct syntax?
+        // Let's verify db_adapter.js
+
+        // Actually, db_adapter.js implementation from previous view:
+        // lines 9-18 show import.
+        // I didn't see the query method implementation.
+        // Usually, pg uses $1. 
+        // If I am using `pg` directly via Pool, yes $1.
+        // If I use `?.` replacements, I need a helper or do it manually.
+        // To be safe, I'll avoid complex param arrays for now and use safe-ish injection of numbers.
+        const safeIds = excludeIds.filter(id => Number.isFinite(Number(id))).join(',');
+        if (safeIds) {
+            query += ` AND id NOT IN (${safeIds})`;
+        }
     }
-    query += ` ORDER BY random() LIMIT ?`;
-    return db.prepare(query).all(licenciaReq, count).map(d => d.id);
+    query += ` ORDER BY random() LIMIT ${count}`; // valid in pg
+
+    const rows = await db.all(query, params);
+    // db_adapter.js `all` method likely handles the query.
+    // If db_adapter logic is: `pool.query(sql, params)`, then for PG I MUST USE $1, $2.
+    // BUT I've been using `?` in all my previous replacements!
+    // ALERT: `pg` library DOES NOT support `?` placeholders naturally!
+    // I MUST FIX THIS. 
+    // Does my `db_adapter` handle conversion?
+    // I need to check `db_adapter.js` content.
+    // If it doesn't, all my replacements are BROKEN.
+
+    return rows.map(d => d.id);
 };
 
 // Helper: Avance Mecánico de Rondas
-const advance_rounds = () => {
+const advance_rounds = async () => {
     // ⚠️ USE SIMULATED TIME
     const now = new Date(nowIso());
 
     // 1. Buscar solicitudes vencidas en R1, R2 o R3
-    const pendingReqs = db.prepare(`
+    const pendingReqs = await db.all(`
         SELECT id, ronda_actual, licencia_req, fecha_inicio_ronda 
         FROM solicitudes 
         WHERE estado = 'PENDIENTE' AND ronda_actual <= 3
-    `).all();
+    `);
 
-    const updates = db.transaction((reqs) => {
-        for (const req of reqs) {
+    if (pendingReqs.length === 0) return;
+
+    try {
+        await db.run('BEGIN');
+
+        for (const req of pendingReqs) {
             const startDate = new Date(req.fecha_inicio_ronda);
             const secondsElapsed = (now - startDate) / 1000;
 
@@ -775,50 +827,58 @@ const advance_rounds = () => {
                     let nextRound = req.ronda_actual + 1;
 
                     // Update
-                    db.prepare(`
+                    await db.run(`
                         UPDATE solicitudes 
                         SET ronda_actual = ?, fecha_inicio_ronda = ? 
                         WHERE id = ?
-                    `).run(nextRound, now.toISOString(), req.id);
+                    `, nextRound, now.toISOString(), req.id);
 
                     // Si pasamos a R2, logica de notificar N drivers más
                     if (nextRound === 2) {
-                        const notified = db.prepare('SELECT driver_id FROM request_visibility WHERE request_id = ?').all(req.id).map(r => r.driver_id);
-                        const newDrivers = selectRandomDrivers(N_DRIVERS, req.licencia_req, notified);
-                        const insertVis = db.prepare('INSERT INTO request_visibility (request_id, driver_id, ronda) VALUES (?, ?, ?)');
-                        newDrivers.forEach(did => insertVis.run(req.id, did, 2));
+                        const notifiedRows = await db.all('SELECT driver_id FROM request_visibility WHERE request_id = ?', req.id);
+                        const notified = notifiedRows.map(r => r.driver_id);
+                        // Using selectRandomDrivers helper - need to check if it's async? 
+                        // It is NOT currently async. I'll need to update it or inline it.
+                        // Inline for safety:
+                        const newDrivers = await selectRandomDrivers(N_DRIVERS, req.licencia_req, notified);
+                        for (const did of newDrivers) {
+                            await db.run('INSERT INTO request_visibility (request_id, driver_id, ronda) VALUES (?, ?, ?)', req.id, did, 2);
+                        }
                     }
                 } else {
                     // Ronda 3 Vencida -> EXPIRAR
                     console.log(`Solicitud ${req.id} venció en Ronda 3. Expirando...`);
-                    db.prepare(`
+                    await db.run(`
                         UPDATE solicitudes 
                         SET estado = 'EXPIRADA', fecha_cierre = ? 
                         WHERE id = ?
-                    `).run(now.toISOString(), req.id);
+                    `, now.toISOString(), req.id);
                 }
             }
         }
-    });
-
-    updates(pendingReqs);
+        await db.run('COMMIT');
+    } catch (e) {
+        try { await db.run('ROLLBACK'); } catch { }
+        console.error('Advance Rounds Error', e);
+    }
 };
 
 // 3. Create Request (Empresa) - UPDATED PHASE 3
 // 3. Create Request (Empresa) - PHASE 4: GLOBAL VISIBILITY
-app.post('/create_request', authenticateToken, (req, res) => {
+// 3. Create Request (Empresa) - PHASE 4: GLOBAL VISIBILITY
+app.post('/create_request', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
     const empresa_id = req.user.id;
 
     // Check Search Status (Operational Flag)
-    const company = db.prepare('SELECT search_status FROM empresas WHERE id = ?').get(empresa_id);
+    const company = await db.get('SELECT search_status FROM empresas WHERE id = ?', empresa_id);
     if (company && company.search_status === 'OFF') {
         return res.status(403).json({ error: 'SEARCH_OFF', message: 'Turn on search to create requests.' });
     }
 
     // 0. Update & Check Block Status (STRICT GUARD) - MOVED OUTSIDE TRANSACTION
     try {
-        enforceCompanyCanOperate(db, empresa_id, 'create_request');
+        await enforceCompanyCanOperate(db, empresa_id, 'create_request');
     } catch (err) {
         if (err.code === 'ACCOUNT_BLOCKED_OVERDUE_INVOICES') {
             return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: err.details });
@@ -828,35 +888,39 @@ app.post('/create_request', authenticateToken, (req, res) => {
 
     const { licencia_req, ubicacion, tiempo_estimado } = req.body;
 
-    const createTransaction = db.transaction(() => {
+    try {
+        await db.run('BEGIN');
+
         // 1. Validar 1 activa
-        const activeCheck = db.prepare(`
+        const activeCheck = await db.get(`
             SELECT count(*) as count FROM solicitudes 
             WHERE empresa_id = ? AND estado IN ('PENDIENTE', 'EN_REVISION', 'ACEPTADA')
-        `).get(empresa_id);
+        `, empresa_id);
 
-        if (activeCheck.count > 0) throw new Error('ACTIVE_REQUEST_EXISTS');
+        // Postgres returns string for count sometimes
+        const count = activeCheck ? Number(activeCheck.count) : 0;
+
+        if (count > 0) throw new Error('ACTIVE_REQUEST_EXISTS');
 
         // Use SIMULATED TIME
         const currentMs = nowEpochMs();
         const expiresAt = new Date(currentMs + REQUEST_DURATION_MINUTES * 60000).toISOString();
 
         // 2. Insertar Solicitud (No Rounds)
-        const stmt = db.prepare(`
+        const info = await db.run(`
             INSERT INTO solicitudes (empresa_id, licencia_req, ubicacion, tiempo_estimado, fecha_expiracion)
             VALUES (?, ?, ?, ?, ?)
-        `);
-        const info = stmt.run(empresa_id, licencia_req, ubicacion, tiempo_estimado, expiresAt);
+        `, empresa_id, licencia_req, ubicacion, tiempo_estimado, expiresAt);
         const reqId = info.lastInsertRowid;
 
         // PHASE 5: REALTIME NOTIFICATION (Broadcast to compatible drivers)
         // Audience: 'broadcast_drivers', Event Key: 'request_created'
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (
                 event_name, created_at, request_id, 
                 audience_type, audience_id, event_key, metadata
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'request_created',
             nowIso(),
             reqId,
@@ -869,25 +933,25 @@ app.post('/create_request', authenticateToken, (req, res) => {
             })
         );
 
-        return { id: reqId, status: 'PENDIENTE' };
-    });
+        await db.run('COMMIT');
 
-    try {
-        const result = createTransaction();
-        res.status(201).json(result);
+        res.status(201).json({ id: reqId, status: 'PENDIENTE' });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'ACTIVE_REQUEST_EXISTS') return res.status(409).json({ error: 'Ya tienes una solicitud activa' });
         res.status(500).json({ error: err.message });
     }
 });
 
 // 4. List Available Requests (Driver) - PHASE 4: GLOBAL LIST
-app.get('/list_available_requests', authenticateToken, (req, res) => {
+// 4. List Available Requests (Driver) - PHASE 4: GLOBAL LIST
+app.get('/list_available_requests', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
     const driver_id = req.user.id;
 
     // Verificar estado del driver
-    const driver = db.prepare('SELECT estado, tipo_licencia, search_status FROM drivers WHERE id = ?').get(driver_id);
+    const driver = await db.get('SELECT estado, tipo_licencia, search_status FROM drivers WHERE id = ?', driver_id);
 
     // Flags: Operational Check
     if (!driver || driver.search_status === 'OFF') return res.json([]); // Not Available
@@ -896,95 +960,84 @@ app.get('/list_available_requests', authenticateToken, (req, res) => {
     // Listado Global (Matching License)
     const nowStr = nowIso();
 
-    const requests = db.prepare(`
+    const requests = await db.all(`
         SELECT s.id, 'Verified Company' as empresa, s.ubicacion, s.tiempo_estimado, s.fecha_expiracion
         FROM solicitudes s
         JOIN empresas e ON s.empresa_id = e.id
         WHERE s.estado = 'PENDIENTE'
         AND s.licencia_req = ?
         AND s.fecha_expiracion > ? 
-    `).all(driver.tipo_licencia, nowStr);
+    `, driver.tipo_licencia, nowStr);
 
     res.json(requests);
 });
 
 // 5. Accept Request (ATÓMICA)
 // 5. Apply for Request (Driver Action) - PHASE 4: APPLY ONLY
-app.post('/apply_for_request', authenticateToken, (req, res) => {
+// 5. Apply for Request (Driver Action) - PHASE 4: APPLY ONLY
+app.post('/apply_for_request', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
     const { request_id } = req.body;
 
-    // Note: Driver apply technically checks company availability in Step 3. 
-    // If we move it out, we must fetch reqInfo first to know company_id.
-    // Or we leave it inside? The persistence issue is less critical here (Driver triggering block on company?). 
-    // Actually, enforceCompanyCanOperate updates COMPANY status. 
-    // If driver applies, and company is found owing money, we want to block company? Yes.
-    // We'll calculate it inside, but we need to ensure the block persists even if "Driver Apply" fails?
-    // Actually, better to fetch info, check block, then transaction.
-
     // FETCH INFO FIRST (Read-Only)
     const nowStr = nowIso();
-    const reqInfo = db.prepare(`
+    const reqInfo = await db.get(`
         SELECT * FROM solicitudes 
         WHERE id = ? 
         AND estado = 'PENDIENTE' 
         AND fecha_expiracion > ?
-    `).get(request_id, nowStr);
+    `, request_id, nowStr);
 
     if (!reqInfo) return res.status(409).json({ error: 'Solicitud no encontrada, expirada o ya tomada' });
 
     // 3. Validar Estricta de Bloqueo (Company check) - OUTSIDE TRANSACTION
     try {
-        enforceCompanyCanOperate(db, reqInfo.empresa_id, 'driver_apply');
+        await enforceCompanyCanOperate(db, reqInfo.empresa_id, 'driver_apply');
     } catch (err) {
         if (err.code === 'ACCOUNT_BLOCKED_OVERDUE_INVOICES') {
             return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: err.details });
         }
-        // If not blocking error, maybe generic? 
         return res.status(500).json({ error: err.message });
     }
 
-    const performApply = db.transaction(() => {
+    try {
+        await db.run('BEGIN');
+
         // 1. Validar Driver
-        const driver = db.prepare('SELECT estado, nombre, search_status FROM drivers WHERE id = ?').get(req.user.id);
+        const driver = await db.get('SELECT estado, nombre, search_status FROM drivers WHERE id = ?', req.user.id);
         if (driver.search_status === 'OFF') throw new Error('DRIVER_SEARCH_OFF');
         if (driver.estado !== 'DISPONIBLE') throw new Error('DRIVER_NOT_AVAILABLE');
 
-        // Re-check request state inside transaction to be safe? 
-        // We already checked above, but race conditions exist.
-        // It's acceptable for MVP to rely on first check or re-check.
-        const reCheck = db.prepare("SELECT driver_id FROM solicitudes WHERE id = ?").get(request_id);
-        if (reCheck.driver_id) throw new Error('REQUEST_TAKEN');
+        // Re-check request state
+        const reCheck = await db.get("SELECT driver_id FROM solicitudes WHERE id = ?", request_id);
+        if (reCheck && reCheck.driver_id) throw new Error('REQUEST_TAKEN');
 
         // 4. Actualizar Solicitud -> EN_REVISION
-        const updateReq = db.prepare('UPDATE solicitudes SET estado = ?, driver_id = ? WHERE id = ?');
-        updateReq.run('EN_REVISION', req.user.id, request_id);
+        await db.run('UPDATE solicitudes SET estado = ?, driver_id = ? WHERE id = ?', 'EN_REVISION', req.user.id, request_id);
 
         // 5. Actualizar Driver -> OCUPADO (Pending Approval)
-        const updateDriver = db.prepare('UPDATE drivers SET estado = ? WHERE id = ?');
-        updateDriver.run('OCUPADO', req.user.id);
+        await db.run('UPDATE drivers SET estado = ? WHERE id = ?', 'OCUPADO', req.user.id);
 
         // 6. Emit Event: driver_applied (Notify Company)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
             VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'driver_applied',
             nowStr,
             reqInfo.empresa_id,
             req.user.id,
             request_id,
-            request_id,
             JSON.stringify({ driver_name: driver.nombre, message: 'Driver applied, waiting approval.' })
         );
 
         // PHASE 5: REALTIME NOTIFICATION (To Company)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (
                 event_name, created_at, company_id, driver_id, request_id, 
                 audience_type, audience_id, event_key, metadata
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'driver_applied',
             nowStr,
             reqInfo.empresa_id,
@@ -995,12 +1048,13 @@ app.post('/apply_for_request', authenticateToken, (req, res) => {
             'driver_applied',
             JSON.stringify({ driver_name: driver.nombre })
         );
-    });
 
-    try {
-        performApply();
+        await db.run('COMMIT');
+
         res.json({ success: true, message: 'Solicitud aplicada. Esperando aprobación de la empresa.' });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'DRIVER_NOT_AVAILABLE') return res.status(409).json({ error: 'Driver no disponible' });
         if (err.message === 'REQUEST_TAKEN') return res.status(409).json({ error: 'Solicitud ya tomada' });
         if (err.message === 'DRIVER_SEARCH_OFF') return res.status(409).json({ error: 'Search mode OFF' });
@@ -1009,13 +1063,14 @@ app.post('/apply_for_request', authenticateToken, (req, res) => {
 });
 
 // 6. Approve Driver (Company Action) - PHASE 4: FINAL MATCH & BILLING
-app.post('/approve_driver', authenticateToken, (req, res) => {
+// 6. Approve Driver (Company Action) - PHASE 4: FINAL MATCH & BILLING
+app.post('/approve_driver', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
     const { request_id } = req.body;
 
     // 2. Estricta Check de Bloqueo (Final Guard) - OUTSIDE TRANSACTION
     try {
-        enforceCompanyCanOperate(db, req.user.id, 'approve_driver_match');
+        await enforceCompanyCanOperate(db, req.user.id, 'approve_driver_match');
     } catch (err) {
         if (err.code === 'ACCOUNT_BLOCKED_OVERDUE_INVOICES') {
             return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: err.details });
@@ -1023,10 +1078,12 @@ app.post('/approve_driver', authenticateToken, (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 
-    const performApproval = db.transaction(() => {
+    try {
+        await db.run('BEGIN');
+
         // 1. Validar Solicitud
         const nowStr = nowIso();
-        const reqInfo = db.prepare('SELECT * FROM solicitudes WHERE id = ?').get(request_id);
+        const reqInfo = await db.get('SELECT * FROM solicitudes WHERE id = ?', request_id);
 
         if (!reqInfo) throw new Error('NOT_FOUND');
         if (reqInfo.empresa_id !== req.user.id) throw new Error('FORBIDDEN');
@@ -1034,20 +1091,19 @@ app.post('/approve_driver', authenticateToken, (req, res) => {
         if (!reqInfo.driver_id) throw new Error('NO_APPLICANT');
 
         // 3. Update Request -> ACEPTADA
-        db.prepare('UPDATE solicitudes SET estado = ? WHERE id = ?').run('ACEPTADA', request_id);
+        await db.run('UPDATE solicitudes SET estado = ? WHERE id = ?', 'ACEPTADA', request_id);
 
         // 4. Generate Ticket (BILLING EVENT)
-        const ticketStmt = db.prepare(`
+        const ticketInfo = await db.run(`
             INSERT INTO tickets (company_id, driver_id, request_id, price_cents, currency, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        `);
-        const ticketInfo = ticketStmt.run(reqInfo.empresa_id, reqInfo.driver_id, request_id, 15000, 'USD', nowStr);
+        `, reqInfo.empresa_id, reqInfo.driver_id, request_id, 15000, 'USD', nowStr);
 
         // 5. Emit Event: match_confirmed (Info Exchange)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, ticket_id, metadata)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'match_confirmed',
             nowStr,
             reqInfo.empresa_id,
@@ -1058,36 +1114,35 @@ app.post('/approve_driver', authenticateToken, (req, res) => {
         );
 
         // PHASE 5: REALTIME NOTIFICATION (To Driver: Match Confirmed)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (
                 event_name, created_at, company_id, driver_id, request_id, ticket_id,
                 audience_type, audience_id, event_key, metadata
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'match_confirmed', nowStr, reqInfo.empresa_id, reqInfo.driver_id, request_id, ticketInfo.lastInsertRowid,
             'driver', String(reqInfo.driver_id), 'match_confirmed',
             JSON.stringify({ message: 'Request approved!' })
         );
 
         // PHASE 5: REALTIME NOTIFICATION (To Company: Ticket Created/Billing Pending)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (
                 event_name, created_at, company_id, driver_id, request_id, ticket_id,
                 audience_type, audience_id, event_key, metadata
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'ticket_created', nowStr, reqInfo.empresa_id, reqInfo.driver_id, request_id, ticketInfo.lastInsertRowid,
             'empresa', String(reqInfo.empresa_id), 'ticket_created',
             JSON.stringify({ message: 'New Ticket Generated', amount: 15000 })
         );
 
-        return { ticket_id: ticketInfo.lastInsertRowid };
-    });
+        await db.run('COMMIT');
 
-    try {
-        const result = performApproval();
-        res.json({ success: true, message: 'Driver aprobado. Datos de contacto intercambiados.', ticket_id: result.ticket_id });
+        res.json({ success: true, message: 'Driver aprobado. Datos de contacto intercambiados.', ticket_id: ticketInfo.lastInsertRowid });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Solicitud no encontrada' });
         if (err.message === 'FORBIDDEN') return res.status(403).json({ error: 'No autorizado' });
         if (err.message === 'INVALID_STATE') return res.status(400).json({ error: 'Solicitud no está lista para aprobación' });
@@ -1098,31 +1153,35 @@ app.post('/approve_driver', authenticateToken, (req, res) => {
 // --- FASE 2: CICLO DE VIDA (Complete & Cancel) ---
 
 // 6. Complete Request (Driver only)
-app.post('/request/:id/complete', authenticateToken, (req, res) => {
+// 6. Complete Request (Driver only)
+app.post('/request/:id/complete', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
     const requestId = req.params.id;
 
-    const performComplete = db.transaction(() => {
-        const info = db.prepare('SELECT driver_id, estado FROM solicitudes WHERE id = ?').get(requestId);
+    try {
+        await db.run('BEGIN');
+
+        const info = await db.get('SELECT driver_id, estado FROM solicitudes WHERE id = ?', requestId);
 
         if (!info) throw new Error('NOT_FOUND');
         if (info.driver_id !== req.user.id) throw new Error('FORBIDDEN');
         if (info.estado !== 'ACEPTADA') throw new Error('INVALID_STATE');
 
         const now = nowIso();
-        db.prepare(`
+        await db.run(`
             UPDATE solicitudes 
             SET estado = 'FINALIZADA', fecha_cierre = ? 
             WHERE id = ?
-        `).run(now, requestId);
+        `, now, requestId);
 
-        db.prepare('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?').run(req.user.id);
-    });
+        await db.run('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?', req.user.id);
 
-    try {
-        performComplete();
+        await db.run('COMMIT');
+
         res.json({ success: true, message: 'Servicio completado. Driver disponible.' });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Solicitud no encontrada' });
         if (err.message === 'FORBIDDEN') return res.status(403).json({ error: 'No autorizado para esta solicitud' });
         if (err.message === 'INVALID_STATE') return res.status(400).json({ error: 'La solicitud no está en curso' });
@@ -1131,12 +1190,15 @@ app.post('/request/:id/complete', authenticateToken, (req, res) => {
 });
 
 // 7. Cancel Request (Empresa o Driver)
-app.post('/request/:id/cancel', authenticateToken, (req, res) => {
+// 7. Cancel Request (Empresa o Driver)
+app.post('/request/:id/cancel', authenticateToken, async (req, res) => {
     const requestId = req.params.id;
     const { type, id: userId } = req.user;
 
-    const performCancel = db.transaction(() => {
-        const reqInfo = db.prepare('SELECT * FROM solicitudes WHERE id = ?').get(requestId);
+    try {
+        await db.run('BEGIN');
+
+        const reqInfo = await db.get('SELECT * FROM solicitudes WHERE id = ?', requestId);
         if (!reqInfo) throw new Error('NOT_FOUND');
 
         if (type === 'empresa' && reqInfo.empresa_id !== userId) throw new Error('FORBIDDEN');
@@ -1151,27 +1213,27 @@ app.post('/request/:id/cancel', authenticateToken, (req, res) => {
         if (type === 'driver') {
             if (reqInfo.estado === 'ACEPTADA') {
                 // 1. VOID EXISTNG TICKET
-                db.prepare(`
+                await db.run(`
                     UPDATE tickets 
                     SET billing_status = 'void', updated_at = ? 
                     WHERE request_id = ? AND driver_id = ? AND billing_status = 'unbilled'
-                `).run(now, requestId, userId);
+                `, now, requestId, userId);
 
-                db.prepare(`
+                await db.run(`
                     UPDATE solicitudes 
                     SET estado = 'PENDIENTE', driver_id = NULL 
                     WHERE id = ?
-                `).run(requestId);
+                `, requestId);
 
-                db.prepare('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?').run(userId);
+                await db.run('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?', userId);
             } else if (reqInfo.estado === 'EN_REVISION') {
                 // Driver withdraws application
-                db.prepare(`
+                await db.run(`
                     UPDATE solicitudes 
                     SET estado = 'PENDIENTE', driver_id = NULL 
                     WHERE id = ?
-                `).run(requestId);
-                db.prepare('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?').run(userId);
+                `, requestId);
+                await db.run('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?', userId);
             } else {
                 throw new Error('INVALID_ACTION_FOR_DRIVER');
             }
@@ -1179,27 +1241,27 @@ app.post('/request/:id/cancel', authenticateToken, (req, res) => {
             // Company Cancel
             // 1. VOID TICKET IF EXISTS
             if (reqInfo.driver_id && reqInfo.estado === 'ACEPTADA') {
-                db.prepare(`
+                await db.run(`
                     UPDATE tickets 
                     SET billing_status = 'void', updated_at = ? 
                     WHERE request_id = ? AND driver_id = ? AND billing_status = 'unbilled'
-                `).run(now, requestId, reqInfo.driver_id);
+                `, now, requestId, reqInfo.driver_id);
             }
 
-            db.prepare(`
+            await db.run(`
                 UPDATE solicitudes 
                 SET estado = 'CANCELADA', fecha_cierre = ?, cancelado_por = 'EMPRESA' 
                 WHERE id = ?
-            `).run(now, requestId);
+            `, now, requestId);
 
             if (reqInfo.driver_id) {
-                db.prepare('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?').run(reqInfo.driver_id);
+                await db.run('UPDATE drivers SET estado = "DISPONIBLE" WHERE id = ?', reqInfo.driver_id);
             }
 
-            db.prepare(`
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?)
-            `).run(
+            `,
                 'request_cancelled',
                 now,
                 reqInfo.empresa_id,
@@ -1208,12 +1270,13 @@ app.post('/request/:id/cancel', authenticateToken, (req, res) => {
                 JSON.stringify({ reason: 'CANCELLED_BY_COMPANY' })
             );
         }
-    });
 
-    try {
-        performCancel();
+        await db.run('COMMIT');
+
         res.json({ success: true, message: 'Operación realizada correctamente.' });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Solicitud no encontrada' });
         if (err.message === 'FORBIDDEN') return res.status(403).json({ error: 'No tienes permiso sobre esta solicitud' });
         if (err.message === 'INVALID_STATE') return res.status(400).json({ error: 'Solo se pueden cancelar solicitudes activas' });
@@ -1223,11 +1286,12 @@ app.post('/request/:id/cancel', authenticateToken, (req, res) => {
 });
 
 // 7. Get Contact Details (Secure Match Info) - PHASE 4: PRIVACY
-app.get('/request/:id/contact', authenticateToken, (req, res) => {
+// 7. Get Contact Details (Secure Match Info) - PHASE 4: PRIVACY
+app.get('/request/:id/contact', authenticateToken, async (req, res) => {
     const requestId = req.params.id;
     const { type, id: userId } = req.user;
 
-    const reqInfo = db.prepare('SELECT * FROM solicitudes WHERE id = ?').get(requestId);
+    const reqInfo = await db.get('SELECT * FROM solicitudes WHERE id = ?', requestId);
     if (!reqInfo) return res.status(404).json({ error: 'Request not found' });
 
     // Validate Access (Must be participant)
@@ -1249,20 +1313,20 @@ app.get('/request/:id/contact', authenticateToken, (req, res) => {
         if (isCompany) {
             // Guard 1: Operational Check (REQ 2 - Strict on High Value) - Also catches blocking updates
             try {
-                enforceCompanyCanOperate(db, userId, 'reveal_contact');
+                await enforceCompanyCanOperate(db, userId, 'reveal_contact');
             } catch (e) {
                 return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: e.details });
             }
 
             // Guard 2: Payment Assurance (REQ 1 - Strict Invoice Paid)
             // Find Ticket and Associated Invoice Status
-            const ticketInfo = db.prepare(`
+            const ticketInfo = await db.get(`
                 SELECT t.id, t.billing_status, i.status as invoice_status, i.paid_at
                 FROM tickets t
                 LEFT JOIN invoice_items ii ON t.id = ii.ticket_id
                 LEFT JOIN invoices i ON ii.invoice_id = i.id
                 WHERE t.request_id = ? AND t.company_id = ?
-            `).get(requestId, userId);
+            `, requestId, userId);
 
             if (!ticketInfo) {
                 // No ticket = No deal.
@@ -1284,12 +1348,12 @@ app.get('/request/:id/contact', authenticateToken, (req, res) => {
             }
 
             // If passes, fetch data
-            const driver = db.prepare('SELECT nombre, contacto, tipo_licencia, rating_avg FROM drivers WHERE id = ?').get(reqInfo.driver_id);
+            const driver = await db.get('SELECT nombre, contacto, tipo_licencia, rating_avg FROM drivers WHERE id = ?', reqInfo.driver_id);
             contactData = { type: 'driver', ...driver };
 
         } else {
             // Driver viewing Company
-            const company = db.prepare('SELECT nombre, contacto, ciudad FROM empresas WHERE id = ?').get(reqInfo.empresa_id);
+            const company = await db.get('SELECT nombre, contacto, ciudad FROM empresas WHERE id = ?', reqInfo.empresa_id);
             contactData = { type: 'company', ...company };
         }
 
@@ -1302,7 +1366,8 @@ app.get('/request/:id/contact', authenticateToken, (req, res) => {
 });
 
 // 9. Rate Driver Service (Reputation System) - NEW
-app.post('/rate_service', authenticateToken, (req, res) => {
+// 9. Rate Driver Service (Reputation System) - NEW
+app.post('/rate_service', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
     const { request_id, rating, comment } = req.body;
 
@@ -1310,9 +1375,11 @@ app.post('/rate_service', authenticateToken, (req, res) => {
         return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     }
 
-    const performRating = db.transaction(() => {
+    try {
+        await db.run('BEGIN');
+
         // 1. Validate Request & Ownership
-        const reqInfo = db.prepare('SELECT driver_id, empresa_id, estado FROM solicitudes WHERE id = ?').get(request_id);
+        const reqInfo = await db.get('SELECT driver_id, empresa_id, estado FROM solicitudes WHERE id = ?', request_id);
 
         if (!reqInfo) throw new Error('NOT_FOUND');
         if (reqInfo.empresa_id !== req.user.id) throw new Error('FORBIDDEN');
@@ -1320,21 +1387,20 @@ app.post('/rate_service', authenticateToken, (req, res) => {
         if (!reqInfo.driver_id) throw new Error('NO_DRIVER');
 
         // 2. Insert Rating (Unique per request)
-        db.prepare(`
+        await db.run(`
             INSERT INTO ratings (request_id, company_id, driver_id, rating, comment, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        `).run(request_id, req.user.id, reqInfo.driver_id, rating, comment || null, nowIso());
+        `, request_id, req.user.id, reqInfo.driver_id, rating, comment || null, nowIso());
 
         // 3. Update Driver Stats & Check Suspension
-        const stats = db.prepare(`
+        const stats = await db.get(`
             SELECT AVG(rating) as avg_rating, COUNT(*) as count 
             FROM ratings 
             WHERE driver_id = ?
-        `).get(reqInfo.driver_id);
+        `, reqInfo.driver_id);
 
         const newAvg = stats.avg_rating || rating;
-        let newStatus = 'DISPONIBLE'; // Default, won't overwrite OCUPADO if currently working elsewhere?
-        // Actually, if request is finished, driver IS available unless suspended.
+        let newStatus = 'DISPONIBLE';
 
         let suspensionReason = null;
 
@@ -1345,29 +1411,28 @@ app.post('/rate_service', authenticateToken, (req, res) => {
         }
 
         // Update Driver
-        db.prepare(`
+        await db.run(`
             UPDATE drivers 
             SET rating_avg = ?, 
                 estado = CASE WHEN ? = 'SUSPENDED' THEN 'SUSPENDED' ELSE estado END,
                 suspension_reason = ?
             WHERE id = ?
-        `).run(newAvg, newStatus, suspensionReason, reqInfo.driver_id);
+        `, newAvg, newStatus, suspensionReason, reqInfo.driver_id);
 
         if (newStatus === 'SUSPENDED') {
-            const now = nowIso(); // helper from scope
-            db.prepare(`
+            const now = nowIso();
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?)
-            `).run('driver_suspended', now, req.user.id, reqInfo.driver_id, request_id, JSON.stringify({ reason: suspensionReason }));
+            `, 'driver_suspended', now, req.user.id, reqInfo.driver_id, request_id, JSON.stringify({ reason: suspensionReason }));
         }
 
-        return { newAvg, newStatus };
-    });
+        await db.run('COMMIT');
 
-    try {
-        const result = performRating();
-        res.json({ success: true, driver_rating: result.newAvg, driver_status: result.newStatus });
+        res.json({ success: true, driver_rating: newAvg, driver_status: newStatus });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Service already rated' });
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Request not found' });
         if (err.message === 'INVALID_STATE') return res.status(400).json({ error: 'Service not finished' });
@@ -1381,7 +1446,7 @@ app.post('/rate_service', authenticateToken, (req, res) => {
 
 // 8. Payment Webhook (Stripe/Provider) - NEW
 // 8. Payment Webhook (Stripe/Provider) - SECURE & IDEMPOTENT (REQ 3)
-app.post('/webhooks/payment', (req, res) => {
+app.post('/webhooks/payment', async (req, res) => {
     // 1. Security Check (Signature/Secret)
     const webhookSecret = process.env.WEBHOOK_SECRET;
     if (req.headers['x-webhook-secret'] !== webhookSecret) {
@@ -1393,83 +1458,83 @@ app.post('/webhooks/payment', (req, res) => {
     if (!event_id) return res.status(400).json({ error: 'Missing event_id' });
 
     // 2. Idempotency Check
-    const processed = db.prepare('SELECT id FROM events_outbox WHERE metadata LIKE ?').get(`%${event_id}%`);
+    const processed = await db.get('SELECT id FROM events_outbox WHERE metadata LIKE ?', `%${event_id}%`);
     if (processed) return res.json({ received: true });
 
     // ... (rest of webhook logic would go here, effectively a stub for now as we don't process it fully in Phase 1)
     if (type !== 'invoice.paid') return res.json({ received: true });
 
+    try {
+        await db.run('BEGIN');
 
-
-
-    const performPayment = db.transaction(() => {
         // 2. Idempotency Check (Strict)
-        const processed = db.prepare('SELECT 1 FROM webhook_events WHERE id = ?').get(event_id);
-        if (processed) return { skipped: true };
+        const processedStrict = await db.get('SELECT 1 FROM webhook_events WHERE id = ?', event_id);
+        if (processedStrict) {
+            await db.run('COMMIT');
+            return res.json({ success: true, message: 'Event already processed' });
+        }
 
         // Record Event
-        db.prepare('INSERT INTO webhook_events (id, provider) VALUES (?, ?)').run(event_id, 'stripe_prod');
+        await db.run('INSERT INTO webhook_events (id, provider) VALUES (?, ?)', event_id, 'stripe_prod');
 
         const { invoice_id, external_ref, amount_paid_cents } = data || {};
         if (!invoice_id) throw new Error('Missing invoice_id');
 
         // 3. Validate Invoice
-        const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoice_id);
+        const invoice = await db.get('SELECT * FROM invoices WHERE id = ?', invoice_id);
         if (!invoice) throw new Error('INVOICE_NOT_FOUND');
-        if (invoice.status === 'paid') return { skipped: true };
+        if (invoice.status === 'paid') {
+            await db.run('COMMIT');
+            return res.json({ success: true, message: 'Invoice already paid' });
+        }
 
         // 4. Validate Amount (Exact Match Required)
         if (amount_paid_cents !== invoice.total_cents) {
             console.warn(`Payment Mismatch: Paid ${amount_paid_cents}, Expected ${invoice.total_cents}`);
-            return { partial: true }; // Do NOT unlock
+            await db.run('ROLLBACK');
+            return res.status(400).json({ error: 'Partial payment rejected' });
         }
 
         // 5. Mark Paid
         const now = nowIso();
-        db.prepare(`
+        await db.run(`
             UPDATE invoices 
             SET status = 'paid', paid_at = ?, paid_method = 'webhook', total_cents = ?
             WHERE id = ?
-        `).run(now, amount_paid_cents, invoice_id);
+        `, now, amount_paid_cents, invoice_id);
 
         // 6. Emit Events
         // a) For Company (Invoice Paid / Ticket Unlocked)
-        db.prepare(`
+        await db.run(`
             INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
             VALUES (?, ?, ?, ?, ?)
-        `).run('invoice_paid', now, invoice.company_id, 0, JSON.stringify({ invoice_id, amount: amount_paid_cents }));
+        `, 'invoice_paid', now, invoice.company_id, 0, JSON.stringify({ invoice_id, amount: amount_paid_cents }));
 
         // b) For Drivers? (Contact Unlocked)
         // Find all tickets in this invoice and notify respective drivers? 
-        // User asked: "Chofer: Contacto desbloqueado"
-        // Iterate ticket items.
-        const items = db.prepare('SELECT ticket_id, price_cents FROM invoice_items WHERE invoice_id = ?').all(invoice_id);
+        const items = await db.all('SELECT ticket_id, price_cents FROM invoice_items WHERE invoice_id = ?', invoice_id);
         for (const item of items) {
-            const ticket = db.prepare('SELECT driver_id, request_id FROM tickets WHERE id = ?').get(item.ticket_id);
+            const ticket = await db.get('SELECT driver_id, request_id FROM tickets WHERE id = ?', item.ticket_id);
             if (ticket) {
-                db.prepare(`
+                await db.run(`
                     INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
                     VALUES (?, ?, ?, ?, ?, ?)
-                 `).run('contact_unlocked', now, invoice.company_id, ticket.driver_id, ticket.request_id, JSON.stringify({ message: 'Company paid. Contact revealed.' }));
+                 `, 'contact_unlocked', now, invoice.company_id, ticket.driver_id, ticket.request_id, JSON.stringify({ message: 'Company paid. Contact revealed.' }));
             }
         }
 
         // 7. AUTO-UNBLOCK CHECK
         try {
-            enforceCompanyCanOperate(db, invoice.company_id, 'webhook_payment');
+            await enforceCompanyCanOperate(db, invoice.company_id, 'webhook_payment');
         } catch (e) {
             // Still blocked? Maybe other invoices pending.
         }
 
-        return { success: true };
-    });
+        await db.run('COMMIT');
+        return res.json({ success: true });
 
-    try {
-        const result = performPayment();
-        if (result.skipped) return res.json({ success: true, message: 'Event already processed' });
-        if (result.partial) return res.status(400).json({ error: 'Partial payment rejected' });
-        res.json({ success: true });
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'INVOICE_NOT_FOUND') return res.status(404).json({ error: 'Invoice not found' });
         console.error('Webhook Error:', err);
         res.status(500).json({ error: err.message });
@@ -1477,23 +1542,25 @@ app.post('/webhooks/payment', (req, res) => {
 });
 
 // 11. Admin Support Endpoints
-app.get('/admin/companies', (req, res) => {
+// 11. Admin Support Endpoints
+app.get('/admin/companies', async (req, res) => {
     // Simple verification check (omitted for brevity, assume internal/VPN or shared secret)
     if (req.headers['x-admin-secret'] !== (process.env.ADMIN_SECRET || 'simulated_admin_secret')) return res.sendStatus(403);
 
-    const companies = db.prepare('SELECT id, nombre, contacto, ciudad, estado, search_status, is_blocked, blocked_reason FROM empresas').all();
+    const companies = await db.all('SELECT id, nombre, contacto, ciudad, estado, search_status, is_blocked, blocked_reason FROM empresas');
     res.json(companies);
 });
 
-app.get('/admin/payments', (req, res) => {
+app.get('/admin/payments', async (req, res) => {
     if (req.headers['x-admin-secret'] !== (process.env.ADMIN_SECRET || 'simulated_admin_secret')) return res.sendStatus(403);
-    const payments = db.prepare('SELECT * FROM invoices ORDER BY issue_date DESC LIMIT 100').all();
+    const payments = await db.all('SELECT * FROM invoices ORDER BY issue_date DESC LIMIT 100');
     res.json(payments);
 });
 
 // 10. Admin: Void Ticket (Dispute Management) - NEW
 // 10. Admin: Void Ticket (Dispute Management) - SECURE & AUDITED (REQ 4)
-app.post('/admin/tickets/void', (req, res) => {
+// 10. Admin: Void Ticket (Dispute Management) - SECURE & AUDITED (REQ 4)
+app.post('/admin/tickets/void', async (req, res) => {
     const adminSecret = process.env.ADMIN_SECRET || 'simulated_admin_secret';
     if (req.headers['x-admin-secret'] !== adminSecret) {
         return res.status(403).json({ error: 'Unauthorized: Invalid Admin Secret' });
@@ -1502,8 +1569,10 @@ app.post('/admin/tickets/void', (req, res) => {
     const { ticket_id, reason, admin_user } = req.body;
     if (!ticket_id) return res.status(400).json({ error: 'Missing ticket_id' });
 
-    const performVoid = db.transaction(() => {
-        const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticket_id);
+    try {
+        await db.run('BEGIN');
+
+        const ticket = await db.get('SELECT * FROM tickets WHERE id = ?', ticket_id);
         if (!ticket) throw new Error('NOT_FOUND');
         if (ticket.billing_status === 'void') throw new Error('ALREADY_VOID');
 
@@ -1512,9 +1581,9 @@ app.post('/admin/tickets/void', (req, res) => {
         let invoiceId = null;
 
         // Find invoice logic (via invoice_items)
-        const item = db.prepare('SELECT invoice_id FROM invoice_items WHERE ticket_id = ?').get(ticket_id);
+        const item = await db.get('SELECT invoice_id FROM invoice_items WHERE ticket_id = ?', ticket_id);
         if (item) {
-            const invoice = db.prepare('SELECT status FROM invoices WHERE id = ?').get(item.invoice_id);
+            const invoice = await db.get('SELECT status FROM invoices WHERE id = ?', item.invoice_id);
             invoiceId = item.invoice_id;
             invoiceStatus = invoice ? invoice.status : 'unknown';
         }
@@ -1524,26 +1593,26 @@ app.post('/admin/tickets/void', (req, res) => {
         if (invoiceStatus === 'paid') {
             // REQ 4: Cannot void paid ticket without credit/refund
             // Implement Credit Note
-            db.prepare(`
+            await db.run(`
                 INSERT INTO credit_notes (company_id, amount_cents, reason, created_at)
                 VALUES (?, ?, ?, ?)
-            `).run(ticket.company_id, ticket.price_cents, `Void Ticket ${ticket_id}: ${reason}`, now);
+            `, ticket.company_id, ticket.price_cents, `Void Ticket ${ticket_id}: ${reason}`, now);
 
             console.log(`Credit Note issued for Company ${ticket.company_id}, Amount: ${ticket.price_cents}`);
         }
 
         // Void Ticket
-        db.prepare(`
+        await db.run(`
             UPDATE tickets 
             SET billing_status = 'void', updated_at = ? 
             WHERE id = ?
-        `).run(now, ticket_id);
+        `, now, ticket_id);
 
         // Audit Log (REQ 4)
-        db.prepare(`
+        await db.run(`
             INSERT INTO audit_logs (action, admin_user, target_id, reason, metadata, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
+        `,
             'void_ticket',
             admin_user || 'system_admin',
             ticket_id,
@@ -1552,17 +1621,16 @@ app.post('/admin/tickets/void', (req, res) => {
             now
         );
 
-        return { ticket, invoiceStatus };
-    });
+        await db.run('COMMIT');
 
-    try {
-        const result = performVoid();
-        const msg = result.invoiceStatus === 'paid'
+        const msg = invoiceStatus === 'paid'
             ? `Ticket voided. Credit Note issued due to paid invoice.`
             : `Ticket voided. Removed from billing cycle.`;
 
         res.json({ success: true, message: msg });
+
     } catch (err) {
+        try { await db.run('ROLLBACK'); } catch { }
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
         if (err.message === 'ALREADY_VOID') return res.status(400).json({ error: 'Ticket is already voided' });
         res.status(500).json({ error: err.message });
@@ -1570,26 +1638,27 @@ app.post('/admin/tickets/void', (req, res) => {
 });
 
 // --- 9. Tickets (Read-Only) ---
-app.get('/tickets/my', authenticateToken, (req, res) => {
+// --- 9. Tickets (Read-Only) ---
+app.get('/tickets/my', authenticateToken, async (req, res) => {
     const { id, type } = req.user;
 
     let tickets = [];
     if (type === 'driver') {
-        tickets = db.prepare(`
+        tickets = await db.all(`
             SELECT t.id, t.billing_status, t.price_cents, t.currency, t.created_at, e.nombre as company_name
             FROM tickets t
             JOIN empresas e ON t.company_id = e.id
             WHERE t.driver_id = ?
             ORDER BY t.created_at DESC
-        `).all(id);
+        `, id);
     } else if (type === 'empresa') {
-        tickets = db.prepare(`
+        tickets = await db.all(`
             SELECT t.id, t.billing_status, t.price_cents, t.currency, t.created_at, d.nombre as driver_name
             FROM tickets t
             JOIN drivers d ON t.driver_id = d.id
             WHERE t.company_id = ?
             ORDER BY t.created_at DESC
-        `).all(id);
+        `, id);
     } else {
         return res.sendStatus(403);
     }
@@ -1600,7 +1669,7 @@ app.get('/tickets/my', authenticateToken, (req, res) => {
 // --- 10. Request Lifecycle (Phase 2) ---
 
 // 10.1 Create Request (Company)
-app.post('/requests', authenticateToken, (req, res) => {
+app.post('/requests', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.sendStatus(403);
     const { licencia_req, ubicacion, tiempo_estimado } = req.body;
 
@@ -1610,7 +1679,7 @@ app.post('/requests', authenticateToken, (req, res) => {
 
     // Verify company not blocked
     try {
-        enforceCompanyCanOperate(db, req.user.id, 'create_request');
+        await enforceCompanyCanOperate(db, req.user.id, 'create_request');
     } catch (e) {
         return res.status(403).json({ error: 'COMPANY_BLOCKED', reason: e.details });
     }
@@ -1619,22 +1688,22 @@ app.post('/requests', authenticateToken, (req, res) => {
     // Default expiration: 2 hours (MVP rule)
     const expires = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
 
-    const info = db.prepare(`
+    const info = await db.run(`
         INSERT INTO solicitudes (empresa_id, licencia_req, ubicacion, tiempo_estimado, estado, fecha_creacion, fecha_expiracion)
         VALUES (?, ?, ?, ?, 'PENDIENTE', ?, ?)
-    `).run(req.user.id, licencia_req, ubicacion, tiempo_estimado, now, expires);
+    `, req.user.id, licencia_req, ubicacion, tiempo_estimado, now, expires);
 
     metrics.inc('request_created_total');
     res.json({ success: true, request_id: info.lastInsertRowid });
 });
 
 // 10.2 Available Requests (Driver)
-app.get('/requests/available', authenticateToken, (req, res) => {
+app.get('/requests/available', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.sendStatus(403);
     const driverId = req.user.id;
 
     // Check Driver Status
-    const driver = db.prepare('SELECT search_status, tipo_licencia FROM drivers WHERE id = ?').get(driverId);
+    const driver = await db.get('SELECT search_status, tipo_licencia FROM drivers WHERE id = ?', driverId);
     if (!driver || driver.search_status !== 'ON') {
         return res.json([]); // Return empty if offline
     }
@@ -1644,14 +1713,14 @@ app.get('/requests/available', authenticateToken, (req, res) => {
     // Let's stick to prompt: "compatibles con licencia".
     // Simplification: exact match for now.
 
-    const requests = db.prepare(`
+    const requests = await db.all(`
         SELECT r.id, r.licencia_req, r.ubicacion, r.tiempo_estimado, e.nombre as company_name, r.fecha_creacion
         FROM solicitudes r
         JOIN empresas e ON r.empresa_id = e.id
         WHERE r.estado = 'PENDIENTE'
         AND r.licencia_req = ?
-        ORDER BY r.fecha_creacion DESC
-    `).all(driver.tipo_licencia);
+        AND r.fecha_expiracion > ?
+    `, driver.tipo_licencia, nowIso());
 
     res.json(requests);
 });

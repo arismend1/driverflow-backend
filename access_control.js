@@ -6,13 +6,13 @@ const time = require('./time_contract');
  * Enforces strict operational blocking based on debt duration.
  * Rule: Block if DEBT EXISTS (pending invoices) AND (Time since last payment >= 28 days OR Time since first unpaid invoice >= 28 days).
  * 
- * @param {import('better-sqlite3').Database} db 
+ * @param {object} db - Async DB Adapter
  * @param {number|string} companyId 
  * @param {string} actionLabel - Context for the error (e.g., 'create_ticket')
- * @returns {void}
+ * @returns {Promise<void>}
  * @throws {Error} if company is blocked
  */
-function enforceCompanyCanOperate(db, companyId, actionLabel) {
+async function enforceCompanyCanOperate(db, companyId, actionLabel) {
     const cId = Number(companyId);
     if (!Number.isFinite(cId)) throw new Error(`Invalid companyId: ${companyId}`);
 
@@ -21,7 +21,7 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
     const nowMs = time.nowMs({ ctx: 'enforce_logic' });
 
     // 0. Fetch Current Status (Preserve Manual Blocks)
-    const current = db.prepare('SELECT is_blocked, blocked_reason FROM empresas WHERE id = ?').get(cId);
+    const current = await db.get('SELECT is_blocked, blocked_reason FROM empresas WHERE id = ?', cId);
     let manualBlock = false;
     if (current && current.is_blocked === 1) {
         // If reason is explicitly from this auto-logic, we are allowed to clear it.
@@ -41,21 +41,22 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
 
     // 1. Calculate Auto-Status
     // Check for ANY debt
-    const pendingCount = db.prepare(`
+    const pendingCountRow = await db.get(`
         SELECT COUNT(*) as c FROM invoices 
         WHERE company_id = ? AND status = 'pending'
-    `).get(cId).c;
+    `, cId);
+    const pendingCount = pendingCountRow ? pendingCountRow.c : 0;
 
     let isAutoBlocked = false;
     let autoReason = null;
 
     if (pendingCount > 0) {
         // Has debt. Check duration since last payment.
-        const lastPayment = db.prepare(`
+        const lastPayment = await db.get(`
             SELECT MAX(paid_at) as last_paid 
             FROM invoices 
             WHERE company_id = ? AND paid_at IS NOT NULL
-        `).get(cId);
+        `, cId);
 
         let refDateMs = null;
 
@@ -66,11 +67,11 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
         } else {
             // Never paid OR all paid invoices irrelevant? 
             // If invoices exist but pending, use oldest pending as anchor.
-            const oldestPending = db.prepare(`
+            const oldestPending = await db.get(`
                 SELECT MIN(COALESCE(issue_date, created_at)) as oldest_date
                 FROM invoices
                 WHERE company_id = ? AND status = 'pending'
-            `).get(cId);
+            `, cId);
 
             if (oldestPending && oldestPending.oldest_date) {
                 const d = time.parseLoose(oldestPending.oldest_date, { minYear: 2000 });
@@ -96,20 +97,20 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
     const nowSql = nowStr.replace('T', ' ').slice(0, 19);
 
     if (isAutoBlocked) {
-        db.prepare(`
+        await db.run(`
             UPDATE empresas 
             SET is_blocked = 1, 
                 blocked_reason = ?, 
                 blocked_at = COALESCE(blocked_at, ?) 
             WHERE id = ?
-        `).run(autoReason, nowSql, cId);
+        `, autoReason, nowSql, cId);
 
         // Emit Event: company_blocked (request_id=0 for system events)
         try {
-            db.prepare(`
+            await db.run(`
                 INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
                 VALUES (?, ?, ?, ?, ?)
-            `).run('company_blocked', nowStr, cId, 0, JSON.stringify({ reason: autoReason }));
+            `, 'company_blocked', nowStr, cId, 0, JSON.stringify({ reason: autoReason }));
         } catch (e) { /* ignore duplicate */ }
 
         const err = new Error('ACCOUNT_BLOCKED_OVERDUE_INVOICES');
@@ -125,13 +126,13 @@ function enforceCompanyCanOperate(db, companyId, actionLabel) {
         if (current && current.is_blocked === 1) {
             // We checked manualBlock above. If we are here, it is NOT manual. 
             // It must be auto/old. And isAutoBlocked is false. So we unblock.
-            db.prepare(`
+            await db.run(`
                 UPDATE empresas 
                 SET is_blocked = 0, 
                     blocked_reason = NULL, 
                     blocked_at = NULL 
                 WHERE id = ?
-            `).run(cId);
+            `, cId);
         }
     }
 }

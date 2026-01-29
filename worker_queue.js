@@ -1,82 +1,68 @@
-const Database = require('better-sqlite3');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
-
-// Environment
-const DB_PATH = (process.env.DB_PATH || 'driverflow.db').trim();
-const WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
-const POLL_INTERVAL = 2000;
-const BATCH_SIZE = 5;
-const LOCK_TTL_SEC = 300; // 5 mins
-
-// Deps (Handlers)
-// Note: We'll construct specific handler logic inside or require it if needed.
-// For MVP, we inline standard handlers (email, etc) or reuse existing code logic.
+const db = require('./db_adapter'); // Async Adapter
 const logger = require('./logger');
 const time = require('./time_contract');
 
-// DB Connection for Worker
-let db;
+const WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
+const POLL_INTERVAL = 2000;
+const BATCH_SIZE = 5;
 
-function getDb() {
-    if (!db) db = new Database(DB_PATH);
-    return db;
-}
-
-// function nowIso() { return new Date().toISOString(); } // REPLACED BY CONTRACT
-const nowIso = () => time.nowIso({ ctx: 'worker_queue' }); // Wrapper for compatibility
-
+// Wrapper for compatibility
+const nowIso = () => time.nowIso({ ctx: 'worker_queue' });
 
 // --- ENQUEUE HELPER ---
-function enqueueJob(dbConn, type, payload, options = {}) {
+async function enqueueJob(type, payload, options = {}) {
     // options: { run_at, max_attempts, idempotency_key }
     const runAt = options.run_at || nowIso();
     const max = options.max_attempts || 5;
     const now = nowIso();
 
     try {
-        const stmt = dbConn.prepare(`
+        await db.run(`
             INSERT INTO jobs_queue (job_type, payload_json, run_at, max_attempts, created_at, idempotency_key)
             VALUES (?, ?, ?, ?, ?, ?)
-        `);
-        stmt.run(type, JSON.stringify(payload), runAt, max, now, options.idempotency_key || null);
+        `, type, JSON.stringify(payload), runAt, max, now, options.idempotency_key || null);
         return true;
     } catch (e) {
-        if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') return false; // Idempotent ignore
+        if (e.message.includes('UNIQUE')) return false; // Idempotent ignore
         throw e;
     }
 }
 
 // --- BRIDGE: Outbox -> Queue ---
-function bridgeOutbox() {
-    const conn = getDb();
+async function bridgeOutbox() {
     const now = nowIso();
 
-    // Atomic Bridge Transaction
-    // 1. Select Pending Events
-    // 2. Update events_outbox status to 'queued'
-    // 3. Insert into jobs_queue
-    const tx = conn.transaction(() => {
+    // Atomic Bridge Transaction using manual BEGIN/COMMIT for Postgres compatibility
+    try {
+        await db.run('BEGIN');
+
         // Select pending (limit 50 to avoid big transactions)
-        const rows = conn.prepare(`
+        // FOR UPDATE SKIP LOCKED would be better in PG, but keeping it simple for MVP compatibility
+        const rows = await db.all(`
             SELECT id, event_name, metadata, audience_type, audience_id, event_key 
             FROM events_outbox 
             WHERE queue_status = 'pending' 
             LIMIT 50
-        `).all();
+        `);
 
-        if (rows.length === 0) return;
+        if (rows.length === 0) {
+            await db.run('COMMIT');
+            return;
+        }
 
         const ids = rows.map(r => r.id);
-        const placeholders = ids.map(() => '?').join(',');
 
-        // Mark as 'queued' immediately to prevent other workers picking them up
-        // Note: In SQLite, the transaction holds the lock.
-        conn.prepare(`
-            UPDATE events_outbox 
-            SET queue_status = 'queued', queued_at = ? 
-            WHERE id IN (${placeholders})
-        `).run(now, ...ids);
+        // Mark as 'queued' immediately
+        // In PG, we're in a transaction, so this is safe.
+        // We can't easily do "WHERE id IN (?)" with generic adapter array params efficiently in one go 
+        // without dynamic SQL or JSON args.
+        // Simplest: Loop updates (inside tx, it's fast enough) or dynamic SQL.
+        // Let's use dynamic SQL for the IDs since we have them.
+
+        // Safety: ids are numbers.
+        const idList = ids.join(',');
+        await db.run(`UPDATE events_outbox SET queue_status = 'queued', queued_at = ? WHERE id IN (${idList})`, now);
 
         for (const ev of rows) {
             let meta = {};
@@ -88,7 +74,7 @@ function bridgeOutbox() {
 
             if (ev.event_name === 'verification_email' || ev.event_name === 'recovery_email') {
                 jobType = 'send_email';
-                payload = { ...meta, event_name: ev.event_name, email: meta.email }; // Ensure email is in payload
+                payload = { ...meta, event_name: ev.event_name, email: meta.email };
             }
             else if (['rating_created', 'invoice_paid', 'driver_applied', 'request_created', 'match_confirmed', 'request_cancelled'].includes(ev.event_name)) {
                 jobType = 'realtime_push';
@@ -102,13 +88,12 @@ function bridgeOutbox() {
             }
 
             if (jobType) {
-                // Enqueue with Source Event ID to enforce Uniqueness at DB level
                 try {
-                    conn.prepare(`
+                    await db.run(`
                         INSERT INTO jobs_queue (
                             job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, source_event_id
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    `).run(
+                    `,
                         jobType,
                         JSON.stringify(payload),
                         now,
@@ -118,23 +103,19 @@ function bridgeOutbox() {
                         ev.id          // source_event_id (UNIQUE constraint)
                     );
                 } catch (e) {
-                    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-                        // Already bridged? Ignore.
-                        // Ideally shouldn't happen if queue_status logic works, but safety net.
+                    if (e.message.includes('UNIQUE')) {
                         logger.warn(`Duplicate bridge attempt for event ${ev.id}`);
                     } else {
-                        throw e; // Abort transaction if other error
+                        throw e;
                     }
                 }
             }
         }
 
-        // logger.info(`Bridged ${rows.length} events`);
-    });
+        await db.run('COMMIT');
 
-    try {
-        tx();
     } catch (e) {
+        try { await db.run('ROLLBACK'); } catch (err) { }
         if (!e.message.includes('busy')) logger.error('Bridge Error', e);
     }
 }
@@ -143,7 +124,6 @@ function bridgeOutbox() {
 const handlers = {
     async send_email(payload) {
         const dryRun = process.env.DRY_RUN === '1';
-
         const apiKey = process.env.SENDGRID_API_KEY;
         const fromEmail = process.env.FROM_EMAIL;
 
@@ -184,84 +164,71 @@ const handlers = {
 
         if (!res.ok) {
             const errText = await res.text();
-
-            // Handle Rate Limits (User Report: 100/day limit reached)
             if (res.status === 403 || res.status === 429) {
-                logger.warn(`SendGrid Limit Reached (${res.status}). Dropping email to prevent retry loop.`, { to: payload.email });
-                return; // Treat as success/skipped to drain queue
+                logger.warn(`SendGrid Limit Reached (${res.status}). Dropped.`, { to: payload.email });
+                return;
             }
-
             throw new Error(`SendGrid Error ${res.status}: ${errText}`);
         }
     },
 
     async realtime_push(payload) {
-        // Logic: Mark as 'pushed' or rely on server.js polling loop
-        // In this MVP architecture, the worker just acknowledges the event was bridged.
-        // Actual push happens via server.js polling 'events_outbox'.
-        // Wait, if we bridged it, server.js sees it?
-        // Server.js polls `status='pending'`? No, server.js polls `realtime_sent_at IS NULL`.
-        // So as long as we don't touch partial `realtime_sent_at`, server.js picks it up.
-        // This 'realtime_push' job is arguably redundant for MVP Node+SQLite unless we move SSE logic here.
-        // But for future Redis scaling, this is WHERE it goes.
-        // So we leave it as a placeholder that marks the JOB as done.
-        // The event in outbox remains there for server.js to pick up for SSE.
-        // logger.info("Realtime Push Job logic (Placeholder)", payload);
+        // Placeholder for SSE/Push logic
     }
 };
 
 // --- WORKER LOOP ---
 async function processJobs() {
-    const conn = getDb();
     const now = nowIso();
-
-    // 1. Release Old Locks (Safety)
-    // conn.prepare("UPDATE jobs_queue SET locked_by=NULL, locked_at=NULL WHERE locked_at < datetime(?, '-? seconds')") ...
-
-    // 2. Claim Batch (Atomic Transaction)
-    // We use IMMEDIATE transaction to lock DB for writing, pick items, update them, and commit.
-    // This effectively serializes the claim step across ANY connection to this DB file.
-
     const jobsToProcess = [];
 
+    // 1. Claim Batch (Atomic Transaction)
     try {
-        const claimTx = conn.transaction(() => {
-            const candidates = conn.prepare(`
-                SELECT id FROM jobs_queue 
-                WHERE status = 'pending' AND run_at <= ? 
-                LIMIT ?
-            `).all(now, BATCH_SIZE);
+        await db.run('BEGIN');
 
-            if (candidates.length === 0) return;
+        // Note: For high concurrency in Postgres, "FOR UPDATE SKIP LOCKED" is best.
+        // Using simple UPDATE ... WHERE ... RETURNING is a good approximation for MVP if rows are locked.
+        // But here we do: Select -> Update. 
+        // In Repeatable Read this might serialize or fail. In Read Committed it's okay but might race.
+        // We'll rely on optimistic locking or standard locking.
 
+        // Simpler approach compatible with Generic Adapter:
+        // Use a single atomic UPDATE ... RETURNING ... LIMIT?
+        // SQLite doesn't support UPDATE LIMIT easily without compiled options.
+        // PG does with CTEs.
+        // Standard MVP way: Fetch candidate IDs -> Update them -> Process them.
+
+        const candidates = await db.all(`
+            SELECT id FROM jobs_queue 
+            WHERE status = 'pending' AND run_at <= ? 
+            LIMIT ?
+        `, now, BATCH_SIZE);
+
+        if (candidates.length > 0) {
             const ids = candidates.map(c => c.id);
-            const placeholders = ids.map(() => '?').join(',');
+            const idList = ids.join(',');
 
-            conn.prepare(`
+            // Mark captured
+            await db.run(`
                 UPDATE jobs_queue 
                 SET status = 'processing', locked_by = ?, locked_at = ? 
-                WHERE id IN (${placeholders})
-            `).run(WORKER_ID, now, ...ids);
+                WHERE id IN (${idList})
+            `, WORKER_ID, now);
 
-            return conn.prepare(`SELECT * FROM jobs_queue WHERE id IN (${placeholders})`).all(...ids);
-        });
+            // Re-fetch full data
+            const claimed = await db.all(`SELECT * FROM jobs_queue WHERE id IN (${idList})`);
+            jobsToProcess.push(...claimed);
+        }
 
-        // better-sqlite3 transactions are immediate by default if they write? 
-        // We can force it: db.transaction(..., { immediate: true })? No, typical wrapper.
-        // But running it inside transaction ensures atomicity.
-
-        const claimed = claimTx();
-        if (claimed) jobsToProcess.push(...claimed);
+        await db.run('COMMIT');
 
     } catch (e) {
-        if (!e.message.includes('busy')) {
-            logger.error('Worker Claim Error', e);
-        }
-        // If busy (locked by another worker), just wait next tick.
+        try { await db.run('ROLLBACK'); } catch { }
+        if (!e.message.includes('busy')) logger.error('Worker Claim Error', e);
         return;
     }
 
-    // Process Outside Transaction (to keep lock duration short)
+    // Process Outside Transaction
     for (const job of jobsToProcess) {
         try {
             const handler = handlers[job.job_type];
@@ -269,32 +236,26 @@ async function processJobs() {
 
             const payload = JSON.parse(job.payload_json);
 
-            // Execute
             await handler(payload);
 
             // Success
-            conn.prepare("UPDATE jobs_queue SET status='done', updated_at=? WHERE id=?").run(nowIso(), job.id);
+            await db.run("UPDATE jobs_queue SET status='done', updated_at=? WHERE id=?", nowIso(), job.id);
             logger.info(`Job ${job.id} (${job.job_type}) DONE`, { worker: WORKER_ID });
 
         } catch (e) {
             // Failure
             const attempts = job.attempts + 1;
             const isDead = attempts >= job.max_attempts;
-
-            // DLQ transition
-            const nextStatus = isDead ? 'dead' : 'pending'; // 'dead' is our DLQ status
-
-            // Backoff: 5s, 10s, 20s...
+            const nextStatus = isDead ? 'dead' : 'pending';
             const delaySec = 5 * Math.pow(2, attempts - 1);
-            // Time Contract Usage
             const nowMs = time.nowMs({ ctx: 'worker_retry_calc' });
             const nextRun = new Date(nowMs + delaySec * 1000).toISOString();
 
-            conn.prepare(`
+            await db.run(`
                 UPDATE jobs_queue 
                 SET status = ?, attempts = ?, last_error = ?, run_at = ?, locked_by = NULL, locked_at = NULL, updated_at = ? 
                 WHERE id = ?
-            `).run(nextStatus, attempts, e.message, nextRun, nowIso(), job.id);
+            `, nextStatus, attempts, e.message, nextRun, nowIso(), job.id);
 
             logger.error(`Job ${job.id} FAILED (${attempts}/${job.max_attempts}) -> ${nextStatus}`, { error: e.message });
         }
@@ -303,24 +264,26 @@ async function processJobs() {
 
 // --- MAIN LOOP ---
 async function startQueueWorker() {
-    const conn = getDb();
     logger.info(`Queue Worker Started`, { worker_id: WORKER_ID });
 
-    setInterval(() => {
-        // Heartbeat
+    // Heartbeat Loop
+    setInterval(async () => {
         try {
-            conn.prepare(`
+            // Upsert Heartbeat
+            // PG: ON CONFLICT DO UPDATE
+            // SQLite: same
+            await db.run(`
                 INSERT INTO worker_heartbeat (worker_name, last_seen, status) VALUES ('queue_worker', ?, 'running')
                 ON CONFLICT(worker_name) DO UPDATE SET last_seen=excluded.last_seen
-            `).run(nowIso());
+            `, nowIso());
         } catch (e) { }
     }, 15000);
 
     // Processing Loop
     while (true) {
         try {
-            bridgeOutbox(); // Move items
-            await processJobs(); // Process items
+            await bridgeOutbox();
+            await processJobs();
         } catch (e) {
             logger.error('Worker Loop fail', e);
         }
@@ -328,4 +291,4 @@ async function startQueueWorker() {
     }
 }
 
-module.exports = { startQueueWorker, enqueueJob, getDb, bridgeOutbox };
+module.exports = { startQueueWorker, enqueueJob, bridgeOutbox };
