@@ -40,9 +40,9 @@ try {
     console.log(`   - Tickets/Payments: (Not verified in this script version)`);
 
     // 4. Queue Health (SRE)
-    const pendingEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE status = 'pending'").get().c;
-    const failedEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE status = 'failed'").get().c;
-    const deadEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE status = 'dead_letter'").get().c;
+    const pendingEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE queue_status = 'pending'").get().c;
+    const failedEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE queue_status = 'failed'").get().c;
+    const deadEvents = db.prepare("SELECT count(*) as c FROM events_outbox WHERE queue_status = 'dead_letter'").get().c;
 
     console.log(`\n4️⃣  SYSTEM HEALTH (Event Queue)`);
     console.log(`   - Pending: ${pendingEvents} ${pendingEvents > 10 ? '⚠️ High Load' : '✅ OK'}`);

@@ -2278,7 +2278,7 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
 });
 
 // 2. Stripe Webhook
-app.post('/stripe/webhook', async (req, res) => {
+app.post('/api/stripe/webhook', async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 

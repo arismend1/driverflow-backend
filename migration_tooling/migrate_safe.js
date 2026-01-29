@@ -1,0 +1,376 @@
+require('dotenv').config();
+const Database = require('better-sqlite3');
+const { Client } = require('pg');
+const fs = require('fs');
+const path = require('path');
+
+// --- CONFIG ---
+// Point to the root DB
+const SQLITE_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'driverflow.db');
+const PG_URL = process.env.DATABASE_URL;
+
+console.log(`Using SQLite Path: ${SQLITE_PATH}`);
+console.log(`Using Postgres URL: ${PG_URL ? '***' : 'MISSING'}`);
+
+if (!PG_URL) {
+    console.error("❌ ERROR: DATABASE_URL is missing/empty");
+    process.exit(1);
+}
+
+// better-sqlite3 should resolve from where? 
+// We are in migration_tooling. better-sqlite3 is in root node_modules (which we can't install/update but CAN require if we point to it?)
+// Actually, if we couldn't install pg in root, we might not be able to require better-sqlite3 from root either if it's broken.
+// BUT better-sqlite3 WAS working for the app. So it should be loadable via require('better-sqlite3') if we assume node resolution climbs up.
+// OR we rely on the one in migration_tooling if we installed it? We only installed pg.
+// Let's try requiring standard, if it fails, we fall back to absolute path.
+let sqlite;
+try {
+    sqlite = new Database(SQLITE_PATH);
+} catch (e) {
+    console.error("Failed to load generic better-sqlite3, trying root path resolution...");
+    try {
+        const rootBs = require('../node_modules/better-sqlite3');
+        sqlite = new rootBs(SQLITE_PATH);
+    } catch (e2) {
+        console.error("CRITICAL: Could not load better-sqlite3. Details:", e2);
+        process.exit(1);
+    }
+}
+
+const pg = new Client({ connectionString: PG_URL, ssl: { rejectUnauthorized: false } });
+
+// --- SCHEMA DEFINITION (Postgres Compatible) ---
+const SCHEMA = [
+    // 1. Core Users (No Dependencies)
+    `CREATE TABLE IF NOT EXISTS empresas (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT,
+        email TEXT UNIQUE,
+        password_hash TEXT,
+        contacto TEXT,           -- was contact_name
+        telefono TEXT,           -- was contact_phone
+        ciudad TEXT,             -- was city
+        estado TEXT,             -- was state
+        fecha_registro TIMESTAMPTZ, -- was created_at
+        tier TEXT,
+        creditos INTEGER DEFAULT 0,
+        is_blocked BOOLEAN DEFAULT FALSE,
+        blocked_reason TEXT,
+        blocked_at TIMESTAMPTZ,
+        search_status TEXT,
+        legal_name TEXT,
+        address_line1 TEXT,
+        address_state TEXT,
+        contact_person TEXT,
+        contact_phone TEXT,       -- kept if exists in sqlite as separate
+        account_state TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(), -- Uncommented to match source
+        verified BOOLEAN DEFAULT FALSE,
+        verification_token TEXT,
+        verification_expires TIMESTAMPTZ,
+        reset_token TEXT,
+        reset_expires TIMESTAMPTZ,
+        failed_attempts INTEGER DEFAULT 0,
+        lockout_until TIMESTAMPTZ,
+        city TEXT -- kept if appeared in inspection
+    )`,
+    `CREATE TABLE IF NOT EXISTS driver_profiles (
+        driver_id INTEGER PRIMARY KEY, -- Will handle FK later or separate
+        has_cdl BOOLEAN DEFAULT FALSE,
+        license_types TEXT,
+        endorsements TEXT,
+        operation_types TEXT,
+        experience_years INTEGER,
+        experience_range TEXT,
+        job_preferences TEXT,
+        has_truck BOOLEAN DEFAULT FALSE,
+        payment_methods TEXT,
+        work_relationships TEXT,
+        updated_at TIMESTAMPTZ
+    )`,
+    `CREATE TABLE IF NOT EXISTS drivers (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT,
+        email TEXT UNIQUE,
+        password_hash TEXT,
+        city TEXT,
+        state TEXT,
+        phone TEXT,
+        status TEXT,
+        push_token TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        verified BOOLEAN DEFAULT FALSE,
+        verification_token TEXT,
+        verification_expires TIMESTAMPTZ,
+        reset_token TEXT,
+        reset_expires TIMESTAMPTZ,
+        failed_attempts INTEGER DEFAULT 0,
+        lockout_until TIMESTAMPTZ,
+        company_id INTEGER -- References empresas(id) conceptually
+    )`,
+    // 2. Core Business Entities (Depend on Users)
+    `CREATE TABLE IF NOT EXISTS solicitudes (
+        id SERIAL PRIMARY KEY,
+        empresa_id INTEGER REFERENCES empresas(id),
+        driver_id INTEGER, -- Nullable
+        licencia_req TEXT,
+        ubicacion TEXT,
+        tiempo_estimado INTEGER,
+        estado TEXT,
+        fecha_creacion TIMESTAMPTZ,
+        fecha_expiracion TIMESTAMPTZ,
+        fecha_cierre TIMESTAMPTZ,
+        cancelado_por TEXT,
+        ronda_actual INTEGER DEFAULT 0,
+        fecha_inicio_ronda TIMESTAMPTZ
+    )`,
+    `CREATE TABLE IF NOT EXISTS matches (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES empresas(id),
+        driver_id INTEGER REFERENCES drivers(id),
+        status TEXT,
+        score INTEGER,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ
+    )`,
+    `CREATE TABLE IF NOT EXISTS tickets (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES empresas(id),
+        driver_id INTEGER REFERENCES drivers(id),
+        request_id INTEGER REFERENCES solicitudes(id),
+        price_cents INTEGER,
+        currency TEXT,
+        billing_status TEXT,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ,
+        billing_week TEXT,
+        amount_cents INTEGER, -- Legacy duplicate?
+        paid_at TIMESTAMPTZ,
+        payment_ref TEXT,
+        billing_notes TEXT,
+        stripe_checkout_session_id TEXT,
+        stripe_payment_intent_id TEXT,
+        stripe_customer_id TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS invoices (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES empresas(id),
+        billing_week TEXT,
+        issue_date TIMESTAMPTZ,
+        status TEXT,
+        currency TEXT,
+        subtotal_cents INTEGER,
+        total_cents INTEGER,
+        created_at TIMESTAMPTZ,
+        due_date TIMESTAMPTZ,
+        paid_at TIMESTAMPTZ,
+        paid_method TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS invoice_items (
+        id SERIAL PRIMARY KEY,
+        invoice_id INTEGER REFERENCES invoices(id),
+        ticket_id INTEGER REFERENCES tickets(id),
+        price_cents INTEGER,
+        created_at TIMESTAMPTZ
+    )`,
+    // 3. System/Infrastructure
+    `CREATE TABLE IF NOT EXISTS events_outbox (
+        id SERIAL PRIMARY KEY,
+        event_name TEXT,
+        created_at TIMESTAMPTZ,
+        company_id BIGINT,
+        driver_id BIGINT,
+        request_id BIGINT,
+        ticket_id BIGINT,
+        metadata TEXT,
+        processed BOOLEAN DEFAULT FALSE,
+        processed_at TIMESTAMPTZ,
+        process_status TEXT,
+        last_error TEXT,
+        send_attempts INTEGER DEFAULT 0,
+        audience_type TEXT,
+        audience_id TEXT,
+        event_key TEXT,
+        realtime_sent_at TIMESTAMPTZ,
+        queue_status TEXT,
+        queued_at TIMESTAMPTZ
+    )`,
+    `CREATE TABLE IF NOT EXISTS jobs_queue (
+        id SERIAL PRIMARY KEY,
+        job_type TEXT,
+        payload_json TEXT,
+        status TEXT,
+        attempts INTEGER DEFAULT 0,
+        max_attempts INTEGER DEFAULT 5,
+        run_at TIMESTAMPTZ,
+        locked_by TEXT,
+        locked_at TIMESTAMPTZ,
+        last_error TEXT,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ,
+        idempotency_key TEXT,
+        source_event_id INTEGER
+    )`,
+    `CREATE TABLE IF NOT EXISTS company_match_prefs (
+        company_id INTEGER PRIMARY KEY REFERENCES empresas(id),
+        req_license TEXT,
+        req_experience TEXT,
+        req_team_driving TEXT,
+        req_start TEXT,
+        req_restrictions TEXT,
+        updated_at TIMESTAMPTZ
+    )`,
+    `CREATE TABLE IF NOT EXISTS worker_heartbeat (
+        worker_name TEXT PRIMARY KEY,
+        last_seen TIMESTAMPTZ,
+        status TEXT,
+        metadata TEXT
+    )`
+];
+
+// --- HELPERS ---
+function transformRow(table, row) {
+    const newRow = { ...row };
+
+    // Explicit transformations (Boolean, Date)
+    const boolFields = [
+        'is_blocked', 'verified', 'has_cdl', 'has_truck', 'processed',
+        'tables_exist', 'worker_running'
+    ];
+
+    Object.keys(newRow).forEach(k => {
+        // Boolean conversion (0/1 -> true/false)
+        if (boolFields.includes(k) || (table === 'drivers' && k === 'verified') || (table === 'empresas' && k === 'verified')) {
+            newRow[k] = !!newRow[k];
+        }
+        // Empty strings to NULL for dates? Postgres is picky with timestamps.
+        // If empty string, set to null.
+        if (typeof newRow[k] === 'string' && newRow[k] === '') {
+            newRow[k] = null;
+        }
+    });
+
+    return newRow;
+}
+
+async function migrate() {
+    console.log("🚀 STARTING MIGRATION: SQLite -> Postgres (Isolated Mode)");
+    console.log(`📂 Source: ${SQLITE_PATH}`);
+    // console.log(`🐘 Target: ${PG_URL.split('@')[1]}`); // Hide creds
+
+    await pg.connect();
+
+    try {
+        await pg.query('BEGIN');
+
+        // 1. Create Schema
+        console.log("🏗️  Building Schema...");
+        // Drop all first to be clean?
+        await pg.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+
+        for (const sql of SCHEMA) {
+            await pg.query(sql);
+        }
+
+        // 2. Migrate Data
+        // Order matters for FKs
+        const TABLES = [
+            'empresas', 'drivers', 'driver_profiles', 'company_match_prefs',
+            'solicitudes', 'matches', 'tickets', 'invoices', 'invoice_items',
+            'events_outbox', 'jobs_queue', 'worker_heartbeat'
+        ];
+
+        for (const table of TABLES) {
+            console.log(`📦 Migrating ${table}...`);
+            const rows = sqlite.prepare(`SELECT * FROM ${table}`).all();
+
+            if (rows.length === 0) continue;
+
+            // Fetch actual Postgres columns to filter inputs
+            // Fetch actual Postgres columns to filter inputs AND types for sanitization
+            const pgColsRes = await pg.query(`
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = $1 AND table_schema = 'public'
+            `, [table]);
+
+            const pgCols = new Set();
+            const pgTypes = {};
+
+            pgColsRes.rows.forEach(r => {
+                pgCols.add(r.column_name);
+                pgTypes[r.column_name] = r.data_type; // e.g., 'timestamp with time zone'
+            });
+
+            console.log(`   ℹ️  Postgres columns for ${table}:`, [...pgCols].join(', '));
+
+            for (const row of rows) {
+                const cleanRow = transformRow(table, row);
+
+                // Filter keys: Only insert if key exists in Postgres table
+                const keys = [];
+                const values = [];
+
+                Object.keys(cleanRow).forEach(k => {
+                    if (pgCols.has(k)) {
+                        let val = cleanRow[k];
+                        const type = pgTypes[k];
+
+                        // Sanitize Timestamps
+                        if (type && (type.includes('timestamp') || type.includes('date'))) {
+                            if (!val || val === 0 || val === '0' || val === '') {
+                                val = null;
+                            } else {
+                                // Validate if it looks like a generic number used as date? 
+                                // SQLite sometimes stores JS timestamps (ms) as REAL/INT. Postgres needs ISO string or Date object.
+                                // If it's a number, convert to ISO.
+                                if (typeof val === 'number') {
+                                    val = new Date(val).toISOString();
+                                }
+                            }
+                        }
+
+                        keys.push(k);
+                        values.push(val);
+                    }
+                });
+
+                if (keys.length === 0) continue; // Should not happen
+
+                const query = `INSERT INTO ${table} (${keys.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')})`;
+                try {
+                    await pg.query('SAVEPOINT sp_insert');
+                    await pg.query(query, values);
+                    await pg.query('RELEASE SAVEPOINT sp_insert');
+                } catch (e) {
+                    await pg.query('ROLLBACK TO SAVEPOINT sp_insert');
+                    if (e.code === '23503') {
+                        console.warn(`   ⚠️  Skipping orphan/invalid FK in ${table} (ID ${cleanRow.id})`);
+                        continue;
+                    }
+                    console.error(`❌ Failed to insert into ${table} (ID ${cleanRow.id}):`, e.message);
+                    throw e;
+                }
+            }
+            console.log(`   ✅ ${rows.length} rows migrated.`);
+
+            // Reset Sequence if table has numeric ID
+            if (['empresas', 'drivers', 'solicitudes', 'tickets', 'invoices', 'events_outbox', 'jobs_queue'].includes(table)) {
+                await pg.query(`SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE(MAX(id), 1)) FROM ${table}`);
+            }
+        }
+
+        await pg.query('COMMIT');
+        console.log("🎉 MIGRATION SUCCESSFUL!");
+
+    } catch (e) {
+        await pg.query('ROLLBACK');
+        console.error("🔥 MIGRATION FAILED:", e);
+    } finally {
+        await pg.end();
+        console.log("DONE.");
+        // sqlite.close(); // might crash if loaded via require
+    }
+}
+
+migrate();
