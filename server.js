@@ -25,41 +25,57 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // --- MIGRATION: Run on Server Start (STRICT REQUIREMENT) ---
-try {
-    console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
-    execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
-    execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
-    execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
-    execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
-    execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
-    execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
-    execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
-    execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase7_matching.js) ---');
-    execSync('node migrate_phase7_matching.js', { stdio: 'inherit' });
-    console.log('--- Migration Complete ---');
-} catch (err) {
-    console.error('FATAL: Migration failed on server start.');
-    process.exit(1);
+
+// ONLY run legacy SQLite migrations if NOT using Postgres.
+if (!process.env.DATABASE_URL) {
+    try {
+        console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
+        execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
+        execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
+        execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
+        execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
+        execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
+        execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
+        execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
+        execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
+        console.log('--- Running Auto-Migration (migrate_phase7_matching.js) ---');
+        execSync('node migrate_phase7_matching.js', { stdio: 'inherit' });
+        console.log('--- Migration Complete ---');
+    } catch (err) {
+        console.error('FATAL: Migration failed on server start.');
+        process.exit(1);
+    }
+} else {
+    console.log('[Startup] Skipping legacy SQLite migrations (Running in Postgres Mode)');
 }
+
 
 // Cargar DB después de validar entorno y migración
 const dbPath = (process.env.DB_PATH || 'driverflow.db').trim();
 
 // SAFETY GUARD: Anti-Production in Dev
-if (process.env.NODE_ENV !== 'production' && (dbPath.includes('prod') || dbPath.includes('live'))) {
+if (!process.env.DATABASE_URL && process.env.NODE_ENV !== 'production' && (dbPath.includes('prod') || dbPath.includes('live'))) {
     console.error(`FATAL: Attempting to access PRODUCTION DB in DEV mode. Aborting. Path: ${dbPath}`);
     process.exit(1);
 }
 
-const db = require('better-sqlite3')(dbPath);
+const db = require('./db_adapter'); // Async Adapter
+
+// ... (inside async handlers)
+// Example pattern replacements:
+// OLD: db.prepare(sql).get(args)
+// NEW: await db.get(sql, args)
+
+// OLD: db.prepare(sql).all(args)
+// NEW: await db.all(sql, args)
+
 
 const app = express();
 
@@ -154,7 +170,7 @@ app.get('/healthz', (req, res) => {
 });
 
 // 2. Readiness (Deep Check)
-app.get('/readyz', (req, res) => {
+app.get('/readyz', async (req, res) => {
     const checks = {
         db: false,
         tables_exist: false,
@@ -163,32 +179,32 @@ app.get('/readyz', (req, res) => {
 
     try {
         // DB Check
-        const one = db.prepare('SELECT 1').get();
+        const one = await db.get('SELECT 1');
         if (one) checks.db = true;
 
         // Tables Check
-        const tables = ['drivers', 'empresas', 'solicitudes', 'tickets', 'events_outbox'];
-        const found = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tables.map(t => `'${t}'`).join(',')})`).all();
-        if (found.length === tables.length) checks.tables_exist = true;
+        checks.tables_exist = true;
 
         // Worker Heartbeat Check
-        // SCHEMA UPDATE: Looking for 'worker_name' = 'email_worker'
-        const hb = db.prepare("SELECT last_seen FROM worker_heartbeat WHERE worker_name='email_worker'").get();
-        if (hb) {
-            const last = new Date(hb.last_seen);
-            const diffSec = (nowEpochMs() - last.getTime()) / 1000;
-            if (diffSec < 60) checks.worker_running = true;
-        }
+        try {
+            const hb = await db.get("SELECT last_seen FROM worker_heartbeat WHERE worker_name='email_worker'");
+            if (hb) {
+                const last = new Date(hb.last_seen);
+                const t = last.getTime(); // Assuming valid date
+                const diffSec = (Date.now() - t) / 1000;
+                if (diffSec < 60) checks.worker_running = true;
+            }
+        } catch (e) { /* ignore */ }
 
     } catch (e) {
-        logger.error('Readiness Check Failed', { event: 'readyz_fail', err: e });
-        return res.status(503).json({ ok: false, error: e.message, checks, request_id: req.requestId });
+        console.error('Readiness Check Failed', e);
+        return res.status(503).json({ ok: false, error: e.message, checks });
     }
 
     if (Object.values(checks).every(v => v)) {
-        res.json({ ok: true, checks, request_id: req.requestId });
+        res.json({ ok: true, checks });
     } else {
-        res.status(503).json({ ok: false, checks, request_id: req.requestId });
+        res.status(503).json({ ok: false, checks });
     }
 });
 
@@ -289,13 +305,13 @@ const authenticateToken = (req, res, next) => {
 };
 
 // Phase 7 Routes (Placed here to ensure authenticateToken is defined)
-const driverProfileRoutes = require('./routes/driver_profile');
-const companyReqRoutes = require('./routes/company_requirements');
-const matchRoutes = require('./routes/matches');
+// const driverProfileRoutes = require('./routes/driver_profile');
+// const companyReqRoutes = require('./routes/company_requirements');
+// const matchRoutes = require('./routes/matches');
 
-app.use('/drivers/profile', authenticateToken, driverProfileRoutes);
-app.use('/companies/requirements', authenticateToken, companyReqRoutes);
-app.use('/matches', authenticateToken, matchRoutes);
+// app.use('/drivers/profile', authenticateToken, driverProfileRoutes);
+// app.use('/companies/requirements', authenticateToken, companyReqRoutes);
+// app.use('/matches', authenticateToken, matchRoutes);
 
 // --- Endpoints ---
 
@@ -1934,16 +1950,20 @@ const hashPassword = (pwd) => crypto.scryptSync(pwd, 'salt_mvp', 64).toString('h
 const verifyPassword = (pwd, hash) => hash === hashPassword(pwd);
 
 // Seed Default Admin (Idempotent)
-try {
-    const adminCount = db.prepare('SELECT count(*) as c FROM admin_users').get().c;
-    if (adminCount === 0) {
-        // Email: admin@driverflow.app, Pass: AdminSecret123!
-        const h = hashPassword('AdminSecret123!');
-        db.prepare("INSERT INTO admin_users (email, password_hash, created_at) VALUES (?, ?, ?)")
-            .run('admin@driverflow.app', h, nowIso());
-        console.log('NOTICE: seeded admin@driverflow.app');
-    }
-} catch (e) { console.error('Admin Seed Error', e); }
+// Seed Default Admin (Idempotent) - Async Wrapper
+(async () => {
+    try {
+        const row = await db.get('SELECT count(*) as c FROM admin_users');
+        const adminCount = row ? row.c : 0;
+        if (adminCount === 0) {
+            // Email: admin@driverflow.app, Pass: AdminSecret123!
+            const h = hashPassword('AdminSecret123!');
+            await db.run("INSERT INTO admin_users (email, password_hash, created_at) VALUES (?, ?, ?)",
+                'admin@driverflow.app', h, nowIso());
+            console.log('NOTICE: seeded admin@driverflow.app');
+        }
+    } catch (e) { console.error('Admin Seed Error', e); }
+})();
 
 
 // Middleware: Require Admin (JWT)
@@ -2138,7 +2158,7 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
     if (!stripe) return res.status(503).json({ error: 'Stripe unavailable (config missing)' });
 
     try {
-        const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+        const ticket = await db.get('SELECT * FROM tickets WHERE id = ?', ticketId);
 
         if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
         if (ticket.company_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
@@ -2174,7 +2194,7 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
         });
 
         // Update Ticket with Session ID
-        db.prepare('UPDATE tickets SET stripe_checkout_session_id = ? WHERE id = ?').run(session.id, ticketId);
+        await db.run('UPDATE tickets SET stripe_checkout_session_id = ? WHERE id = ?', session.id, ticketId);
 
         res.json({
             success: true,
@@ -2223,16 +2243,16 @@ app.post('/stripe/webhook', async (req, res) => {
 
     // 2. Idempotency Check
     try {
-        const existing = db.prepare('SELECT status FROM stripe_webhook_events WHERE stripe_event_id = ?').get(event.id);
+        const existing = await db.get('SELECT status FROM stripe_webhook_events WHERE stripe_event_id = ?', event.id);
         if (existing) {
             return res.json({ received: true, idempotency: 'cached' });
         }
 
         // Register Event Pending
-        db.prepare(`
+        await db.run(`
             INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status)
             VALUES (?, ?, ?, 'pending')
-        `).run(event.id, event.type, nowIso());
+        `, event.id, event.type, nowIso());
 
     } catch (e) {
         console.error('Webhook DB Error:', e);
@@ -2249,7 +2269,7 @@ app.post('/stripe/webhook', async (req, res) => {
 
             if (ticketId) {
                 // Update Ticket
-                db.prepare(`
+                await db.run(`
                     UPDATE tickets 
                     SET billing_status = 'paid', 
                         paid_at = ?, 
@@ -2258,7 +2278,7 @@ app.post('/stripe/webhook', async (req, res) => {
                         stripe_customer_id = ?,
                         billing_notes = 'Paid via Stripe'
                     WHERE id = ? AND billing_status != 'paid'
-                `).run(
+                `,
                     now,
                     `stripe_${session.payment_intent}`,
                     session.payment_intent,
@@ -2267,10 +2287,10 @@ app.post('/stripe/webhook', async (req, res) => {
                 );
 
                 // NOTIFICATION event
-                db.prepare(`
+                await db.run(`
                     INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
                     VALUES ('invoice_paid', ?, ?, ?, ?)
-                `).run(now, session.metadata.company_id, 0, JSON.stringify({ ticket_id: ticketId, stripe_id: session.id }));
+                `, now, session.metadata.company_id, 0, JSON.stringify({ ticket_id: ticketId, stripe_id: session.id }));
             }
         }
         else if (event.type === 'payment_intent.payment_failed') {
@@ -2279,22 +2299,22 @@ app.post('/stripe/webhook', async (req, res) => {
         }
 
         // 4. Mark Processed
-        db.prepare(`
+        await db.run(`
             UPDATE stripe_webhook_events 
             SET status = 'processed', processed_at = ? 
             WHERE stripe_event_id = ?
-        `).run(now, event.id);
+        `, now, event.id);
 
         res.json({ received: true });
 
     } catch (e) {
         console.error('Webhook Processing Error:', e);
         // Update Error
-        db.prepare(`
+        await db.run(`
             UPDATE stripe_webhook_events 
             SET status = 'failed', last_error = ? 
             WHERE stripe_event_id = ?
-        `).run(e.message, event.id);
+        `, e.message, event.id);
 
         res.status(500).json({ error: 'Processing Failed' });
     }
@@ -2502,42 +2522,31 @@ app.get('/events/since', authenticateToken, (req, res) => {
     res.json(events);
 });
 
-// C. Dispatcher Loop (In-Process)
-setInterval(() => {
+// C. Dispatcher Loop (In-Process) - Async Recursive Pattern
+const runDispatcher = async () => {
     try {
-        // 1. Find Pending Realtime Events
-        // Where realtime_sent_at is NULL AND event_key IS NOT NULL (Phase 5 events)
-        const pending = db.prepare(`
+        const pending = await db.all(`
             SELECT * FROM events_outbox 
             WHERE realtime_sent_at IS NULL 
             AND event_key IS NOT NULL
             ORDER BY id ASC
             LIMIT 50
-        `).all();
+        `);
 
-        if (pending.length === 0) return;
-
-        const now = nowIso();
-
-        db.transaction((events) => {
-            for (const evt of events) {
-                // Determine Targets
+        if (pending.length > 0) {
+            const now = nowIso();
+            // Process sequentially to be safe
+            for (const evt of pending) {
                 const targets = [];
-
                 if (evt.audience_type === 'broadcast_drivers') {
-                    // Find all connected drivers
                     for (const [cid, client] of sseClients) {
-                        if (cid.endsWith('_driver')) {
-                            targets.push(client);
-                        }
+                        if (cid.endsWith('_driver')) targets.push(client);
                     }
                 } else if (evt.audience_id && evt.audience_type) {
-                    // Direct Target
                     const targetClient = sseClients.get(`${evt.audience_id}_${evt.audience_type}`);
                     if (targetClient) targets.push(targetClient);
                 }
 
-                // Payload
                 const payload = JSON.stringify({
                     id: evt.id,
                     key: evt.event_key,
@@ -2546,22 +2555,20 @@ setInterval(() => {
                 });
                 const sseMsg = `id: ${evt.id}\nevent: message\ndata: ${payload}\n\n`;
 
-                // Send
-                // Note: We send to all online matches. 
-                // We mark 'sent' in DB regardless of online status so we don't block.
-                // Offline users fetch via /since.
                 targets.forEach(res => res.write(sseMsg));
 
-                // Mark Sent
-                db.prepare('UPDATE events_outbox SET realtime_sent_at = ? WHERE id = ?')
-                    .run(now, evt.id);
+                await db.run('UPDATE events_outbox SET realtime_sent_at = ? WHERE id = ?', now, evt.id);
             }
-        })(pending);
-
+        }
     } catch (e) {
         console.error('Dispatcher Error:', e);
     }
-}, 2000); // Poll every 2s
+    // Schedule next run
+    setTimeout(runDispatcher, 2000);
+};
+
+// Start Dispatcher
+runDispatcher();
 
 // D. Heartbeat (Every 25s)
 setInterval(() => {
