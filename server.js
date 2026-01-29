@@ -203,10 +203,13 @@ app.get('/metrics', async (req, res) => {
 app.get('/sys/debug/email-status', async (req, res) => {
     try {
         const events = await db.all("SELECT id, event_name, queue_status, created_at FROM events_outbox ORDER BY id DESC LIMIT 10");
-        const jobs = await db.all("SELECT id, job_type, status, attempts, last_error, run_at FROM jobs_queue ORDER BY id DESC LIMIT 10");
-        const hb = await db.all("SELECT * FROM worker_heartbeat");
-        res.json({ events, jobs, hb, now: nowIso() });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const jobs = await db.all("SELECT id, job_type, status, attempts, last_error, run_at FROM jobs_queue ORDER BY id DESC LIMIT 5");
+        const hb = await db.all("SELECT worker_name, last_seen, status, metadata FROM worker_heartbeat");
+        const logs = await db.all("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 10");
+        res.json({ events, jobs, hb, logs, now: new Date().toISOString() });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.post('/sys/debug/reset-jobs', async (req, res) => {
