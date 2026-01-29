@@ -1,9 +1,60 @@
 const db = require('./db_adapter');
 
-console.log('--- [PROD MIGRATION] CONSSOLIDATED SCHEMA FIX ---');
+console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
 
 (async () => {
+    // --- HELPER: Safe Add Column (Postgres) ---
+    async function safeAddColumn(table, col, type) {
+        try {
+            await db.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+            console.log(`✅ Added ${table}.${col}`);
+        } catch (e) {
+            if (e.message && (e.message.includes('duplicate column') || e.message.includes('exists'))) {
+                // Ignore
+            } else {
+                console.warn(`⚠️ Warning adding ${table}.${col}: ${e.message}`);
+            }
+        }
+    }
+
     try {
+        // --- PHASE 0: BASE SCHEMA REPAIR ---
+        console.log('Migrating: Base Schema Repair...');
+
+        // Ensure Drivers Table
+        await db.run(`
+            CREATE TABLE IF NOT EXISTS drivers (
+                id SERIAL PRIMARY KEY,
+                nombre TEXT,
+                contacto TEXT UNIQUE,
+                password_hash TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT
+            )
+        `);
+
+        // Ensure Empresas Table
+        await db.run(`
+            CREATE TABLE IF NOT EXISTS empresas (
+                id SERIAL PRIMARY KEY,
+                nombre TEXT,
+                contacto TEXT UNIQUE,
+                password_hash TEXT,
+                created_at TEXT
+            )
+        `);
+
+        // REPAIR MISSING COLUMNS (The error was "column contacto does not exist")
+        await safeAddColumn('drivers', 'contacto', 'TEXT UNIQUE');
+        await safeAddColumn('drivers', 'password_hash', 'TEXT');
+        await safeAddColumn('drivers', 'status', "TEXT DEFAULT 'active'");
+
+        await safeAddColumn('empresas', 'contacto', 'TEXT UNIQUE');
+        await safeAddColumn('empresas', 'password_hash', 'TEXT');
+        await safeAddColumn('empresas', 'legal_name', 'TEXT');
+        await safeAddColumn('empresas', 'address_line1', 'TEXT');
+        await safeAddColumn('empresas', 'city', 'TEXT');
+
         // --- PHASE 3: OBSERVABILITY ---
         console.log('Migrating: Observability...');
         // metrics_snapshot
@@ -152,7 +203,7 @@ console.log('--- [PROD MIGRATION] CONSSOLIDATED SCHEMA FIX ---');
 
         // admin_audit_log
         await db.run(`
-             CREATE TABLE IF NOT EXISTS admin_audit_log (
+             CREATE TABLE IF NOT EXISTS admin_users_audit_log (
                 id SERIAL PRIMARY KEY,
                 admin_id INTEGER,
                 action TEXT NOT NULL,
