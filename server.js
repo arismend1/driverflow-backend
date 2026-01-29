@@ -31,22 +31,10 @@ if (process.env.NODE_ENV === 'production') {
 try {
     console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
     execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
-    execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
-    execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
-    execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
-    execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
-    execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
-    execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
-    execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
-    console.log('--- Running Auto-Migration (migrate_phase7_matching.js) ---');
-    execSync('node migrate_phase7_matching.js', { stdio: 'inherit' });
+
+    console.log('--- Running Consolidated Prod Schema Verification (migrate_prod_consolidated.js) ---');
+    execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
+
     console.log('--- Migration Complete ---');
 } catch (err) {
     console.error('FATAL: Migration failed on server start.');
