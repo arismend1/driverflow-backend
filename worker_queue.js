@@ -9,6 +9,8 @@ const BATCH_SIZE = 5;
 
 // Wrapper for compatibility
 const nowIso = () => time.nowIso({ ctx: 'worker_queue' });
+const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
+const FROM_NAME = "DriverFlow";
 
 // --- ENQUEUE HELPER ---
 async function enqueueJob(type, payload, options = {}) {
@@ -134,13 +136,16 @@ const handlers = {
 
         let subject = "DriverFlow Notification";
         let body = "Notification";
+        const fromName = FROM_NAME;
 
         if (payload.event_name === 'verification_email') {
             subject = "Verifica tu cuenta - DriverFlow";
-            body = `Tu código de verificación es: ${payload.token}`;
+            const name = payload.name || 'Usuario';
+            body = `Hola ${name},\n\nGracias por registrarte.\n\nActiva tu cuenta aquí:\n${API_URL}/verify-email?token=${payload.token}\n\nO usa el código: ${payload.token}\n(Deep Link: driverflow://verify-email?token=${payload.token})`;
         } else if (payload.event_name === 'recovery_email') {
-            subject = "Restablecer Password - DriverFlow";
-            body = `Usa este token para restablecer tu contraseña: ${payload.token}`;
+            subject = "Restablecer Contraseña - DriverFlow";
+            const name = payload.name || 'Usuario';
+            body = `Hola ${name},\n\nSolicitaste recuperar tu contraseña.\n\nHaz clic aquí:\n${API_URL}/reset-password-web?token=${payload.token}\n\n(Deep Link: driverflow://reset-password?token=${payload.token})`;
         }
 
         if (dryRun) {
@@ -156,7 +161,7 @@ const handlers = {
             },
             body: JSON.stringify({
                 personalizations: [{ to: [{ email: payload.email }] }],
-                from: { email: fromEmail || "no-reply@driverflow.app" },
+                from: { email: fromEmail || "no-reply@driverflow.app", name: fromName },
                 subject,
                 content: [{ type: "text/plain", value: body }]
             })
