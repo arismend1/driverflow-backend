@@ -9,12 +9,11 @@ let pgPool = null;
 let sqliteDb = null;
 
 if (IS_POSTGRES) {
-    let pg;
     try {
         pg = require('pg');
     } catch (e) {
-        console.warn('[DB] root pg not found, trying migration_tooling...');
-        pg = require('./migration_tooling/node_modules/pg');
+        console.error('[DB] root pg not found. Ensure "pg" is in package.json');
+        throw e;
     }
     const { Pool } = pg;
     pgPool = new Pool({
