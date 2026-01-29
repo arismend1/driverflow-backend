@@ -307,6 +307,10 @@ app.post('/login', async (req, res) => {
         if (await bcrypt.compare(password, row.password_hash)) {
             if (row.failed_attempts > 0) await db.run(`UPDATE ${table} SET failed_attempts=0, lockout_until=NULL WHERE id=?`, row.id);
             const token = jwt.sign({ id: row.id, type }, SECRET_KEY, { expiresIn: '24h' });
+
+            // Audit Success
+            await auditLog('login_success', row.id, type, {}, req);
+
             res.json({ ok: true, token, type, id: row.id });
         } else {
             const fails = (row.failed_attempts || 0) + 1;
@@ -346,7 +350,7 @@ app.all('/verify-email', async (req, res) => {
 // I will include minimal Reset to support flow
 app.post('/forgot_password', async (req, res) => {
     if (!checkRateLimit(req.ip, 'forgot')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    const { email } = req.body;
+    const email = req.body.email || req.body.contacto;
     try {
         let u = await db.get("SELECT id, nombre, 'driver' as type FROM drivers WHERE contacto=?", email);
         if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type FROM empresas WHERE contacto=?", email);
@@ -358,6 +362,10 @@ app.post('/forgot_password', async (req, res) => {
             await db.run(`UPDATE ${table} SET reset_token=?, reset_expires=? WHERE id=?`, token, expires, u.id);
             await db.run(`INSERT INTO events_outbox (event_name, created_at, metadata) VALUES (?, ?, ?)`,
                 'recovery_email', nowIso(), JSON.stringify({ token, email, name: u.nombre }));
+
+            await auditLog('forgot_password_req', u.id, u.type, { email }, req);
+        } else {
+            await auditLog('forgot_password_fail', 'unknown', email, { reason: 'not_found' }, req);
         }
         res.json({ ok: true }); // Always 200 security
     } catch (e) {
