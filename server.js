@@ -249,11 +249,11 @@ app.post('/register', async (req, res) => {
         const expires = new Date(nowEpochMs() + 86400000).toISOString();
 
         if (type === 'driver') {
-            const info = await db.run(`INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,'active',?,0,?,?)`,
+            const info = await db.run(`INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,'active',?,false,?,?)`,
                 nombre, contacto, hash, extras.tipo_licencia || 'B', now, token, expires);
             await db.run(`INSERT INTO events_outbox (event_name, created_at, driver_id, metadata) VALUES (?,?,?,?)`, 'verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         } else {
-            const info = await db.run(`INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,0,?,?,?)`,
+            const info = await db.run(`INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,false,?,?,?)`,
                 nombre, contacto, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
             await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?,?,?,?)`, 'verification_email', now, info.lastInsertRowid, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
@@ -317,7 +317,7 @@ app.all('/verify-email', async (req, res) => {
 
     if (!u) return res.status(404).send('Invalid Token');
     const table = u.type === 'driver' ? 'drivers' : 'empresas';
-    await db.run(`UPDATE ${table} SET verified=1, verification_token=NULL WHERE id=?`, u.id);
+    await db.run(`UPDATE ${table} SET verified=true, verification_token=NULL WHERE id=?`, u.id);
     res.send('<h1>Verified</h1>');
 });
 
