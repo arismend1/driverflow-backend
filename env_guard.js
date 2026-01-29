@@ -18,6 +18,8 @@ function validateEnv({ role }) {
 
     if (role === 'api') {
         required.push('ADMIN_SECRET');
+        // Email
+        required.push('SENDGRID_API_KEY', 'FROM_EMAIL');
         // Stripe Enforcement if configured
         if (process.env.STRIPE_SECRET_KEY && !process.env.STRIPE_SECRET_KEY.startsWith('sk_live_')) {
             console.error('FATAL: STRIPE_SECRET_KEY must be a Live Key (sk_live_...) in Production');
