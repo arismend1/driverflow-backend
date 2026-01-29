@@ -7,17 +7,16 @@ function validateEnv({ role }) {
     const required = [];
 
     // Common
-    required.push('NODE_ENV', 'PORT', 'JWT_SECRET'); // Strict JWT_SECRET
+    required.push('NODE_ENV');
 
     // DB Selection
-    if (process.env.DATABASE_URL) {
-        // Postgres
-    } else {
-        // Legacy SQLite support if needed
+    if (!process.env.DATABASE_URL && !process.env.DB_PATH) {
+        console.error('FATAL: Database configuration missing (DATABASE_URL or DB_PATH required)');
+        process.exit(1);
     }
 
     if (role === 'api') {
-        required.push('ADMIN_SECRET', 'METRICS_TOKEN');
+        required.push('PORT', 'JWT_SECRET', 'ADMIN_SECRET', 'METRICS_TOKEN');
 
         // Email (Warn only)
         if (!process.env.SENDGRID_API_KEY) console.warn('⚠️  SENDGRID_API_KEY missing. Emails will fail.');
@@ -36,6 +35,7 @@ function validateEnv({ role }) {
 
     if (role === 'worker') {
         // Worker needs email keys too, but we let 'api' guarding cover it usually if shared env
+        // STRICT: Worker MUST have DB and JWT just like API for consistency
     }
 
     const missing = required.filter(k => !process.env[k]);

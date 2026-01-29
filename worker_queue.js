@@ -176,6 +176,67 @@ const handlers = {
 
     async realtime_push(payload) {
         // Placeholder for SSE/Push logic
+    },
+
+    // --- WEEKLY BILLING ---
+    async generate_weekly_invoices(payload) {
+        const { company_id, week_start, week_end } = payload;
+        if (!company_id || !week_start || !week_end) {
+            logger.error('Invalid Invoice Job Payload', payload);
+            return;
+        }
+
+        try {
+            logger.info(`[Billing] Generating for Co:${company_id} (${week_start} - ${week_end})`);
+
+            // 1. Calculate Usage
+            // 'solicitudes' table. Range: [start, end)
+            // week_end + 1 day for upper bound (exclusive)
+
+            let start = week_start;
+            let endPlusOne;
+            try {
+                const d = new Date(week_end);
+                d.setDate(d.getDate() + 1);
+                endPlusOne = d.toISOString().split('T')[0];
+            } catch (e) { endPlusOne = week_end; }
+
+            const usage = await db.get(`
+                SELECT count(*) as cnt, count(distinct driver_id) as drv 
+                FROM solicitudes 
+                WHERE empresa_id = ? AND created_at >= ? AND created_at < ?`,
+                company_id, start, endPlusOne
+            );
+
+            const total = usage ? (usage.cnt || 0) : 0;
+            const drivers = usage ? (usage.drv || 0) : 0;
+
+            // 2. Pricing Logic (Placeholder: $10 MXN per request -> 1000 cents)
+            // In future, fetch pricing from companies table
+            const PRICE_PER_REQ_CENTS = 1000;
+            const amount = total * PRICE_PER_REQ_CENTS;
+
+            // 3. Upsert Invoice
+            const existing = await db.get("SELECT id FROM weekly_invoices WHERE company_id=? AND week_start=?", company_id, week_start);
+
+            if (existing) {
+                await db.run(`UPDATE weekly_invoices SET total_requests=?, active_drivers=?, amount_cents=?, updated_at=? WHERE id=?`,
+                    total, drivers, amount, nowIso(), existing.id);
+                logger.info(`[Billing] Updated Invoice #${existing.id}`);
+            } else {
+                await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, status, created_at) VALUES (?,?,?,?,?,?,'pending',?)`,
+                    company_id, week_start, week_end, total, drivers, amount, nowIso());
+                logger.info(`[Billing] Created New Invoice`);
+            }
+
+            // 4. Emit Event
+            await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
+                'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount }));
+
+        } catch (e) {
+            logger.error(`[Billing] Failed for Co:${company_id}`, e);
+            throw e; // Retry job
+        }
     }
 };
 
@@ -291,6 +352,15 @@ async function startQueueWorker() {
         }
         await new Promise(r => setTimeout(r, POLL_INTERVAL));
     }
+}
+
+// --- SELF-EXECUTION ---
+if (require.main === module) {
+    require('./env_guard').validateEnv({ role: 'worker' });
+    startQueueWorker().catch(err => {
+        logger.error('FATAL: Worker Failed', err);
+        process.exit(1);
+    });
 }
 
 module.exports = { startQueueWorker, enqueueJob, bridgeOutbox };
