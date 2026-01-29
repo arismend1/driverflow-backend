@@ -44,10 +44,11 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
             )
         `);
 
-        // REPAIR MISSING COLUMNS (The error was "column contacto does not exist")
+        // REPAIR MISSING COLUMNS
         await safeAddColumn('drivers', 'contacto', 'TEXT UNIQUE');
         await safeAddColumn('drivers', 'password_hash', 'TEXT');
         await safeAddColumn('drivers', 'status', "TEXT DEFAULT 'active'");
+        await safeAddColumn('drivers', 'tipo_licencia', "TEXT DEFAULT 'B'");
 
         await safeAddColumn('empresas', 'contacto', 'TEXT UNIQUE');
         await safeAddColumn('empresas', 'password_hash', 'TEXT');
@@ -201,9 +202,9 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
             )
         `);
 
-        // admin_audit_log
+        // admin_audit_log (Legacy/Specific)
         await db.run(`
-             CREATE TABLE IF NOT EXISTS admin_users_audit_log (
+             CREATE TABLE IF NOT EXISTS admin_audit_log (
                 id SERIAL PRIMARY KEY,
                 admin_id INTEGER,
                 action TEXT NOT NULL,
@@ -211,6 +212,19 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
                 target_id TEXT,
                 ip_address TEXT,
                 timestamp TEXT NOT NULL
+            )
+        `);
+
+        // FASE 9: GENERAL AUDIT LOGS
+        await db.run(`
+             CREATE TABLE IF NOT EXISTS audit_logs (
+                id SERIAL PRIMARY KEY,
+                action TEXT NOT NULL,
+                actor_id TEXT, -- can be email or user_id
+                target_id TEXT,
+                metadata TEXT,
+                ip_address TEXT,
+                created_at TEXT NOT NULL
             )
         `);
 
