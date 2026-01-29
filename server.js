@@ -361,7 +361,8 @@ app.all('/verify-email', async (req, res) => {
 // I will include minimal Reset to support flow
 app.post('/forgot_password', async (req, res) => {
     if (!checkRateLimit(req.ip, 'forgot')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    const email = req.body.email || req.body.contacto;
+    // Support all variations: standard, mobile (contacto), and new mobile (contact)
+    const email = req.body.email || req.body.contacto || req.body.contact;
     try {
         let u = await db.get("SELECT id, nombre, 'driver' as type FROM drivers WHERE contacto=?", email);
         if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type FROM empresas WHERE contacto=?", email);
