@@ -346,8 +346,106 @@ app.all('/verify-email', async (req, res) => {
 // I will include minimal Reset to support flow
 app.post('/forgot_password', async (req, res) => {
     if (!checkRateLimit(req.ip, 'forgot')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    // ... logic would be here ...
-    res.json({ ok: true });
+    const { email } = req.body;
+    try {
+        let u = await db.get("SELECT id, nombre, 'driver' as type FROM drivers WHERE contacto=?", email);
+        if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type FROM empresas WHERE contacto=?", email);
+
+        if (u) {
+            const token = crypto.randomBytes(32).toString('hex');
+            const expires = new Date(nowEpochMs() + 3600000).toISOString(); // 1h
+            const table = u.type === 'driver' ? 'drivers' : 'empresas';
+            await db.run(`UPDATE ${table} SET reset_token=?, reset_expires=? WHERE id=?`, token, expires, u.id);
+            await db.run(`INSERT INTO events_outbox (event_name, created_at, metadata) VALUES (?, ?, ?)`,
+                'recovery_email', nowIso(), JSON.stringify({ token, email, name: u.nombre }));
+        }
+        res.json({ ok: true }); // Always 200 security
+    } catch (e) {
+        console.error('Forgot Error', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.post('/reset_password', async (req, res) => {
+    if (!checkRateLimit(req.ip, 'reset')) return res.status(429).json({ error: 'RATE_LIMITED' });
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword || !isStrongPassword(newPassword)) return res.status(400).json({ error: 'Invalid data or weak password' });
+
+    try {
+        let u = await db.get("SELECT id, 'driver' as type FROM drivers WHERE reset_token=? AND reset_expires > ?", token, nowIso());
+        if (!u) u = await db.get("SELECT id, 'empresa' as type FROM empresas WHERE reset_token=? AND reset_expires > ?", token, nowIso());
+
+        if (!u) return res.status(400).json({ error: 'Invalid or expired token' });
+
+        const hash = await bcrypt.hash(newPassword, 10);
+        const table = u.type === 'driver' ? 'drivers' : 'empresas';
+        await db.run(`UPDATE ${table} SET password_hash=?, reset_token=NULL, reset_expires=NULL WHERE id=?`, hash, u.id);
+
+        // Audit
+        await auditLog('password_reset', u.id, u.type, {}, req);
+
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Reset Error', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.get('/reset-password-web', (req, res) => {
+    const token = req.query.token;
+    if (!token) return res.status(400).send('Missing Token');
+    res.send(`
+        <html>
+        <head>
+            <title>Restablecer Contraseña</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; }
+                form { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+                input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+                button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+                button:hover { background: #0056b3; }
+                .msg { margin-bottom: 1rem; color: #666; font-size: 0.9rem; }
+            </style>
+        </head>
+        <body>
+            <form id="resetForm">
+                <h2>Nueva Contraseña</h2>
+                <div class="msg">Introduce tu nueva contraseña (mínimo 8 caracteres, números y letras).</div>
+                <input type="hidden" id="token" value="${token}">
+                <input type="password" id="password" placeholder="Nueva Contraseña" required minlength="8">
+                <button type="submit">Guardar</button>
+            </form>
+            <script>
+                document.getElementById('resetForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const password = document.getElementById('password').value;
+                    const token = document.getElementById('token').value;
+                    const btn = e.target.querySelector('button');
+                    btn.disabled = true; btn.innerText = 'Guardando...';
+
+                    try {
+                        const res = await fetch('/reset_password', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ token, newPassword: password })
+                        });
+                        const data = await res.json();
+                        if (data.ok) {
+                            document.body.innerHTML = '<div style="text-align:center; padding: 2rem;"><h1>¡Listo!</h1><p>Contraseña actualizada correctamente.</p><p>Ya puedes iniciar sesión en la app.</p></div>';
+                        } else {
+                            alert('Error: ' + (data.error || 'No se pudo actualizar'));
+                            btn.disabled = false; btn.innerText = 'Guardar';
+                        }
+                    } catch (err) {
+                        alert('Error de conexión');
+                        btn.disabled = false; btn.innerText = 'Guardar';
+                    }
+                });
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 
