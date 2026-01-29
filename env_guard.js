@@ -7,19 +7,22 @@ function validateEnv({ role }) {
     const required = [];
 
     // Common
-    required.push('NODE_ENV', 'PORT', 'JWT_SECRET');
+    required.push('NODE_ENV', 'PORT', 'JWT_SECRET'); // Strict JWT_SECRET
 
     // DB Selection
     if (process.env.DATABASE_URL) {
         // Postgres
     } else {
-        required.push('DB_PATH'); // SQLite Legacy in Prod? Should be Postgres, but support legacy.
+        // Legacy SQLite support if needed
     }
 
     if (role === 'api') {
-        required.push('ADMIN_SECRET');
-        // Email
-        required.push('SENDGRID_API_KEY', 'FROM_EMAIL');
+        required.push('ADMIN_SECRET', 'METRICS_TOKEN');
+
+        // Email (Warn only)
+        if (!process.env.SENDGRID_API_KEY) console.warn('⚠️  SENDGRID_API_KEY missing. Emails will fail.');
+        if (!process.env.FROM_EMAIL) console.warn('⚠️  FROM_EMAIL missing. Emails will fail.');
+
         // Stripe Enforcement if configured
         if (process.env.STRIPE_SECRET_KEY && !process.env.STRIPE_SECRET_KEY.startsWith('sk_live_')) {
             console.error('FATAL: STRIPE_SECRET_KEY must be a Live Key (sk_live_...) in Production');
@@ -32,7 +35,7 @@ function validateEnv({ role }) {
     }
 
     if (role === 'worker') {
-        // specific worker envs?
+        // Worker needs email keys too, but we let 'api' guarding cover it usually if shared env
     }
 
     const missing = required.filter(k => !process.env[k]);

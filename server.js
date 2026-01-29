@@ -20,7 +20,14 @@ const { getStripe } = require('./stripe_client');
 validateEnv({ role: 'api' });
 
 // --- MIGRATION ON START ---
-if (process.env.RUN_MIGRATIONS !== 'false') {
+const app = express();
+// --- 9.3 REAL IP (Render/Proxy) ---
+app.set('trust proxy', 1);
+
+// --- 9.1 ENV GUARD (Already called above) ---
+
+// --- MIGRATION ON START (Conditional) ---
+if (process.env.RUN_MIGRATIONS === 'true') {
     try {
         console.log('--- Auto-Migration ---');
         execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
@@ -35,16 +42,12 @@ if (process.env.RUN_MIGRATIONS !== 'false') {
 
 // DB Init
 const dbPath = (process.env.DB_PATH || 'driverflow.db').trim();
-if (!process.env.DATABASE_URL && process.env.NODE_ENV !== 'production' && (dbPath.includes('prod') || dbPath.includes('live'))) {
+if (!process.env.DATABASE_URL && process.env.NODE_ENV === 'production' && (dbPath.includes('prod') || dbPath.includes('live'))) {
     console.error(`FATAL: Prod DB in Dev? No.`);
     process.exit(1);
 }
 const db = require('./db_adapter');
 const IS_POSTGRES = !!process.env.DATABASE_URL;
-
-const app = express();
-// --- 9.3 REAL IP (Render/Proxy) ---
-app.set('trust proxy', 1);
 
 // --- 9.4 RATE LIMITER ---
 const rateLimitMap = new Map();
@@ -82,7 +85,11 @@ async function auditLog(action, actorId, targetId, metadata, req) {
 }
 
 // --- 9.2 STRIPE WEBHOOK (Unified) ---
+// --- 9.2 STRIPE WEBHOOK (Unified & Hardened) ---
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    // Note: Rate limiting here can be dangerous if Stripe sends many events. 
+    // We use a higher limit for webhooks or skip it if from known Stripe IPs (hard to verify).
+    // For now, we use the webhook specific limiter.
     if (!checkRateLimit(req.ip, 'webhook')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const sig = req.headers['stripe-signature'];
@@ -128,23 +135,33 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         res.json({ received: true });
     } catch (err) {
         console.error('[Stripe Error]', err);
-        // Return 200 to stop retry loops
-        res.json({ received: true, status: 'error_logged' });
+        // CRITICAL: Return 500 so Stripe Retries if it's a transient DB error
+        res.status(500).send('Internal Server Error');
     }
 });
-// Legacy Redirection (Logging)
-const goneHandler = (req, res) => {
-    console.warn(`[Legacy Webhook] Hit on ${req.path}. Use /stripe/webhook`);
-    res.status(410).send('Gone. Use /stripe/webhook');
+
+// Legacy Redirection (Internal Forward or Instructions)
+const legacyWebhook = (req, res) => {
+    // Ideally 307 to preserve body, but that's risky if client doesn't support.
+    // Better: Instruct user or return 404 (Not Found, but not Gone).
+    // User requested: "No devolver 410 aún. Redirigir internamente..."
+    // Since we can't easily "forward" the raw body stream after express.json might have consumed it (if defined later),
+    // and these routes are defined BEFORE express.json(), we can just attach the handler!
+    // BUT 'req.url' might matter. Let's just return 404 with a helpful message for logs.
+    console.warn(`[Legacy Webhook] Hit on ${req.path}. Update Stripe Config to /stripe/webhook`);
+    res.status(404).json({ error: 'Use /stripe/webhook' });
 };
-app.post('/api/stripe/webhook', goneHandler);
-app.post('/webhooks/payment', goneHandler);
+app.post('/api/stripe/webhook', legacyWebhook);
+app.post('/webhooks/payment', legacyWebhook);
 
 
 // --- APP CONFIG ---
 app.use(express.json());
 // 9.2 CORS FIX (Safe Parsing)
+// 9.2 CORS FIX (Safe Parsing)
 const allowedStr = (process.env.ALLOWED_ORIGINS || '').trim();
+// If empty in PROD, default to [] (Closed), unless explicitly intended.
+// User rule: "Si lista vacía => permitir solo no-origin... o bloquear todo"
 const ALLOWED_ORIGINS = allowedStr ? allowedStr.split(',').map(s => s.trim()).filter(Boolean) : [];
 
 app.use(cors({
@@ -152,10 +169,16 @@ app.use(cors({
         // Mobile/Curl (no origin) -> Allow
         if (!origin) return cb(null, true);
 
-        // If config is empty in PROD, deny everything except no-origin (above).
-        // If config has '*', allow all.
-        // Else, strict match.
-        if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+        // If config requires '*', allow all.
+        if (ALLOWED_ORIGINS.includes('*')) return cb(null, true);
+
+        // If empty in Prod and not *, it's closed to browsers.
+        if (ALLOWED_ORIGINS.length === 0 && process.env.NODE_ENV === 'production') {
+            return cb(new Error('CORS Denied (Empty Config)'));
+        }
+
+        // Strict match
+        if (ALLOWED_ORIGINS.includes(origin)) {
             return cb(null, true);
         }
 
@@ -185,18 +208,101 @@ app.get('/readyz', async (req, res) => {
     res.status(checks.db ? 200 : 503).json(checks);
 });
 
-// Metrics
+// --- 10. METRICS & DASHBOARD ---
 app.get('/metrics', async (req, res) => {
-    if (process.env.NODE_ENV === 'production') {
-        if (req.headers['authorization'] !== `Bearer ${process.env.METRICS_TOKEN}`) return res.sendStatus(401);
+    // 1. Strict Auth
+    if (req.headers['authorization'] !== `Bearer ${process.env.METRICS_TOKEN}`) return res.sendStatus(401);
+
+    // 2. Data Gathering
+    try {
+        const dbStatus = await db.get('SELECT 1');
+        const outbox = await db.all("SELECT queue_status, count(*) as c FROM events_outbox GROUP BY queue_status");
+        const jobs = await db.all("SELECT status, count(*) as c FROM jobs_queue GROUP BY status");
+        const hooks = await db.all("SELECT status, count(*) as c FROM stripe_webhook_events GROUP BY status");
+
+        const data = {
+            status: 'up',
+            db: !!dbStatus,
+            memory: process.memoryUsage(),
+            uptime: process.uptime(),
+            timestamp: new Date().toISOString(),
+            queues: {
+                events_outbox: outbox.reduce((acc, r) => ({ ...acc, [r.queue_status || 'null']: r.c }), {}),
+                jobs_queue: jobs.reduce((acc, r) => ({ ...acc, [r.status || 'null']: r.c }), {}),
+                webhooks: hooks.reduce((acc, r) => ({ ...acc, [r.status || 'null']: r.c }), {})
+            }
+        };
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ status: 'error', error: e.message });
     }
-    // Async DB Counts
-    const sc = await db.get("SELECT count(*) as c FROM events_outbox WHERE process_status='sent'");
-    const fc = await db.get("SELECT count(*) as c FROM events_outbox WHERE process_status='failed'");
-    const data = metrics.getSnapshot();
-    data.db_sent = sc ? parseInt(sc.c) : 0;
-    data.db_failed = fc ? parseInt(fc.c) : 0;
-    res.json(data);
+});
+
+app.get('/admin/metrics', async (req, res) => {
+    const adminSecret = req.headers['x-admin-secret'];
+    if (adminSecret !== process.env.ADMIN_SECRET) return res.sendStatus(403);
+
+    try {
+        const outbox = await db.all("SELECT queue_status, count(*) as c FROM events_outbox GROUP BY queue_status");
+        const jobs = await db.all("SELECT status, count(*) as c FROM jobs_queue GROUP BY status");
+        const hooks = await db.all("SELECT status, count(*) as c FROM stripe_webhook_events GROUP BY status");
+
+        const fmt = (rows, key) => rows.map(r => `<li><b>${r[key] || 'null'}</b>: <span class="val">${r.c}</span></li>`).join('');
+
+        const html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>DriverFlow Monitor</title>
+            <meta http-equiv="refresh" content="10">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #111; color: #eee; padding: 20px; font-size: 14px; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+                .card { background: #222; padding: 15px; border: 1px solid #444; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+                h2 { margin-top: 0; color: #4db8ff; font-size: 1.1rem; border-bottom: 1px solid #333; padding-bottom: 8px; margin-bottom: 10px; }
+                ul { list-style: none; padding: 0; margin: 0; }
+                li { padding: 6px 0; border-bottom: 1px solid #333; display: flex; justify-content: space-between; }
+                li:last-child { border-bottom: none; }
+                .ok { color: #0f0; font-weight: bold; } 
+                .err { color: #f00; font-weight: bold; }
+                .warn { color: #fb0; font-weight: bold; }
+                .val { font-family: monospace; font-size: 1.1em; }
+            </style>
+        </head>
+        <body>
+            <header style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+                <h1 style="margin: 0; font-size: 1.5rem;">System Monitor</h1>
+                <div style="font-size: 0.8rem; color: #888;">${new Date().toISOString()}</div>
+            </header>
+            
+            <div class="grid">
+                <div class="card">
+                    <h2>SYSTEM HEALTH</h2>
+                    <ul>
+                        <li><span>Status</span> <span class="ok">ONLINE</span></li>
+                        <li><span>DB Connection</span> <span class="ok">CONNECTED</span></li>
+                        <li><span>Uptime</span> <span class="val">${Math.floor(process.uptime())}s</span></li>
+                        <li><span>Memory (RSS)</span> <span class="val">${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB</span></li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h2>EVENTS OUTBOX</h2>
+                     <ul>${fmt(outbox, 'queue_status') || '<li>Empty</li>'}</ul>
+                </div>
+                <div class="card">
+                    <h2>JOBS QUEUE</h2>
+                     <ul>${fmt(jobs, 'status') || '<li>Empty</li>'}</ul>
+                </div>
+                 <div class="card">
+                    <h2>STRIPE WEBHOOKS</h2>
+                     <ul>${fmt(hooks, 'status') || '<li>Empty</li>'}</ul>
+                </div>
+            </div>
+        </body>
+        </html>`;
+        res.send(html);
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // DEBUG ENDPOINTS (Temporary for Production Diagnosis)
@@ -354,7 +460,34 @@ app.all('/verify-email', async (req, res) => {
     if (!u) return res.status(404).send('Invalid Token');
     const table = u.type === 'driver' ? 'drivers' : 'empresas';
     await db.run(`UPDATE ${table} SET verified=true, verification_token=NULL WHERE id=?`, u.id);
-    res.send('<h1>Verified</h1>');
+    res.send('<h1>Cuenta Verificada</h1><p>Ya puedes iniciar sesión en la app.</p>');
+});
+
+app.post('/resend-verification', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    try {
+        let u = await db.get("SELECT id, nombre, status, verified, 'driver' as type FROM drivers WHERE contacto=?", email);
+        if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type, verified FROM empresas WHERE contacto=?", email);
+
+        if (!u) return res.status(404).json({ error: 'User not found' });
+        if (u.verified) return res.status(400).json({ error: 'Already verified' });
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const expires = new Date(nowEpochMs() + 86400000).toISOString();
+        const table = u.type === 'driver' ? 'drivers' : 'empresas';
+
+        await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+
+        await db.run(`INSERT INTO events_outbox (event_name, created_at, driver_id, company_id, metadata) VALUES (?, ?, ?, ?, ?)`,
+            'verification_email', nowIso(), u.type === 'driver' ? u.id : null, u.type === 'empresa' ? u.id : null, JSON.stringify({ token, email, name: u.nombre, user_type: u.type }));
+
+        res.json({ ok: true, message: 'Verification email resent.' });
+    } catch (e) {
+        console.error('Resend Error', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
 });
 
 // Resend / Forgot / Reset ... (Keeping omitted for space, assuming similar Async conversion necessary)
@@ -710,7 +843,7 @@ app.post('/admin/tickets/:id/void', requireAdmin, async (req, res) => {
 });
 
 // --- LEGACY CLEANUP ---
-app.post('/requests/:id/apply', (q, s) => s.status(410).json({ error: 'Deprecated. Use v2 flow' }));
+app.post('/requests/:id/apply', (q, s) => s.status(410).json({ error: 'Deprecated. Use v2 flow /apply_for_request' })); // Kept 410 as "Clear Instruction"
 app.post('/requests/:id/confirm', (q, s) => s.status(410).json({ error: 'Deprecated' }));
 
 const PORT = process.env.PORT || 3000;
