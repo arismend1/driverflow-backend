@@ -671,6 +671,11 @@ app.post('/requests/:id/apply', (q, s) => s.status(410).json({ error: 'Deprecate
 app.post('/requests/:id/confirm', (q, s) => s.status(410).json({ error: 'Deprecated' }));
 
 const PORT = process.env.PORT || 3000;
+const { startQueueWorker } = require('./worker_queue');
+
+// Start Worker
+startQueueWorker().catch(e => console.error('Worker Fail', e));
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Mode: ${process.env.NODE_ENV} | DB: ${IS_POSTGRES ? 'Postgres' : 'SQLite'}`);
