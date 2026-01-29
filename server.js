@@ -223,9 +223,11 @@ app.post('/sys/debug/reset-jobs', async (req, res) => {
 app.get('/sys/debug/user-check', async (req, res) => {
     const email = req.query.email;
     if (!email) return res.json({ error: 'No email provided' });
-    const d = await db.get("SELECT * FROM drivers WHERE contact_email = ? OR contacto = ?", email, email);
-    const e = await db.get("SELECT * FROM empresas WHERE contact_email = ? OR contacto = ?", email, email);
-    res.json({ driver: d, empresa: e });
+    try {
+        const d = await db.get("SELECT * FROM drivers WHERE contacto = ?", email);
+        const e = await db.get("SELECT * FROM empresas WHERE contacto = ?", email);
+        res.json({ driver: d, empresa: e });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 1. JWT SECRET UNIFICATION (CRITICAL)
