@@ -93,8 +93,8 @@ async function bridgeOutbox() {
                 try {
                     await db.run(`
                         INSERT INTO jobs_queue (
-                            job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, source_event_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, source_event_id, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
                     `,
                         jobType,
                         JSON.stringify(payload),

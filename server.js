@@ -214,7 +214,7 @@ app.get('/sys/debug/email-status', async (req, res) => {
 
 app.post('/sys/debug/reset-jobs', async (req, res) => {
     try {
-        await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status IN ('processing', 'failed')");
+        await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status IS NULL OR status IN ('processing', 'failed')");
         await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status IS NULL OR queue_status='processing'");
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
