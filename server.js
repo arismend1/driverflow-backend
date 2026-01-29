@@ -25,35 +25,32 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // --- MIGRATION: Run on Server Start (STRICT REQUIREMENT) ---
+// We now run migrations on BOTH Postgres and SQLite to ensure schema consistency.
+// The migrations use 'db_adapter' which handles the dialect switch.
 
-// ONLY run legacy SQLite migrations if NOT using Postgres.
-if (!process.env.DATABASE_URL) {
-    try {
-        console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
-        execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
-        execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
-        execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
-        execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
-        execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
-        execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
-        execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
-        execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
-        console.log('--- Running Auto-Migration (migrate_phase7_matching.js) ---');
-        execSync('node migrate_phase7_matching.js', { stdio: 'inherit' });
-        console.log('--- Migration Complete ---');
-    } catch (err) {
-        console.error('FATAL: Migration failed on server start.');
-        process.exit(1);
-    }
-} else {
-    console.log('[Startup] Skipping legacy SQLite migrations (Running in Postgres Mode)');
+try {
+    console.log('--- Running Auto-Migration (migrate_auth_fix.js) ---');
+    execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase3_observability.js) ---');
+    execSync('node migrate_phase3_observability.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase4_billing.js) ---');
+    execSync('node migrate_phase4_billing.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_notifications.js) ---');
+    execSync('node migrate_phase5_notifications.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_2_stripe.js) ---');
+    execSync('node migrate_phase5_2_stripe.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_3_ratings.js) ---');
+    execSync('node migrate_phase5_3_ratings.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_4_queue.js) ---');
+    execSync('node migrate_phase5_4_queue.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase5_post_hardening.js) ---');
+    execSync('node migrate_phase5_post_hardening.js', { stdio: 'inherit' });
+    console.log('--- Running Auto-Migration (migrate_phase7_matching.js) ---');
+    execSync('node migrate_phase7_matching.js', { stdio: 'inherit' });
+    console.log('--- Migration Complete ---');
+} catch (err) {
+    console.error('FATAL: Migration failed on server start.');
+    process.exit(1);
 }
 
 
@@ -395,57 +392,62 @@ app.post('/register', async (req, res) => {
 
 // --- 2. Login ---
 app.post('/login', async (req, res) => {
-    const { type, contacto, password } = req.body;
-    if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
+    try {
+        const { type, contacto, password } = req.body;
+        if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
 
-    const table = type === 'driver' ? 'drivers' : 'empresas';
-    const row = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, contacto);
+        const table = type === 'driver' ? 'drivers' : 'empresas';
+        const row = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, contacto);
 
-    // Rate Limit
-    if (!checkRateLimit(req.ip, 'login')) return res.status(429).json({ error: 'RATE_LIMITED' });
+        // Rate Limit
+        if (!checkRateLimit(req.ip, 'login')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
-    // Generic error for security
-    if (!row) return res.status(401).json({ error: 'Credenciales inválidas' });
+        // Generic error for security
+        if (!row) return res.status(401).json({ error: 'Credenciales inválidas' });
 
-    // LOCKOUT CHECK
-    if (row.lockout_until && new Date(row.lockout_until) > new Date(nowEpochMs())) {
-        const remaining = Math.ceil((new Date(row.lockout_until) - new Date(nowEpochMs())) / 60000);
-        return res.status(403).json({ error: 'ACCOUNT_LOCKED', message: `Cuenta bloqueada temporalmente. Intenta en ${remaining} min.` });
-    }
-
-    // STRICT VERIFICATION CHECK
-    if (row.verified !== 1) {
-        return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED' });
-    }
-
-    if (await bcrypt.compare(password, row.password_hash)) {
-        // RESET LOCKOUT ON SUCCESS
-        if (row.failed_attempts > 0 || row.lockout_until) {
-            await db.run(`UPDATE ${table} SET failed_attempts = 0, lockout_until = NULL WHERE id = ?`, row.id);
+        // LOCKOUT CHECK
+        if (row.lockout_until && new Date(row.lockout_until) > new Date(nowEpochMs())) {
+            const remaining = Math.ceil((new Date(row.lockout_until) - new Date(nowEpochMs())) / 60000);
+            return res.status(403).json({ error: 'ACCOUNT_LOCKED', message: `Cuenta bloqueada temporalmente. Intenta en ${remaining} min.` });
         }
 
-        const payload = { id: row.id, type: type };
-        const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
-        metrics.inc('login_total', { status: 'success', type });
-        res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
-    } else {
-        metrics.inc('login_total', { status: 'failed_auth', type });
-        // INCREMENT FAILED ATTEMPTS (Logic remains same)
-        const newAttempts = (row.failed_attempts || 0) + 1;
-        let updateSql = `UPDATE ${table} SET failed_attempts = ?`;
-        const params = [newAttempts];
-
-        if (newAttempts >= 5) {
-            const lockoutTime = new Date(nowEpochMs() + 15 * 60000).toISOString();
-            updateSql += `, lockout_until = ?`;
-            params.push(lockoutTime);
+        // STRICT VERIFICATION CHECK
+        if (row.verified !== 1) {
+            return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED' });
         }
-        updateSql += ` WHERE id = ?`;
-        params.push(row.id);
 
-        await db.run(updateSql, ...params);
+        if (await bcrypt.compare(password, row.password_hash)) {
+            // RESET LOCKOUT ON SUCCESS
+            if (row.failed_attempts > 0 || row.lockout_until) {
+                await db.run(`UPDATE ${table} SET failed_attempts = 0, lockout_until = NULL WHERE id = ?`, row.id);
+            }
 
-        res.status(401).json({ error: 'Credenciales inválidas' });
+            const payload = { id: row.id, type: type };
+            const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '24h' });
+            metrics.inc('login_total', { status: 'success', type });
+            res.json({ ok: true, token, type, id: row.id, nombre: row.nombre });
+        } else {
+            metrics.inc('login_total', { status: 'failed_auth', type });
+            // INCREMENT FAILED ATTEMPTS
+            const newAttempts = (row.failed_attempts || 0) + 1;
+            let updateSql = `UPDATE ${table} SET failed_attempts = ?`;
+            const params = [newAttempts];
+
+            if (newAttempts >= 5) {
+                const lockoutTime = new Date(nowEpochMs() + 15 * 60000).toISOString();
+                updateSql += `, lockout_until = ?`;
+                params.push(lockoutTime);
+            }
+            updateSql += ` WHERE id = ?`;
+            params.push(row.id);
+
+            await db.run(updateSql, ...params);
+
+            res.status(401).json({ error: 'Credenciales inválidas' });
+        }
+    } catch (err) {
+        logger.error('Login Error', { event: 'login_error', err, req });
+        res.status(500).json({ error: 'Error del servidor en Login' });
     }
 });
 
