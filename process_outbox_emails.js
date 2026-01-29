@@ -1,7 +1,7 @@
-﻿const Database = require("better-sqlite3");
-
-const DB_PATH = (process.env.DB_PATH || "driverflow.db").trim();
-const db = new Database(DB_PATH);
+﻿const db = require('./db_adapter');
+// const Database = require("better-sqlite3");
+// const DB_PATH = (process.env.DB_PATH || "driverflow.db").trim();
+// const db = new Database(DB_PATH);
 
 // Config
 const DRY_RUN = process.env.DRY_RUN === "1";
@@ -16,7 +16,7 @@ const metrics = require('./metrics');
 
 // Logging - STRUCTURED
 logger.info("--- Email Processor Started ---", { event: 'worker_start', service: 'worker' });
-logger.info("DB Config", { event: 'worker_config', db_path: DB_PATH, dry_run: DRY_RUN, service: 'worker' });
+// logger.info("DB Config", { event: 'worker_config', db_path: DB_PATH, dry_run: DRY_RUN, service: 'worker' });
 
 // Strict validation for live sends
 if (!DRY_RUN) {
@@ -34,14 +34,16 @@ if (!DRY_RUN) {
   }
 }
 
-// 1. Ensure DB Sanity (Req D.1)
-try {
-  const check = db.prepare("SELECT count(*) as c FROM events_outbox").get();
-  logger.info("DB Check OK", { event: 'db_open_ok', count: check.c });
-} catch (e) {
-  logger.error("FATAL: events_outbox missing or DB invalid", { event: 'db_open_fail', err: e });
-  process.exit(1);
-}
+// 1. Ensure DB Sanity (Req D.1) - ASYNC
+(async () => {
+  try {
+    const check = await db.get("SELECT count(*) as c FROM events_outbox");
+    logger.info("DB Check OK", { event: 'db_open_ok', count: check.c });
+  } catch (e) {
+    logger.error("FATAL: events_outbox missing or DB invalid", { event: 'db_open_fail', err: e });
+    process.exit(1);
+  }
+})();
 
 function nowSql() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -80,11 +82,21 @@ async function sendEmailSendGrid(to, subject, textBody) {
   return res;
 }
 
-const sqlMarkSent = db.prepare(`UPDATE events_outbox SET process_status='sent', processed_at=?, last_error=NULL, send_attempts=send_attempts+1 WHERE id=?`);
-const sqlMarkFailed = db.prepare(`UPDATE events_outbox SET process_status='failed', processed_at=?, last_error=?, send_attempts=send_attempts+1 WHERE id=?`);
+// Prepared statements replacement
+// const sqlMarkSent = db.prepare(`UPDATE events_outbox SET process_status='sent', processed_at=?, last_error=NULL, send_attempts=send_attempts+1 WHERE id=?`);
+// const sqlMarkFailed = db.prepare(`UPDATE events_outbox SET process_status='failed', processed_at=?, last_error=?, send_attempts=send_attempts+1 WHERE id=?`);
+
+async function markSent(id) {
+  await db.run(`UPDATE events_outbox SET process_status='sent', processed_at=?, last_error=NULL, send_attempts=send_attempts+1 WHERE id=?`, nowSql(), id);
+}
+
+async function markFailed(id, error) {
+  await db.run(`UPDATE events_outbox SET process_status='failed', processed_at=?, last_error=?, send_attempts=send_attempts+1 WHERE id=?`, nowSql(), error, id);
+}
 
 async function runOnce() {
-  const events = db.prepare(`SELECT * FROM events_outbox WHERE process_status='pending' ORDER BY id ASC LIMIT 50`).all();
+  const events = await db.all(`SELECT * FROM events_outbox WHERE process_status='pending' ORDER BY id ASC LIMIT 50`);
+
   if (events.length > 0) logger.info(`Processing ${events.length} events...`, { event: 'worker_poll_batch', count: events.length, service: 'worker' });
 
   for (const ev of events) {
@@ -122,7 +134,7 @@ async function runOnce() {
       if (!['verification_email', 'recovery_email'].includes(ev.event_name)) {
         // Skip other events silently or implement them
       } else {
-        sqlMarkFailed.run(nowSql(), "No info to send", ev.id);
+        await markFailed(ev.id, "No info to send");
       }
       continue;
     }
@@ -131,24 +143,21 @@ async function runOnce() {
       for (const msg of messages) {
         await sendEmailSendGrid(msg.to, msg.subject, msg.body);
       }
-      sqlMarkSent.run(nowSql(), ev.id);
+      await markSent(ev.id);
 
       logger.info(`Email Sent`, { event: 'email_sent', outbox_id: ev.id, event_name: ev.event_name, service: 'worker' });
       metrics.inc('emails_sent_total');
 
     } catch (e) {
       logger.error(`Email Failed`, { event: 'email_failed', outbox_id: ev.id, err: e, service: 'worker' });
-      sqlMarkFailed.run(nowSql(), e.message, ev.id);
+      await markFailed(ev.id, e.message);
       metrics.inc('emails_failed_total');
     }
   }
 }
 
 // Poll Loop
-const POLL_MS = 30000; // 30s as requested in heartbeat section logic preferred (or 10s poll but 30s heartbeat)
-// User said "worker actualiza cada 30s un heartbeat".
-// Let's keep loop fast (10s) but heartbeat every loop or throttled.
-// Simplest: Heartbeat on every loop (10s is fine, satisfies <60s check).
+const POLL_MS = 30000;
 
 async function startWorker() {
   logger.info(`Worker polling started`, { event: 'worker_loop_start', interval_ms: POLL_MS });
@@ -156,16 +165,17 @@ async function startWorker() {
   while (true) {
     try {
       // 1. Heartbeat (Req D.3)
-      // STRICT SCHEMA: worker_name
       const now = new Date().toISOString();
-      db.prepare(`
+      await db.run(`
             INSERT INTO worker_heartbeat (worker_name, last_seen, status, metadata)
             VALUES ('email_worker', ?, 'running', ?)
             ON CONFLICT(worker_name) DO UPDATE SET last_seen=excluded.last_seen, status='running'
-        `).run(now, JSON.stringify({ pid: process.pid }));
+        `, now, JSON.stringify({ pid: process.pid }));
 
       // 2. Poll metrics
-      const pending = db.prepare("SELECT count(*) as c FROM events_outbox WHERE process_status='pending'").get().c;
+      const pendingRes = await db.get("SELECT count(*) as c FROM events_outbox WHERE process_status='pending'");
+      const pending = pendingRes ? pendingRes.c : 0;
+
       logger.info('Worker Poll', { event: 'worker_poll', pending_count: pending, service: 'worker' });
 
       // 3. Process
