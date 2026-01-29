@@ -169,10 +169,7 @@ const handlers = {
 
         if (!res.ok) {
             const errText = await res.text();
-            if (res.status === 403 || res.status === 429) {
-                logger.warn(`SendGrid Limit Reached (${res.status}). Dropped.`, { to: payload.email });
-                return;
-            }
+            // remove suppression to see errors in DB
             throw new Error(`SendGrid Error ${res.status}: ${errText}`);
         }
     },
