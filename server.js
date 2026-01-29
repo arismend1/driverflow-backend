@@ -389,20 +389,28 @@ app.post('/forgot_password', async (req, res) => {
 app.post('/reset_password', async (req, res) => {
     if (!checkRateLimit(req.ip, 'reset')) return res.status(429).json({ error: 'RATE_LIMITED' });
     const { token, newPassword } = req.body;
-    if (!token || !newPassword || !isStrongPassword(newPassword)) return res.status(400).json({ error: 'Invalid data or weak password' });
+
+    if (!token) return res.status(400).json({ error: 'Token missing' });
+    if (!isStrongPassword(newPassword)) {
+        await auditLog('password_reset_fail', 'unknown', 'unknown', { reason: 'weak_password' }, req);
+        return res.status(400).json({ error: 'La contraseña es muy débil. Debe tener 8 caracteres, mayúscula, minúscula y número.' });
+    }
 
     try {
         let u = await db.get("SELECT id, 'driver' as type FROM drivers WHERE reset_token=? AND reset_expires > ?", token, nowIso());
         if (!u) u = await db.get("SELECT id, 'empresa' as type FROM empresas WHERE reset_token=? AND reset_expires > ?", token, nowIso());
 
-        if (!u) return res.status(400).json({ error: 'Invalid or expired token' });
+        if (!u) {
+            await auditLog('password_reset_fail', 'unknown', 'unknown', { reason: 'invalid_token' }, req);
+            return res.status(400).json({ error: 'El enlace ha expirado o no es válido.' });
+        }
 
         const hash = await bcrypt.hash(newPassword, 10);
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
         await db.run(`UPDATE ${table} SET password_hash=?, reset_token=NULL, reset_expires=NULL WHERE id=?`, hash, u.id);
 
         // Audit
-        await auditLog('password_reset', u.id, u.type, {}, req);
+        await auditLog('password_reset_success', u.id, u.type, {}, req);
 
         res.json({ ok: true });
     } catch (e) {
@@ -413,35 +421,70 @@ app.post('/reset_password', async (req, res) => {
 
 app.get('/reset-password-web', (req, res) => {
     const token = req.query.token;
-    if (!token) return res.status(400).send('Missing Token');
+    if (!token) return res.status(400).send('Enlace inválido. Falta el token.');
     res.send(`
         <html>
         <head>
             <title>Restablecer Contraseña</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
-                body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; }
-                form { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
-                input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-                button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; margin: 0; }
+                form { background: white; padding: 2.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 90%; max-width: 400px; }
+                h2 { margin-top: 0; color: #1a1a1a; }
+                input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 16px; transition: border-color 0.2s; }
+                input:focus { border-color: #007bff; outline: none; }
+                button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: 600; margin-top: 1rem; transition: background 0.2s; }
                 button:hover { background: #0056b3; }
-                .msg { margin-bottom: 1rem; color: #666; font-size: 0.9rem; }
+                button:disabled { background: #ccc; cursor: not-allowed; }
+                .msg { margin-bottom: 1.5rem; color: #555; font-size: 0.95rem; line-height: 1.5; }
+                .requirements { font-size: 0.85rem; color: #666; margin-bottom: 1rem; background: #f8f9fa; padding: 10px; border-radius: 6px; }
+                .requirements ul { margin: 5px 0 0 0; padding-left: 20px; }
+                #errorBox { color: #d32f2f; background: #ffebee; padding: 10px; border-radius: 6px; font-size: 0.9rem; margin-bottom: 15px; display: none; border: 1px solid #ffcdd2; }
             </style>
         </head>
         <body>
             <form id="resetForm">
                 <h2>Nueva Contraseña</h2>
-                <div class="msg">Introduce tu nueva contraseña (mínimo 8 caracteres, números y letras).</div>
+                <div class="msg">Crea una contraseña segura para tu cuenta.</div>
+                
+                <div class="requirements">
+                    <strong>Requisitos:</strong>
+                    <ul>
+                        <li>Mínimo 8 caracteres</li>
+                        <li>Al menos una mayúscula (A-Z)</li>
+                        <li>Al menos una minúscula (a-z)</li>
+                        <li>Al menos un número (0-9)</li>
+                    </ul>
+                </div>
+
+                <div id="errorBox"></div>
+
                 <input type="hidden" id="token" value="${token}">
-                <input type="password" id="password" placeholder="Nueva Contraseña" required minlength="8">
-                <button type="submit">Guardar</button>
+                <input type="password" id="password" placeholder="Escribe tu nueva contraseña" required minlength="8">
+                <button type="submit">Guardar Contraseña</button>
             </form>
             <script>
-                document.getElementById('resetForm').addEventListener('submit', async (e) => {
+                const form = document.getElementById('resetForm');
+                const errorBox = document.getElementById('errorBox');
+                const btn = form.querySelector('button');
+
+                function showError(msg) {
+                    errorBox.innerText = msg;
+                    errorBox.style.display = 'block';
+                }
+
+                form.addEventListener('submit', async (e) => {
                     e.preventDefault();
+                    errorBox.style.display = 'none';
                     const password = document.getElementById('password').value;
                     const token = document.getElementById('token').value;
-                    const btn = e.target.querySelector('button');
+                    
+                    // Client side pre-check
+                    const strongRegex = new RegExp("^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.{8,})");
+                    if (!strongRegex.test(password)) {
+                        return showError('La contraseña no cumple con los requisitos de seguridad.');
+                    }
+
                     btn.disabled = true; btn.innerText = 'Guardando...';
 
                     try {
@@ -451,15 +494,15 @@ app.get('/reset-password-web', (req, res) => {
                             body: JSON.stringify({ token, newPassword: password })
                         });
                         const data = await res.json();
-                        if (data.ok) {
-                            document.body.innerHTML = '<div style="text-align:center; padding: 2rem;"><h1>¡Listo!</h1><p>Contraseña actualizada correctamente.</p><p>Ya puedes iniciar sesión en la app.</p></div>';
+                        if (res.ok && data.ok) {
+                            document.body.innerHTML = '<div style="text-align:center; padding: 2rem; font-family: sans-serif;"><h1>¡Listo!</h1><p style="font-size: 1.1rem; color: #444;">Tu contraseña ha sido actualizada.</p><p>Ya puedes volver a la app e iniciar sesión.</p></div>';
                         } else {
-                            alert('Error: ' + (data.error || 'No se pudo actualizar'));
-                            btn.disabled = false; btn.innerText = 'Guardar';
+                            showError(data.error || 'No se pudo actualizar la contraseña');
+                            btn.disabled = false; btn.innerText = 'Guardar Contraseña';
                         }
                     } catch (err) {
-                        alert('Error de conexión');
-                        btn.disabled = false; btn.innerText = 'Guardar';
+                        showError('Error de conexión. Intenta de nuevo.');
+                        btn.disabled = false; btn.innerText = 'Guardar Contraseña';
                     }
                 });
             </script>
