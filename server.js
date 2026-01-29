@@ -198,6 +198,26 @@ app.get('/metrics', async (req, res) => {
     res.json(data);
 });
 
+// DEBUG ENDPOINTS (Temporary for Production Diagnosis)
+app.get('/sys/debug/email-status', async (req, res) => {
+    try {
+        const events = await db.all("SELECT id, event_name, queue_status, created_at FROM events_outbox ORDER BY id DESC LIMIT 10");
+        const jobs = await db.all("SELECT id, job_type, status, attempts, last_error, run_at FROM jobs_queue ORDER BY id DESC LIMIT 10");
+        const hb = await db.all("SELECT * FROM worker_heartbeat");
+        res.json({ events, jobs, hb, now: nowIso() });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/sys/debug/reset-jobs', async (req, res) => {
+    try {
+        // Reset stuck/dead jobs to pending
+        await db.run("UPDATE jobs_queue SET status='pending', attempts=0, run_at=?, locked_by=NULL WHERE status IN ('dead', 'failed', 'processing')", nowIso());
+        // Reset old events that might be stuck
+        await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status != 'done'");
+        res.json({ ok: true, message: "Jobs and Events Reset" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 1. JWT SECRET UNIFICATION (CRITICAL)
 if (!process.env.JWT_SECRET) {
     if (process.env.NODE_ENV === 'production') {
