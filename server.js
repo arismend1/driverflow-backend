@@ -762,7 +762,7 @@ app.get('/admin/invoices', async (req, res) => {
         const rows = await db.all(`
             SELECT w.*, c.nombre as company_name 
             FROM weekly_invoices w 
-            LEFT JOIN companies c ON w.company_id = c.id 
+            LEFT JOIN empresas c ON w.company_id = c.id 
             ORDER BY w.week_start DESC 
             LIMIT 100
         `);
@@ -818,7 +818,7 @@ app.post('/admin/invoices/generate', async (req, res) => {
         if (company_id) {
             companies.push({ id: company_id });
         } else {
-            companies = await db.all("SELECT id FROM companies WHERE status='active' OR status IS NULL");
+            companies = await db.all("SELECT id FROM empresas WHERE status='active' OR status IS NULL");
         }
 
         const { enqueueJob } = require('./worker_queue');

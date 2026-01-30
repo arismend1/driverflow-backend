@@ -8,7 +8,7 @@ async function migrate() {
         await db.exec(`
             CREATE TABLE IF NOT EXISTS weekly_invoices (
                 id SERIAL PRIMARY KEY,
-                company_id INTEGER NOT NULL REFERENCES companies(id),
+                company_id INTEGER NOT NULL REFERENCES empresas(id),
                 week_start DATE NOT NULL,
                 week_end DATE NOT NULL,
                 total_requests INTEGER DEFAULT 0,
