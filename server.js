@@ -818,7 +818,7 @@ app.post('/admin/invoices/generate', async (req, res) => {
         if (company_id) {
             companies.push({ id: company_id });
         } else {
-            companies = await db.all("SELECT id FROM empresas WHERE status='active' OR status IS NULL");
+            companies = await db.all("SELECT id FROM empresas");
         }
 
         const { enqueueJob } = require('./worker_queue');
