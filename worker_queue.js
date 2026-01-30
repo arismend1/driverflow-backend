@@ -241,10 +241,21 @@ const handlers = {
     },
 
     async charge_weekly_invoice(payload) {
-        // payload: { invoice_id } OR { company_id, week_start }
+        const { invoice_id } = payload;
+
+        // 1. Worker Startup & Config Validation (Fail Fast)
+        // Note: Ideally this is checked once at startup, but doing it here ensures safety per job
+        const stripeKey = process.env.STRIPE_SECRET_KEY;
+        // VALIDATION MOVED TO GLOBAL SCOPE FOR FATAL STARTUP, but checked here too just in case
+        if (!stripeKey || !stripeKey.startsWith('sk_')) {
+            throw new Error("FATAL: STRIPE_SECRET_KEY invalid in job execution");
+        }
+
+        // 2. Fetch Invoice
+        // Support payload flexibility if rescheduled
         let invoice;
-        if (payload.invoice_id) {
-            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.id = ?", payload.invoice_id);
+        if (invoice_id) {
+            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.id = ?", invoice_id);
         } else if (payload.company_id && payload.week_start) {
             invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?", payload.company_id, payload.week_start);
         }
@@ -256,13 +267,15 @@ const handlers = {
 
         const logPrefix = `[Billing Charge #${invoice.id}]`;
 
-        // 1. Idempotency Check
-        if (invoice.status === 'paid' || invoice.status === 'charging') {
-            logger.info(`${logPrefix} Skipped (Status: ${invoice.status})`);
+        // 3. Strict Idempotency Check (DB Level)
+        // 3. Strict Idempotency Check (DB Level)
+        // STRICT STATUS: charged (success), failed, retrying. NO 'paid'.
+        if (['charged'].includes(invoice.status)) {
+            logger.info(`${logPrefix} Skipped (Already Charged)`);
             return;
         }
 
-        // 2. Validate Stripe Customer
+        // 4. Validate Data
         if (!invoice.stripe_customer_id) {
             const err = "Missing stripe_customer_id";
             logger.error(`${logPrefix} ${err}`);
@@ -271,73 +284,102 @@ const handlers = {
         }
 
         if (invoice.amount_cents <= 0) {
-            logger.info(`${logPrefix} Skipped (Amount 0)`);
-            await db.run("UPDATE weekly_invoices SET status='paid', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
+            logger.info(`${logPrefix} Auto-closing $0 invoice`);
+            await db.run("UPDATE weekly_invoices SET status='charged', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
             return;
         }
 
+        const stripe = require('stripe')(stripeKey);
+        const isLive = stripeKey.startsWith('sk_live_');
+        logger.info(`${logPrefix} Processing Charge: $${invoice.amount_cents / 100} (Live: ${isLive})`);
+
+        // 5. Idempotency Key & Create-or-Confirm Logic
+        const idempotencyKey = `invoice_${invoice.id}_charge`;
+        let paymentIntent;
+
         try {
-            // 3. Mark as Charging
+            // Optimistic Lock
             await db.run("UPDATE weekly_invoices SET status='charging', updated_at=?, attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id=?", nowIso(), invoice.id);
 
-            // 4. Init Stripe
-            const stripeKey = process.env.STRIPE_SECRET_KEY;
-            if (!stripeKey) throw new Error("Missing STRIPE_SECRET_KEY");
-            const stripe = require('stripe')(stripeKey);
-
-            // 5. Create PaymentIntent
-            logger.info(`${logPrefix} Attempting Charge: $${invoice.amount_cents / 100} to ${invoice.stripe_customer_id}`);
-
-            const idempotencyKey = `inv_${invoice.id}_attempt_${(invoice.attempt_count || 0) + 1}`;
-
-            const paymentIntent = await stripe.paymentIntents.create({
-                amount: invoice.amount_cents,
-                currency: invoice.currency || 'mxn',
-                customer: invoice.stripe_customer_id,
-                confirm: true,
-                off_session: true, // Important for background charge
-                description: `Weekly Invoice ${invoice.week_start} - ${invoice.week_end}`,
-                metadata: {
-                    invoice_id: invoice.id,
-                    company_id: invoice.company_id,
-                    week_start: invoice.week_start
-                }
-            }, { idempotencyKey });
-
-            // 6. Success
-            if (paymentIntent.status === 'succeeded') {
-                await db.run(`
-                    UPDATE weekly_invoices 
-                    SET status='paid', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, updated_at=? 
-                    WHERE id=?
-                `, paymentIntent.id, nowIso(), nowIso(), invoice.id);
-
-                logger.info(`${logPrefix} SUCCESS ${paymentIntent.id}`);
-
-                await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                    'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.amount_cents }));
-
+            if (invoice.stripe_payment_intent_id) {
+                logger.info(`${logPrefix} Retrieving existing PI: ${invoice.stripe_payment_intent_id}`);
+                paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id);
             } else {
-                // Should catch in error block usually, but if status is pending/requires_action
-                throw new Error(`Stripe Status: ${paymentIntent.status}`);
+                logger.info(`${logPrefix} Creating new PI with key: ${idempotencyKey}`);
+                paymentIntent = await stripe.paymentIntents.create({
+                    amount: invoice.amount_cents,
+                    currency: invoice.currency || 'mxn',
+                    customer: invoice.stripe_customer_id,
+                    confirm: true, // Try to charge immediately
+                    off_session: true,
+                    description: `Weekly Invoice ${invoice.week_start} - ${invoice.week_end}`,
+                    metadata: {
+                        invoice_id: invoice.id,
+                        company_id: invoice.company_id,
+                        week_start: invoice.week_start,
+                        env: process.env.NODE_ENV
+                    }
+                }, { idempotencyKey });
+            }
+
+            // Retry/Confirm if needed
+            if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
+                logger.info(`${logPrefix} PI ${paymentIntent.id} is ${paymentIntent.status}, attempting confirm...`);
+                paymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
+                    off_session: true
+                });
+            }
+
+            // Save PI ID if new
+            if (!invoice.stripe_payment_intent_id && paymentIntent.id) {
+                await db.run("UPDATE weekly_invoices SET stripe_payment_intent_id=? WHERE id=?", paymentIntent.id, invoice.id);
             }
 
         } catch (e) {
-            // 7. Failure Handling
+            // Capture PI ID from error if available
+            if (e.raw && e.raw.payment_intent) {
+                const piId = e.raw.payment_intent.id;
+                await db.run("UPDATE weekly_invoices SET stripe_payment_intent_id=? WHERE id=?", piId, invoice.id);
+            }
+
             let reason = e.message;
+            let isDecline = false;
+
             if (e.type === 'StripeCardError') {
                 reason = `Declined: ${e.code}`;
+                isDecline = true;
             }
-            logger.error(`${logPrefix} FAILED: ${reason}`);
 
+            logger.error(`${logPrefix} Stripe Error: ${reason}`);
+
+            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, last_error=?, updated_at=? WHERE id=?", reason, reason, nowIso(), invoice.id);
+
+            // Allow retry for non-business errors? 
+            // If it's a connection error, throwing lets the worker retry.
+            if (!isDecline && (e.type === 'StripeConnectionError' || e.type === 'StripeAPIError')) {
+                await db.run("UPDATE weekly_invoices SET status='retrying' WHERE id=?", invoice.id);
+                throw e;
+            }
+            return;
+        }
+
+        // 6. Success
+        // 6. Success
+        if (paymentIntent && paymentIntent.status === 'succeeded') {
             await db.run(`
                 UPDATE weekly_invoices 
-                SET status='failed', failure_reason=?, updated_at=? 
+                SET status='charged', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, updated_at=? 
                 WHERE id=?
-            `, reason, nowIso(), invoice.id);
+            `, paymentIntent.id, nowIso(), nowIso(), invoice.id);
+
+            logger.info(`${logPrefix} SUCCESS: Charged ${paymentIntent.id}`);
 
             await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                'invoice_payment_failed', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, reason }));
+                'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.amount_cents, stripe_pi: paymentIntent.id }));
+        } else {
+            const status = paymentIntent ? paymentIntent.status : 'unknown';
+            logger.warn(`${logPrefix} Incomplete Status: ${status}`);
+            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", `Stripe Status: ${status}`, nowIso(), invoice.id);
         }
     }
 };
@@ -433,6 +475,9 @@ async function startQueueWorker() {
 
     // --- SCHEDULER (Mondays 00:10 UTC) ---
     // Runs every Monday at 00:10 to generate invoices for the previous week
+    // --- SCHEDULER (Mondays 00:10 UTC -> 10:00 AM EST? No, user wants Lunes 14:00 EST for billing, maybe Lunes early for generation?)
+    // Let's keep generation early Monday, but make it timezone aware just to be safe.
+    // User only specified 14:00 EST for Billing. Generation can be earlier.
     cron.schedule('10 0 * * 1', async () => {
         logger.info('[Scheduler] Starting Weekly Invoice Generation...');
         try {
@@ -467,7 +512,9 @@ async function startQueueWorker() {
 
     // --- BILLING SCHEDULER (Mondays 19:00 UTC = 14:00 EST) ---
     // Attempt to charge pending invoices
-    cron.schedule('0 19 * * 1', async () => {
+    // --- BILLING SCHEDULER (Mondays 14:00 EST) ---
+    // Attempt to charge pending invoices
+    cron.schedule('0 14 * * 1', async () => {
         logger.info('[Scheduler] Starting Automatic Billing Execution...');
         try {
             // Select all PENDING invoices
@@ -481,6 +528,9 @@ async function startQueueWorker() {
         } catch (e) {
             logger.error('[Scheduler] Error triggering billing charges', e);
         }
+    }, {
+        scheduled: true,
+        timezone: "America/New_York"
     });
 
     // Heartbeat Loop
@@ -511,6 +561,14 @@ async function startQueueWorker() {
 // --- SELF-EXECUTION ---
 if (require.main === module) {
     require('./env_guard').validateEnv({ role: 'worker' });
+
+    // FATAL CHECK FOR STRIPE KEY
+    const sk = process.env.STRIPE_SECRET_KEY;
+    if (!sk || !sk.startsWith('sk_')) {
+        console.error("FATAL: STRIPE_SECRET_KEY is missing or invalid (must start with 'sk_'). Worker refusing to start.");
+        process.exit(1);
+    }
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);

@@ -845,6 +845,37 @@ app.post('/admin/invoices/generate', async (req, res) => {
     }
 });
 
+// Retry Invoice Charge
+app.post('/admin/invoices/:id/retry', async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.sendStatus(403);
+
+    const invoiceId = req.params.id;
+
+    try {
+        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        if (!invoice) return res.status(404).json({ error: 'Not Found' });
+
+        if (invoice.status === 'charged' || invoice.status === 'charging') {
+            return res.status(400).json({ error: `Cannot retry invoice in status: ${invoice.status}` });
+        }
+
+        // Set to retrying 
+        await db.run("UPDATE weekly_invoices SET status='retrying', failure_reason=NULL, updated_at=? WHERE id=?", nowIso(), invoiceId);
+
+        const { enqueueJob } = require('./worker_queue');
+        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
+
+        await auditLog('invoice_retry_manual', 'admin', invoiceId, {}, req);
+
+        res.json({ ok: true, message: 'Retry enqueued' });
+
+    } catch (e) {
+        console.error('Retry Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 8. LEGACY / DEPRECATED ROUTES ---
 app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Deprecated. Use /apply_for_request' }));
 
