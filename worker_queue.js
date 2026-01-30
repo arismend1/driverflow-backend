@@ -238,6 +238,107 @@ const handlers = {
             logger.error(`[Billing] Failed for Co:${company_id}`, e);
             throw e; // Retry job
         }
+    },
+
+    async charge_weekly_invoice(payload) {
+        // payload: { invoice_id } OR { company_id, week_start }
+        let invoice;
+        if (payload.invoice_id) {
+            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.id = ?", payload.invoice_id);
+        } else if (payload.company_id && payload.week_start) {
+            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?", payload.company_id, payload.week_start);
+        }
+
+        if (!invoice) {
+            logger.error(`[Billing Charge] Invoice not found`, payload);
+            return;
+        }
+
+        const logPrefix = `[Billing Charge #${invoice.id}]`;
+
+        // 1. Idempotency Check
+        if (invoice.status === 'paid' || invoice.status === 'charging') {
+            logger.info(`${logPrefix} Skipped (Status: ${invoice.status})`);
+            return;
+        }
+
+        // 2. Validate Stripe Customer
+        if (!invoice.stripe_customer_id) {
+            const err = "Missing stripe_customer_id";
+            logger.error(`${logPrefix} ${err}`);
+            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", err, nowIso(), invoice.id);
+            return;
+        }
+
+        if (invoice.amount_cents <= 0) {
+            logger.info(`${logPrefix} Skipped (Amount 0)`);
+            await db.run("UPDATE weekly_invoices SET status='paid', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
+            return;
+        }
+
+        try {
+            // 3. Mark as Charging
+            await db.run("UPDATE weekly_invoices SET status='charging', updated_at=?, attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id=?", nowIso(), invoice.id);
+
+            // 4. Init Stripe
+            const stripeKey = process.env.STRIPE_SECRET_KEY;
+            if (!stripeKey) throw new Error("Missing STRIPE_SECRET_KEY");
+            const stripe = require('stripe')(stripeKey);
+
+            // 5. Create PaymentIntent
+            logger.info(`${logPrefix} Attempting Charge: $${invoice.amount_cents / 100} to ${invoice.stripe_customer_id}`);
+
+            const idempotencyKey = `inv_${invoice.id}_attempt_${(invoice.attempt_count || 0) + 1}`;
+
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: invoice.amount_cents,
+                currency: invoice.currency || 'mxn',
+                customer: invoice.stripe_customer_id,
+                confirm: true,
+                off_session: true, // Important for background charge
+                description: `Weekly Invoice ${invoice.week_start} - ${invoice.week_end}`,
+                metadata: {
+                    invoice_id: invoice.id,
+                    company_id: invoice.company_id,
+                    week_start: invoice.week_start
+                }
+            }, { idempotencyKey });
+
+            // 6. Success
+            if (paymentIntent.status === 'succeeded') {
+                await db.run(`
+                    UPDATE weekly_invoices 
+                    SET status='paid', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, updated_at=? 
+                    WHERE id=?
+                `, paymentIntent.id, nowIso(), nowIso(), invoice.id);
+
+                logger.info(`${logPrefix} SUCCESS ${paymentIntent.id}`);
+
+                await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
+                    'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.amount_cents }));
+
+            } else {
+                // Should catch in error block usually, but if status is pending/requires_action
+                throw new Error(`Stripe Status: ${paymentIntent.status}`);
+            }
+
+        } catch (e) {
+            // 7. Failure Handling
+            let reason = e.message;
+            if (e.type === 'StripeCardError') {
+                reason = `Declined: ${e.code}`;
+            }
+            logger.error(`${logPrefix} FAILED: ${reason}`);
+
+            await db.run(`
+                UPDATE weekly_invoices 
+                SET status='failed', failure_reason=?, updated_at=? 
+                WHERE id=?
+            `, reason, nowIso(), invoice.id);
+
+            await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
+                'invoice_payment_failed', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, reason }));
+        }
     }
 };
 
@@ -361,6 +462,24 @@ async function startQueueWorker() {
 
         } catch (e) {
             logger.error('[Scheduler] Error triggering weekly invoices', e);
+        }
+    });
+
+    // --- BILLING SCHEDULER (Mondays 19:00 UTC = 14:00 EST) ---
+    // Attempt to charge pending invoices
+    cron.schedule('0 19 * * 1', async () => {
+        logger.info('[Scheduler] Starting Automatic Billing Execution...');
+        try {
+            // Select all PENDING invoices
+            // Safety cap of 500 to avoid clogging, though we expect fewer active clients for MVP
+            const pendingInvoices = await db.all("SELECT id FROM weekly_invoices WHERE status = 'pending' LIMIT 500");
+
+            for (const inv of pendingInvoices) {
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+            }
+            logger.info(`[Scheduler] Enqueued charges for ${pendingInvoices.length} invoices.`);
+        } catch (e) {
+            logger.error('[Scheduler] Error triggering billing charges', e);
         }
     });
 
