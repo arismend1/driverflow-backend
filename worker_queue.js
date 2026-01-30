@@ -1,3 +1,4 @@
+const cron = require('node-cron');
 const crypto = require('crypto');
 const db = require('./db_adapter'); // Async Adapter
 const logger = require('./logger');
@@ -192,7 +193,6 @@ const handlers = {
             // 1. Calculate Usage
             // 'solicitudes' table. Range: [start, end)
             // week_end + 1 day for upper bound (exclusive)
-
             let start = week_start;
             let endPlusOne;
             try {
@@ -212,26 +212,27 @@ const handlers = {
             const drivers = usage ? (usage.drv || 0) : 0;
 
             // 2. Pricing Logic (Placeholder: $10 MXN per request -> 1000 cents)
-            // In future, fetch pricing from companies table
             const PRICE_PER_REQ_CENTS = 1000;
             const amount = total * PRICE_PER_REQ_CENTS;
 
-            // 3. Upsert Invoice
-            const existing = await db.get("SELECT id FROM weekly_invoices WHERE company_id=? AND week_start=?", company_id, week_start);
-
-            if (existing) {
-                await db.run(`UPDATE weekly_invoices SET total_requests=?, active_drivers=?, amount_cents=?, updated_at=? WHERE id=?`,
-                    total, drivers, amount, nowIso(), existing.id);
-                logger.info(`[Billing] Updated Invoice #${existing.id}`);
-            } else {
+            // 3. Insert Invoice (Idempotent: Skip if exists)
+            try {
                 await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, status, created_at) VALUES (?,?,?,?,?,?,'pending',?)`,
                     company_id, week_start, week_end, total, drivers, amount, nowIso());
-                logger.info(`[Billing] Created New Invoice`);
-            }
 
-            // 4. Emit Event
-            await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount }));
+                logger.info(`[Billing] Created New Invoice`);
+
+                // 4. Emit Event usage only on creation
+                await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
+                    'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount }));
+
+            } catch (e) {
+                if (e.message.includes('UNIQUE') || e.message.includes('constraint')) {
+                    logger.warn(`[Billing] Skipped existing invoice for Co:${company_id} Week:${week_start}`);
+                    return; // Graceful exit
+                }
+                throw e; // Rethrow other errors
+            }
 
         } catch (e) {
             logger.error(`[Billing] Failed for Co:${company_id}`, e);
@@ -328,6 +329,40 @@ async function processJobs() {
 // --- MAIN LOOP ---
 async function startQueueWorker() {
     logger.info(`Queue Worker Started`, { worker_id: WORKER_ID });
+
+    // --- SCHEDULER (Mondays 00:10 UTC) ---
+    // Runs every Monday at 00:10 to generate invoices for the previous week
+    cron.schedule('10 0 * * 1', async () => {
+        logger.info('[Scheduler] Starting Weekly Invoice Generation...');
+        try {
+            // Calculate previous week (Monday to Sunday)
+            const now = new Date();
+            const lastMonday = new Date(now);
+            lastMonday.setDate(now.getDate() - 7);
+            const lastSunday = new Date(now);
+            lastSunday.setDate(now.getDate() - 1);
+
+            const week_start = lastMonday.toISOString().split('T')[0];
+            const week_end = lastSunday.toISOString().split('T')[0]; // Inclusive
+
+            logger.info(`[Scheduler] Targeting Week: ${week_start} to ${week_end}`);
+
+            // Fetch all active companies
+            const companies = await db.all("SELECT id FROM companies WHERE status = 'active'");
+
+            for (const c of companies) {
+                await enqueueJob('generate_weekly_invoices', {
+                    company_id: c.id,
+                    week_start,
+                    week_end
+                });
+            }
+            logger.info(`[Scheduler] Enqueued generation for ${companies.length} companies.`);
+
+        } catch (e) {
+            logger.error('[Scheduler] Error triggering weekly invoices', e);
+        }
+    });
 
     // Heartbeat Loop
     setInterval(async () => {
