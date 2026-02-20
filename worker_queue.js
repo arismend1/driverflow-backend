@@ -318,7 +318,9 @@ const handlers = {
 
             if (invoice.stripe_payment_intent_id) {
                 logger.info(`${logPrefix} Retrieving existing PI: ${invoice.stripe_payment_intent_id}`);
-                paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id);
+                paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id, {
+                    expand: ['latest_charge']
+                });
             } else {
                 logger.info(`${logPrefix} Creating new PI with key: ${idempotencyKey}`);
                 paymentIntent = await stripe.paymentIntents.create({
@@ -327,6 +329,7 @@ const handlers = {
                     customer: invoice.stripe_customer_id,
                     confirm: true, // Try to charge immediately
                     off_session: true,
+                    expand: ['latest_charge'],
                     description: `Weekly Invoice ${invoice.week_start} - ${invoice.week_end}`,
                     metadata: {
                         invoice_id: invoice.id,
@@ -413,8 +416,16 @@ const handlers = {
 
         // 6. Success
         if (paymentIntent && paymentIntent.status === 'succeeded') {
-            const chargeId = paymentIntent.latest_charge || (paymentIntent.charges && paymentIntent.charges.data.length > 0 ? paymentIntent.charges.data[0].id : null);
-            const receiptUrl = paymentIntent.charges && paymentIntent.charges.data.length > 0 ? paymentIntent.charges.data[0].receipt_url : null;
+            let chargeId = null;
+            let receiptUrl = null;
+
+            if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge === 'object') {
+                chargeId = paymentIntent.latest_charge.id;
+                receiptUrl = paymentIntent.latest_charge.receipt_url;
+            } else if (paymentIntent.charges && paymentIntent.charges.data.length > 0) {
+                chargeId = paymentIntent.charges.data[0].id;
+                receiptUrl = paymentIntent.charges.data[0].receipt_url;
+            }
 
             await db.run(`
                 UPDATE weekly_invoices 

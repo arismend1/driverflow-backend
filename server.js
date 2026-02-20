@@ -932,13 +932,17 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
 app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
     try {
+        let limit = parseInt(req.query.limit) || 20;
+        if (limit > 100) limit = 100;
+        const offset = parseInt(req.query.offset) || 0;
+
         const rows = await db.all(`
             SELECT id, week_start, week_end, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
             FROM weekly_invoices 
             WHERE company_id=? 
             ORDER BY week_start DESC 
-            LIMIT 100
-        `, req.user.id);
+            LIMIT ? OFFSET ?
+        `, req.user.id, limit, offset);
         res.json(rows || []);
     } catch (e) {
         console.error('Invoices List Error', e);
