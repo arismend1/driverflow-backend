@@ -856,12 +856,12 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
         const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
         if (!invoice) return res.status(404).json({ error: 'Not Found' });
 
-        if (invoice.status === 'charged' || invoice.status === 'charging') {
+        if (['charged', 'charging', 'suspended'].includes(invoice.status)) {
             return res.status(400).json({ error: `Cannot retry invoice in status: ${invoice.status}` });
         }
 
-        // Set to retrying 
-        await db.run("UPDATE weekly_invoices SET status='retrying', failure_reason=NULL, updated_at=? WHERE id=?", nowIso(), invoiceId);
+        // Set to retrying and reset next_retry_at to now for immediate pickup by Dunning loop or direct queue
+        await db.run("UPDATE weekly_invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
 
         const { enqueueJob } = require('./worker_queue');
         await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
@@ -872,6 +872,58 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
 
     } catch (e) {
         console.error('Retry Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Suspend Invoice (Admin)
+app.post('/admin/invoices/:id/suspend', async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.sendStatus(403);
+
+    const invoiceId = req.params.id;
+
+    try {
+        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        if (!invoice) return res.status(404).json({ error: 'Not Found' });
+
+        if (invoice.status === 'charged') return res.status(400).json({ error: 'Cannot suspend a charged invoice' });
+
+        await db.run("UPDATE weekly_invoices SET status='suspended', suspended_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await auditLog('invoice_suspended_manual', 'admin', invoiceId, {}, req);
+
+        res.json({ ok: true, message: 'Invoice suspended manually' });
+    } catch (e) {
+        console.error('Suspend Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Unsuspend Invoice (Admin)
+app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.sendStatus(403);
+
+    const invoiceId = req.params.id;
+
+    try {
+        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        if (!invoice) return res.status(404).json({ error: 'Not Found' });
+
+        if (invoice.status !== 'suspended') return res.status(400).json({ error: `Invoice is not suspended (Status: ${invoice.status})` });
+
+        // Set to failed/retrying with next_retry_at to NOW() so Dunning loop can pick it up
+        await db.run("UPDATE weekly_invoices SET status='retrying', suspended_at=NULL, next_retry_at=?, attempt_count=0, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+
+        // Also enqueue it immediately just in case
+        const { enqueueJob } = require('./worker_queue');
+        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
+
+        await auditLog('invoice_unsuspended_manual', 'admin', invoiceId, {}, req);
+
+        res.json({ ok: true, message: 'Invoice unsuspended and queued for retry' });
+    } catch (e) {
+        console.error('Unsuspend Error', e);
         res.status(500).json({ error: e.message });
     }
 });

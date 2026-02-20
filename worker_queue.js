@@ -268,10 +268,25 @@ const handlers = {
         const logPrefix = `[Billing Charge #${invoice.id}]`;
 
         // 3. Strict Idempotency Check (DB Level)
-        // 3. Strict Idempotency Check (DB Level)
-        // STRICT STATUS: charged (success), failed, retrying. NO 'paid'.
-        if (['charged'].includes(invoice.status)) {
-            logger.info(`${logPrefix} Skipped (Already Charged)`);
+        // Strict Dunning Check
+        if (['charged', 'charging', 'suspended'].includes(invoice.status)) {
+            logger.info(`${logPrefix} Skipped: Invoice status is ${invoice.status}`);
+            return;
+        }
+
+        // Lock the row to prevent race conditions during retry/processing
+        // Using basic optimistic update 
+        const lockRes = await db.run(`
+            UPDATE weekly_invoices 
+            SET status='charging', updated_at=? 
+            WHERE id=? AND status IN ('pending', 'retrying', 'failed')
+        `, nowIso(), invoice.id);
+
+        // Verification mechanism compatible with sqlite/pg adapter abstraction. 
+        // We fetch again to confirm if we locked it (in generic adapters where CHANGES isn't universally surfaced)
+        const lockedInvoice = await db.get("SELECT status FROM weekly_invoices WHERE id=?", invoice.id);
+        if (!lockedInvoice || lockedInvoice.status !== 'charging') {
+            logger.warn(`${logPrefix} Failed to lock invoice for charging. Race condition avoided.`);
             return;
         }
 
@@ -298,8 +313,8 @@ const handlers = {
         let paymentIntent;
 
         try {
-            // Optimistic Lock
-            await db.run("UPDATE weekly_invoices SET status='charging', updated_at=?, attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id=?", nowIso(), invoice.id);
+            // Optimistic Lock - This was moved above to prevent race conditions earlier.
+            // The status is already 'charging' from the lock mechanism.
 
             if (invoice.stripe_payment_intent_id) {
                 logger.info(`${logPrefix} Retrieving existing PI: ${invoice.stripe_payment_intent_id}`);
@@ -341,29 +356,61 @@ const handlers = {
                 const piId = e.raw.payment_intent.id;
                 await db.run("UPDATE weekly_invoices SET stripe_payment_intent_id=? WHERE id=?", piId, invoice.id);
             }
-
-            let reason = e.message;
+            const reason = e.message || 'Unknown Stripe Error';
             let isDecline = false;
+            let stripeCode = 'unknown';
 
             if (e.type === 'StripeCardError') {
-                reason = `Declined: ${e.code}`;
                 isDecline = true;
+                stripeCode = e.code || 'card_declined';
+            } else if (e.type) {
+                stripeCode = e.type;
             }
 
-            logger.error(`${logPrefix} Stripe Error: ${reason}`);
+            logger.error(`${logPrefix} Stripe Error: ${reason} (Code: ${stripeCode})`);
 
-            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, last_error=?, updated_at=? WHERE id=?", reason, reason, nowIso(), invoice.id);
+            // DUNNING LOGIC: Increment attempt, determine next status and backoff
+            const newAttemptCount = (invoice.attempt_count || 0) + 1;
+            let nextStatus = 'failed';
+            let nextRetryAt = null;
+            let suspendedAt = null;
 
-            // Allow retry for non-business errors? 
-            // If it's a connection error, throwing lets the worker retry.
-            if (!isDecline && (e.type === 'StripeConnectionError' || e.type === 'StripeAPIError')) {
-                await db.run("UPDATE weekly_invoices SET status='retrying' WHERE id=?", invoice.id);
-                throw e;
+            if (newAttemptCount >= MAX_ATTEMPTS) {
+                nextStatus = 'suspended';
+                suspendedAt = nowIso();
+                await notifyPaymentSuspended(invoice);
+            } else {
+                nextStatus = (isDecline || ['StripeConnectionError', 'StripeAPIError'].includes(e.type)) ? 'retrying' : 'failed';
+                // Backoff logic: +24h, +48h... (simplified to 24 * attempt hours for now)
+                const delayMs = 24 * 60 * 60 * 1000 * Math.pow(2, newAttemptCount - 1);
+                nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+                await notifyPaymentFailed(invoice, newAttemptCount, MAX_ATTEMPTS, reason);
             }
+
+            await db.run(`
+                UPDATE weekly_invoices 
+                SET status=?, 
+                    failure_reason=?, 
+                    last_error_code=?, 
+                    last_error_message=?, 
+                    attempt_count=?, 
+                    last_attempt_at=?, 
+                    next_retry_at=?, 
+                    suspended_at=?,
+                    updated_at=? 
+                WHERE id=?
+            `, nextStatus, reason, stripeCode, reason, newAttemptCount, nowIso(), nextRetryAt, suspendedAt, nowIso(), invoice.id);
+
+            // Audit
+            await db.run(`
+                INSERT INTO invoice_attempts 
+                (invoice_id, attempt_number, status, stripe_payment_intent_id, error_code, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `, invoice.id, newAttemptCount, nextStatus, invoice.stripe_payment_intent_id, stripeCode, reason, nowIso());
+
             return;
         }
 
-        // 6. Success
         // 6. Success
         if (paymentIntent && paymentIntent.status === 'succeeded') {
             await db.run(`
@@ -374,12 +421,24 @@ const handlers = {
 
             logger.info(`${logPrefix} SUCCESS: Charged ${paymentIntent.id}`);
 
+            // Audit Success
+            const successAttempt = (invoice.attempt_count || 0) + 1;
+            await db.run(`
+                INSERT INTO invoice_attempts 
+                (invoice_id, attempt_number, status, stripe_payment_intent_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            `, invoice.id, successAttempt, 'charged', paymentIntent.id, nowIso());
+
             await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
                 'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.amount_cents, stripe_pi: paymentIntent.id }));
         } else {
+            // If we reach here, it means the paymentIntent was not 'succeeded' after creation/confirmation,
+            // but also didn't throw an error. This is an unexpected state for a 'confirm: true' flow.
+            // We should treat this as a failure and let the dunning logic handle retries.
             const status = paymentIntent ? paymentIntent.status : 'unknown';
-            logger.warn(`${logPrefix} Incomplete Status: ${status}`);
-            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", `Stripe Status: ${status}`, nowIso(), invoice.id);
+            logger.warn(`${logPrefix} Unexpected PI Status: ${status}. Treating as failure.`);
+            // Re-throw to trigger the catch block for dunning logic
+            throw new Error(`Stripe PI in unexpected status: ${status}`);
         }
     }
 };
@@ -512,25 +571,46 @@ async function startQueueWorker() {
 
     // --- BILLING SCHEDULER (Mondays 19:00 UTC = 14:00 EST) ---
     // Attempt to charge pending invoices
-    // --- BILLING SCHEDULER (Mondays 14:00 EST) ---
-    // Attempt to charge pending invoices
+    // 2. Billing: Cobro principal
     cron.schedule('0 14 * * 1', async () => {
         logger.info('[Scheduler] Starting Automatic Billing Execution...');
         try {
-            // Select all PENDING invoices
-            // Safety cap of 500 to avoid clogging, though we expect fewer active clients for MVP
-            const pendingInvoices = await db.all("SELECT id FROM weekly_invoices WHERE status = 'pending' LIMIT 500");
-
-            for (const inv of pendingInvoices) {
-                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+            const invoices = await db.all("SELECT id FROM weekly_invoices WHERE status IN ('pending', 'failed') AND amount_cents > 0");
+            for (const inv of invoices) {
+                await utils.enqueueJob(db, 'charge_weekly_invoice', { invoice_id: inv.id });
             }
-            logger.info(`[Scheduler] Enqueued charges for ${pendingInvoices.length} invoices.`);
+            logger.info(`[Scheduler] Enqueued charges for ${invoices.length} invoices.`);
         } catch (e) {
-            logger.error('[Scheduler] Error triggering billing charges', e);
+            logger.error('[Scheduler] Error starting billing', e);
         }
     }, {
         scheduled: true,
         timezone: "America/New_York"
+    });
+
+    // 3. Dunning: Reintentos Inteligentes (Se revisa cada 1 hora)
+    cron.schedule('0 * * * *', async () => {
+        logger.info('[Scheduler] Checking Dunning / Retries...');
+        try {
+            // Reintentar 'retrying' o 'failed' (si se forzó) que ya hayan pasado la barrera de tiempo.
+            // SQLite/PG compatible timestamp string compare
+            const invoices = await db.all(`
+                SELECT id FROM weekly_invoices 
+                WHERE status IN ('failed', 'retrying') 
+                AND next_retry_at IS NOT NULL 
+                AND next_retry_at <= ?
+            `, nowIso());
+
+            for (const inv of invoices) {
+                logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
+                await utils.enqueueJob(db, 'charge_weekly_invoice', { invoice_id: inv.id });
+                // We clear next_retry_at temporarily to avoid duplicate queueing in the same hour if job is delayed
+                await db.run("UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?", inv.id);
+            }
+            if (invoices.length > 0) logger.info(`[Dunning] Enqueued ${invoices.length} invoices for retry.`);
+        } catch (e) {
+            logger.error('[Scheduler] Error in Dunning loop', e);
+        }
     });
 
     // Heartbeat Loop
