@@ -1,42 +1,41 @@
-# Checklist de Pruebas - Fase 15: Client Billing Dashboard
+# Checklist de Verificación - Fase 15 (Client Billing Dashboard)
 
-### 1) Ejecutar migración en DBeaver
-Abre DBeaver (conectado a PRD) y ejecuta este query idempotente:
+### A) Ejecutar migración en DBeaver
+Copia y pega este script SQL idempotente:
 ```sql
 ALTER TABLE weekly_invoices ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT;
 ALTER TABLE weekly_invoices ADD COLUMN IF NOT EXISTS receipt_url TEXT;
 ```
 
-### 2) Query para confirmar columnas
-Confirma que Postgres asimiló los campos correctamente:
+### B) Query para confirmar columnas
+Revisa que ambas existan:
 ```sql
 SELECT column_name, data_type 
 FROM information_schema.columns 
 WHERE table_name = 'weekly_invoices' AND column_name IN ('stripe_charge_id', 'receipt_url');
 ```
 
-### 3) Curl para `/api/billing/invoices/me`
-Debes enviar una petición autenticada usando tu JWT real de rol `empresa`. Esto te traerá máximo 20 resultados por página.
+### C) Curl para `/api/billing/invoices/me`
+Pide tus propias facturas. (Usa tu Bearer Token real de empresa)
 ```bash
-curl -X GET "https://TU_URL_EN_RENDER/api/billing/invoices/me?limit=20&offset=0" \
+curl -X GET "https://TU_RENDER_URL/api/billing/invoices/me?limit=20&offset=0" \
      -H "Authorization: Bearer <TU_TOKEN_JWT>"
 ```
-*(Si usas ThunderClient o Postman, simplemente haz GET a la ruta con el Bearer Token en Auth).*
 
-### 4) Prueba negativa (Otra empresa)
-Consigue el ID numérico de una factura que *sabes* que le pertenece a otro driver/company e intenta leerla.
+### D) Prueba negativa (Invoice ajeno)
+Intenta acceder al ID numérico de una factura que pertenece a un tercero:
 ```bash
-curl -X GET "https://TU_URL_EN_RENDER/api/billing/invoices/ID_AJENO" \
+curl -i -X GET "https://TU_RENDER_URL/api/billing/invoices/ID_AJENO" \
      -H "Authorization: Bearer <TU_TOKEN_JWT>"
 ```
-**Esperado:** Obtendrás un Http `404 Not Found`.
+**Esperado:** Http `404 Not Found`.
 
-### 5) Confirmar receipt_url
-Para no tener que volver a cobrarte en vivo ahora, busca una factura que *ya esté* en `status='charged'` y lánzale un cobro falso al endpoint manual Retry del Admin. Como usamos idempotencia y `confirm:true` no la doblará, pero Stripe regurgitará el PaymentIntent completo y de ahí extraerá el recibo.
-O simplemente fíjate si las facturas del próximo lunes se llenan:
+### E) Confirmar `receipt_url`
+Ejecuta el query para ver la URL del recibo (Stripe):
 ```sql
-SELECT id, status, stripe_payment_intent_id, receipt_url 
+SELECT id, status, receipt_url, stripe_charge_id 
 FROM weekly_invoices 
 WHERE status = 'charged' 
-ORDER BY id DESC LIMIT 5;
+ORDER BY id DESC LIMIT 1;
 ```
+*(Si no tienes facturas pagadas aún, mueve una pendiente temporalmente a `status='failed'` en DB, y ejecuta el Endpoint de `Retry` del Admin para que Stripe genere el Charge de nuevo bajo la misma Idempotency Key).*

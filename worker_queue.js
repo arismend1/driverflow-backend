@@ -422,6 +422,13 @@ const handlers = {
             if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge === 'object') {
                 chargeId = paymentIntent.latest_charge.id;
                 receiptUrl = paymentIntent.latest_charge.receipt_url;
+            } else if (typeof paymentIntent.latest_charge === 'string') {
+                // FALLBACK VITAL: Si Stripe ignoró el expand, pedir el objeto real directo de su SDK:
+                chargeId = paymentIntent.latest_charge;
+                try {
+                    const fullCharge = await stripe.charges.retrieve(chargeId);
+                    receiptUrl = fullCharge.receipt_url;
+                } catch (e) { logger.warn(`${logPrefix} Failed to retrieve missing expanded charge ${chargeId}`); }
             } else if (paymentIntent.charges && paymentIntent.charges.data.length > 0) {
                 chargeId = paymentIntent.charges.data[0].id;
                 receiptUrl = paymentIntent.charges.data[0].receipt_url;
