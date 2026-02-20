@@ -413,11 +413,15 @@ const handlers = {
 
         // 6. Success
         if (paymentIntent && paymentIntent.status === 'succeeded') {
+            const chargeId = paymentIntent.latest_charge || (paymentIntent.charges && paymentIntent.charges.data.length > 0 ? paymentIntent.charges.data[0].id : null);
+            const receiptUrl = paymentIntent.charges && paymentIntent.charges.data.length > 0 ? paymentIntent.charges.data[0].receipt_url : null;
+
             await db.run(`
                 UPDATE weekly_invoices 
-                SET status='charged', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, updated_at=? 
+                SET status='charged', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, 
+                    stripe_charge_id=COALESCE(stripe_charge_id, ?), receipt_url=COALESCE(receipt_url, ?), updated_at=? 
                 WHERE id=?
-            `, paymentIntent.id, nowIso(), nowIso(), invoice.id);
+            `, paymentIntent.id, chargeId, receiptUrl, nowIso(), nowIso(), invoice.id);
 
             logger.info(`${logPrefix} SUCCESS: Charged ${paymentIntent.id}`);
 

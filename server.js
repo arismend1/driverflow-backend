@@ -928,6 +928,41 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
     }
 });
 
+// --- 7.2 BILLING (CLIENT DASHBOARD) ---
+app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const rows = await db.all(`
+            SELECT id, week_start, week_end, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
+            FROM weekly_invoices 
+            WHERE company_id=? 
+            ORDER BY week_start DESC 
+            LIMIT 100
+        `, req.user.id);
+        res.json(rows || []);
+    } catch (e) {
+        console.error('Invoices List Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const inv = await db.get(`
+            SELECT id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
+            FROM weekly_invoices 
+            WHERE id=? AND company_id=?
+        `, req.params.id, req.user.id);
+
+        if (!inv) return res.status(404).json({ error: 'Not Found' });
+        res.json(inv);
+    } catch (e) {
+        console.error('Invoice Detail Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 8. LEGACY / DEPRECATED ROUTES ---
 app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Deprecated. Use /apply_for_request' }));
 
