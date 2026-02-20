@@ -16,6 +16,12 @@ if (IS_POSTGRES) {
             connectionString: process.env.DATABASE_URL,
             ssl: { rejectUnauthorized: false }
         });
+
+        pgPool.on('error', (err, client) => {
+            console.error('[DB] Unexpected error on idle client', err.message);
+            // Log it but do NOT exit the process. pg pool will automatically reconnect on next query.
+        });
+
         console.log('[DB] Using PostgreSQL connection.');
     } catch (e) {
         console.error('[DB] FATAL: "pg" module not found but DATABASE_URL is set.');

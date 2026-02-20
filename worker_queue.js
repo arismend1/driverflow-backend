@@ -22,8 +22,8 @@ async function enqueueJob(type, payload, options = {}) {
 
     try {
         await db.run(`
-            INSERT INTO jobs_queue (job_type, payload_json, run_at, max_attempts, created_at, idempotency_key)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs_queue (job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
         `, type, JSON.stringify(payload), runAt, max, now, options.idempotency_key || null);
         return true;
     } catch (e) {
@@ -204,7 +204,7 @@ const handlers = {
             const usage = await db.get(`
                 SELECT count(*) as cnt, count(distinct driver_id) as drv 
                 FROM solicitudes 
-                WHERE empresa_id = ? AND created_at >= ? AND created_at < ?`,
+                WHERE empresa_id = ? AND fecha_creacion >= ? AND fecha_creacion < ?`,
                 company_id, start, endPlusOne
             );
 

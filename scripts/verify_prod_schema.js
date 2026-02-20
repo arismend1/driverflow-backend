@@ -42,6 +42,27 @@ async function verify() {
                 const tableName = row.table_name;
                 const countRes = await client.query(`SELECT COUNT(*) as c FROM "${tableName}"`);
                 console.log(`   - ${tableName}: ${countRes.rows[0].c} registros`);
+
+                // Check columns for weekly_invoices
+                if (tableName === 'weekly_invoices') {
+                    const cols = await client.query(`
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'weekly_invoices'
+                    `);
+                    const colNames = cols.rows.map(r => r.column_name);
+                    console.log(`     Columnas: ${colNames.join(', ')}`);
+
+                    const required = ['stripe_payment_intent_id', 'paid_at', 'failure_reason', 'attempt_count', 'last_error'];
+                    const missing = required.filter(c => !colNames.includes(c));
+
+                    if (missing.length > 0) {
+                        console.error(`     ❌ FALTAN COLUMNAS: ${missing.join(', ')}`);
+                        console.error(`     ⚠️ DEBES EJECUTAR: scripts/manual_migration_phase13_hardening.sql`);
+                    } else {
+                        console.log(`     ✅ Todas las columnas de hardening presentes.`);
+                    }
+                }
             }
 
             console.log('\n✅ Todo parece correcto. La estructura está en su lugar.');
