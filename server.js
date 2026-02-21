@@ -293,10 +293,16 @@ if (!JWT_SECRET) {
 const authenticateToken = (req, res, next) => {
     const header = req.headers['authorization'];
     const token = header && header.split(' ')[1];
-    if (!token) return res.sendStatus(401);
+    if (!token) {
+        console.warn(`[Auth] Missing Token. Authorization header present: ${!!header}`);
+        return res.status(401).json({ error: 'Unauthorized', reason: 'MissingToken' });
+    }
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
+        if (err) {
+            console.warn(`[Auth] JWT Verify Failed - Name: ${err.name}, Message: ${err.message}. Auth header present: ${!!header}`);
+            return res.status(403).json({ error: 'Forbidden', reason: err.name || 'InvalidToken' });
+        }
 
         user.type = user.type || user.tipo;
 
@@ -929,6 +935,22 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
         console.error('Unsuspend Error', e);
         res.status(500).json({ error: e.message });
     }
+});
+
+// Debug JWT (Admin)
+app.post('/admin/debug/jwt', (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
+
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Missing token in body' });
+
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err) {
+            return res.status(403).json({ ok: false, error: err.name, message: err.message });
+        }
+        res.json({ ok: true, decoded });
+    });
 });
 
 // --- 7.2 BILLING (CLIENT DASHBOARD) ---
