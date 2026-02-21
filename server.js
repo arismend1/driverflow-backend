@@ -102,6 +102,15 @@ app.use((req, res, next) => {
     next();
 });
 
+// --- Debug Env Check (Temporal) ---
+app.get('/api/debug/env', (req, res) => {
+    res.json({
+        DATABASE_URL: process.env.DATABASE_URL || 'NOT_SET',
+        JWT_SECRET: process.env.JWT_SECRET ? 'SET' : 'NOT_SET',
+        STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ? 'SET' : 'NOT_SET'
+    });
+});
+
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
 // Unified Stripe Webhook
