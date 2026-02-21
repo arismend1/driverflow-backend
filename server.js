@@ -297,6 +297,9 @@ const authenticateToken = (req, res, next) => {
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.sendStatus(403);
+
+        user.type = user.type || user.tipo;
+
         req.user = user;
         next();
     });
