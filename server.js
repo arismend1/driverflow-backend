@@ -102,53 +102,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- Debug Env Check (Temporal) ---
-app.get('/api/debug/env', (req, res) => {
-    res.json({
-        DATABASE_URL: process.env.DATABASE_URL || 'NOT_SET',
-        JWT_SECRET: process.env.JWT_SECRET ? 'SET' : 'NOT_SET',
-        STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ? 'SET' : 'NOT_SET'
-    });
-});
-
-app.get('/api/debug/migrate', async (req, res) => {
-    try {
-        await db.run(`
-            CREATE TABLE IF NOT EXISTS weekly_invoices (
-                id SERIAL PRIMARY KEY,
-                company_id INTEGER NOT NULL,
-                week_start TEXT NOT NULL,
-                week_end TEXT NOT NULL,
-                amount_cents INTEGER NOT NULL DEFAULT 0,
-                currency TEXT DEFAULT 'usd',
-                status TEXT NOT NULL DEFAULT 'pending',
-                stripe_payment_intent_id TEXT,
-                stripe_charge_id TEXT,
-                receipt_url TEXT,
-                failure_reason TEXT,
-                last_error_code TEXT,
-                last_error_message TEXT,
-                attempt_count INTEGER DEFAULT 0,
-                last_attempt_at TEXT,
-                next_retry_at TEXT,
-                suspended_at TEXT,
-                paid_at TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                total_requests INTEGER DEFAULT 0,
-                active_drivers INTEGER DEFAULT 0
-            )
-        `);
-        try { await db.run("ALTER TABLE weekly_invoices ADD COLUMN stripe_charge_id TEXT;"); } catch (e) { }
-        try { await db.run("ALTER TABLE weekly_invoices ADD COLUMN receipt_url TEXT;"); } catch (e) { }
-
-        const cols = await db.all("SELECT column_name FROM information_schema.columns WHERE table_name = 'weekly_invoices'");
-        res.json({ success: true, columns: cols.map(c => c.column_name) });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
 // Unified Stripe Webhook
