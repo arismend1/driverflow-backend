@@ -102,6 +102,39 @@ app.use((req, res, next) => {
     next();
 });
 
+// --- Migración de columnas Dunning (Temporal) ---
+app.get('/api/debug/migrate', async (req, res) => {
+    try {
+        const statements = [
+            "ALTER TABLE weekly_invoices ADD COLUMN failure_reason TEXT;",
+            "ALTER TABLE weekly_invoices ADD COLUMN last_error_code TEXT;",
+            "ALTER TABLE weekly_invoices ADD COLUMN last_error_message TEXT;",
+            "ALTER TABLE weekly_invoices ADD COLUMN attempt_count INTEGER DEFAULT 0;",
+            "ALTER TABLE weekly_invoices ADD COLUMN last_attempt_at TEXT;",
+            "ALTER TABLE weekly_invoices ADD COLUMN next_retry_at TEXT;",
+            "ALTER TABLE weekly_invoices ADD COLUMN suspended_at TEXT;"
+        ];
+
+        const results = [];
+        for (const sql of statements) {
+            try {
+                await db.run(sql);
+                results.push({ sql, status: 'ok' });
+            } catch (err) {
+                // Ignore "column already exists" errors
+                results.push({ sql, status: err.message });
+            }
+        }
+
+        const colsResult = await db.all("SELECT column_name FROM information_schema.columns WHERE table_name = 'weekly_invoices'");
+        const columns = colsResult.map(c => c.column_name);
+
+        res.json({ success: true, migrations: results, columns });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
 // Unified Stripe Webhook
