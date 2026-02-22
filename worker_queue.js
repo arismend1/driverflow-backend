@@ -616,18 +616,22 @@ async function startQueueWorker() {
         try {
             // Reintentar 'retrying' o 'failed' (si se forzó) que ya hayan pasado la barrera de tiempo.
             // SQLite/PG compatible timestamp string compare
-            const invoices = await db.all(`
+            const querySelect = `
                 SELECT id FROM weekly_invoices 
                 WHERE status IN ('failed', 'retrying') 
                 AND next_retry_at IS NOT NULL 
                 AND next_retry_at <= ?
-            `, nowIso());
+            `;
+            console.log("[Scheduler][Dunning] Executing query:", querySelect);
+            const invoices = await db.all(querySelect, nowIso());
 
             for (const inv of invoices) {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
                 await utils.enqueueJob(db, 'charge_weekly_invoice', { invoice_id: inv.id });
                 // We clear next_retry_at temporarily to avoid duplicate queueing in the same hour if job is delayed
-                await db.run("UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?", inv.id);
+                const queryUpdate = "UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?";
+                console.log("[Scheduler][Dunning] Executing query:", queryUpdate);
+                await db.run(queryUpdate, inv.id);
             }
             if (invoices.length > 0) logger.info(`[Dunning] Enqueued ${invoices.length} invoices for retry.`);
         } catch (err) {
