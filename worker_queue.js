@@ -605,7 +605,7 @@ async function startQueueWorker() {
         try {
             const invoices = await db.all("SELECT id FROM weekly_invoices WHERE status IN ('pending', 'failed') AND amount_cents > 0");
             for (const inv of invoices) {
-                await utils.enqueueJob(db, 'charge_weekly_invoice', { invoice_id: inv.id });
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
             }
             logger.info(`[Scheduler] Enqueued charges for ${invoices.length} invoices.`);
         } catch (e) {
@@ -633,7 +633,7 @@ async function startQueueWorker() {
 
             for (const inv of invoices) {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
-                await utils.enqueueJob(db, 'charge_weekly_invoice', { invoice_id: inv.id });
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
                 // We clear next_retry_at temporarily to avoid duplicate queueing in the same hour if job is delayed
                 const queryUpdate = "UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?";
                 console.log("[Scheduler][Dunning] Executing query:", queryUpdate);
