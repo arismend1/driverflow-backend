@@ -17,3 +17,10 @@ Thumbs.db
 
 # Environment
 .env
+
+# local test scripts
+test_api_2.js
+test_db_prod.js
+test_prod_e2e.js
+verify_phase15_tmp.js
+
