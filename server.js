@@ -126,23 +126,11 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
     }
 
     try {
-        // Idempotency: PostgreSQL safe ON CONFLICT approach
-        // 1. Create table structure if missing with safe schema enforcement
-        await db.run(`
-            CREATE TABLE IF NOT EXISTS stripe_webhook_events (
-                stripe_event_id TEXT PRIMARY KEY,
-                type TEXT,
-                status TEXT,
-                created_at TEXT,
-                processed_at TEXT
-            )
-        `);
-
-        // 2. Safe insertion mapped as lock
+        // 1. Safe insertion mapped as lock (PostgreSQL ON CONFLICT)
         try {
             await db.run(
-                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES ($1, $2, $3, 'pending')`,
-                event.id, event.type, nowIso()
+                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES ($1, $2, CURRENT_TIMESTAMP, 'pending')`,
+                event.id, event.type
             );
         } catch (err) {
             // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
@@ -196,7 +184,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         }
 
         // Complete Event Lock
-        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=$1 WHERE stripe_event_id=$2`, nowIso(), event.id);
+        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=$1`, event.id);
         res.json({ received: true });
     } catch (err) {
         console.error('[Stripe Processing Error]', err);
