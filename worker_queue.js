@@ -630,8 +630,17 @@ async function startQueueWorker() {
                 await db.run("UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?", inv.id);
             }
             if (invoices.length > 0) logger.info(`[Dunning] Enqueued ${invoices.length} invoices for retry.`);
-        } catch (e) {
-            logger.error('[Scheduler] Error in Dunning loop', e);
+        } catch (err) {
+            console.error("[Scheduler][Dunning] PG ERROR", {
+                message: err.message,
+                code: err.code,
+                column: err.column,
+                table: err.table,
+                schema: err.schema,
+                position: err.position,
+                detail: err.detail,
+                where: err.where
+            });
         }
     });
 
