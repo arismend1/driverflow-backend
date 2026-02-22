@@ -340,6 +340,15 @@ const handlers = {
                 }, { idempotencyKey });
             }
 
+            // Save PI ID immediately if new to allow robust inverse reconciliation in Webhook
+            if (!invoice.stripe_payment_intent_id && paymentIntent.id) {
+                await db.run(
+                    "UPDATE weekly_invoices SET stripe_payment_intent_id=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND stripe_payment_intent_id IS NULL",
+                    paymentIntent.id, invoice.id
+                );
+                invoice.stripe_payment_intent_id = paymentIntent.id;
+            }
+
             // Retry/Confirm if needed
             if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
                 logger.info(`${logPrefix} PI ${paymentIntent.id} is ${paymentIntent.status}, attempting confirm...`);
@@ -348,10 +357,7 @@ const handlers = {
                 });
             }
 
-            // Save PI ID if new
-            if (!invoice.stripe_payment_intent_id && paymentIntent.id) {
-                await db.run("UPDATE weekly_invoices SET stripe_payment_intent_id=? WHERE id=?", paymentIntent.id, invoice.id);
-            }
+            // (PI Id saving was moved above for guaranteed bottom-up reconciliation)
 
         } catch (e) {
             // Capture PI ID from error if available

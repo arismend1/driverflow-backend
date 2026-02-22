@@ -126,27 +126,77 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
     }
 
     try {
-        // Idempotency
-        const existing = await db.get('SELECT status FROM stripe_webhook_events WHERE stripe_event_id = ?', event.id);
-        if (existing) return res.json({ received: true });
+        // Idempotency: PostgreSQL safe ON CONFLICT approach
+        // 1. Create table structure if missing with safe schema enforcement
+        await db.run(`
+            CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+                stripe_event_id TEXT PRIMARY KEY,
+                type TEXT,
+                status TEXT,
+                created_at TEXT,
+                processed_at TEXT
+            )
+        `);
 
-        await db.run(`INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES (?, ?, ?, 'pending')`, event.id, event.type, nowIso());
+        // 2. Safe insertion mapped as lock
+        try {
+            await db.run(
+                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES ($1, $2, $3, 'pending')`,
+                event.id, event.type, nowIso()
+            );
+        } catch (err) {
+            // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
+            if (err.code === '23505' || err.message.includes('UNIQUE')) {
+                return res.json({ received: true });
+            }
+            throw err;
+        }
 
-        if (event.type === 'checkout.session.completed') {
-            const session = event.data.object;
-            const ticketId = session.metadata?.ticket_id;
-            if (ticketId) {
-                console.log(`[Stripe] Invoice Paid: Ticket ${ticketId}`);
-                await db.run(`UPDATE tickets SET billing_status='paid', paid_at=?, payment_ref=?, stripe_payment_intent_id=?, stripe_customer_id=?, billing_notes='Paid via Stripe' WHERE id=? AND billing_status != 'paid'`,
-                    nowIso(), session.payment_intent, session.payment_intent, session.customer, ticketId);
+        // 3. Invoice Payment Interception
+        if (event.type === 'payment_intent.succeeded') {
+            const paymentIntent = event.data.object;
+            const invoiceId = paymentIntent.metadata?.invoice_id || null;
+            const piId = paymentIntent.id;
 
-                // Outbox Event
-                await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                    'invoice_paid', nowIso(), session.metadata.company_id, JSON.stringify({ ticket_id: ticketId, stripe_id: session.id }));
+            let chargeId = null;
+            let receiptUrl = null;
+
+            // Deep charge resolution (Expansion safety fallback)
+            if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge === 'object') {
+                chargeId = paymentIntent.latest_charge.id;
+                receiptUrl = paymentIntent.latest_charge.receipt_url;
+            } else if (typeof paymentIntent.latest_charge === 'string') {
+                chargeId = paymentIntent.latest_charge;
+                try {
+                    const chargeData = await stripe.charges.retrieve(chargeId);
+                    receiptUrl = chargeData.receipt_url;
+                } catch (e) {
+                    console.error(`[Webhook] Fetch charge failed for PI ${piId}`);
+                }
+            }
+
+            if (invoiceId) {
+                // Direct Reconciliation (Worker Originated)
+                await db.run(`
+                    UPDATE weekly_invoices 
+                    SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
+                    WHERE id=$6 AND status != 'charged'
+                `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
+                console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
+
+            } else {
+                // Inverse Reconciliation (Out-of-band manual dashboard capture)
+                await db.run(`
+                    UPDATE weekly_invoices 
+                    SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
+                    WHERE stripe_payment_intent_id=$5 AND status != 'charged'
+                `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
+                console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
             }
         }
 
-        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=? WHERE stripe_event_id=?`, nowIso(), event.id);
+        // Complete Event Lock
+        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=$1 WHERE stripe_event_id=$2`, nowIso(), event.id);
         res.json({ received: true });
     } catch (err) {
         console.error('[Stripe Processing Error]', err);
