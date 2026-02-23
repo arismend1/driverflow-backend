@@ -375,7 +375,7 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
 
     try {
-        const row = await db.get(`SELECT * FROM ${table} WHERE LOWER(contacto) = ?`, contacto);
+        const row = await db.get(`SELECT * FROM ${table} WHERE LOWER(contacto) = LOWER(?)`, contacto);
 
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
