@@ -358,18 +358,24 @@ function isStrongPassword(p) {
 // LOGIN
 app.post('/login', async (req, res) => {
     if (!checkRateLimit(req.ip, 'login')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    const { type, contacto, password } = req.body;
+    console.log('LOGIN_ROUTE_VERSION_2_ACTIVE');
 
-    // Log intent (masked)
-    // console.log(`[Login] Attempt for ${contacto} as ${type}`);
+    const type = (req.body.type || '').toString().trim().toLowerCase();
+    const contacto = (req.body.contacto || '').toString().trim().toLowerCase();
+    const password = (req.body.password || '').toString();
+
+    if (!['driver', 'empresa'].includes(type)) {
+        return res.status(400).json({ error: 'Invalid Type' });
+    }
+
+    if (!contacto || !password) {
+        return res.status(400).json({ error: 'Missing Data' });
+    }
+
+    const table = type === 'driver' ? 'drivers' : 'empresas';
 
     try {
-        const table = type === 'driver' ? 'drivers' : 'empresas';
-        // Validate type to prevent SQL Injection via table name (though internal, best practice)
-        if (!['driver', 'empresas'].includes(table) && type !== 'empresa') return res.status(400).json({ error: 'Invalid Type' });
-
-        const safeTable = type === 'driver' ? 'drivers' : 'empresas';
-        const row = await db.get(`SELECT * FROM ${safeTable} WHERE contacto = ?`, contacto);
+        const row = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, contacto);
 
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
