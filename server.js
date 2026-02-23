@@ -375,7 +375,7 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
 
     try {
-        const row = await db.get(`SELECT * FROM ${table} WHERE contacto = ?`, contacto);
+        const row = await db.get(`SELECT * FROM ${table} WHERE LOWER(contacto) = ?`, contacto);
 
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
@@ -403,7 +403,7 @@ app.post('/login', async (req, res) => {
         if (match) {
             // Success
             if (row.failed_attempts > 0) {
-                await db.run(`UPDATE ${safeTable} SET failed_attempts=0, lockout_until=NULL WHERE id=?`, row.id);
+                await db.run(`UPDATE ${table} SET failed_attempts=0, lockout_until=NULL WHERE id=?`, row.id);
             }
             const token = jwt.sign({ id: row.id, type: type === 'empresa' ? 'empresa' : 'driver' }, JWT_SECRET, { expiresIn: '24h' });
 
@@ -413,7 +413,7 @@ app.post('/login', async (req, res) => {
         } else {
             // Bad Password
             const fails = (row.failed_attempts || 0) + 1;
-            let sql = `UPDATE ${safeTable} SET failed_attempts = ?`;
+            let sql = `UPDATE ${table} SET failed_attempts = ?`;
             const args = [fails];
             if (fails >= 5) {
                 sql += `, lockout_until = ?`;
@@ -436,7 +436,8 @@ app.post('/login', async (req, res) => {
 // REGISTER
 app.post('/register', async (req, res) => {
     if (!checkRateLimit(req.ip, 'register')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    const { type, nombre, contacto, password, ...extras } = req.body;
+    const { type, nombre, password, ...extras } = req.body;
+    const contacto = (req.body.contacto || '').toString().trim().toLowerCase();
 
     if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Bad type' });
     if (!nombre || !contacto || !password) return res.status(400).json({ error: 'Missing fields' });
