@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: driverflow-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: driverflow-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: STRIPE_WEBHOOK_SECRET
+        generateValue: true
+      - key: RUN_MIGRATIONS
+        value: "true"
+      - key: PORT
+        value: "10000"
+      - key: ALLOWED_ORIGINS
+        value: "*" # Update this with your final app domain or *
+
+  - type: worker
+    name: driverflow-worker
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run start:worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: driverflow-db
+          property: connectionString
+      - key: JWT_SECRET
+        sync: false # Re-use from web if possible or generate same
+      - key: RUN_MIGRATIONS
+        value: "false"
+
+databases:
+  - name: driverflow-db
+    plan: free
