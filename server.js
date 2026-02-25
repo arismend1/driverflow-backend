@@ -289,6 +289,90 @@ app.post('/company/search_status', authenticateToken, (req, res) => {
     }
 });
 
+// --- COMPANY REQUIREMENTS ---
+const companyRequirementsHandler = (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Access denied: Use company account.' });
+
+    if (req.method === 'GET') {
+        let reqs = db.prepare('SELECT * FROM company_requirements WHERE company_id = ?').get(req.user.id);
+        if (!reqs) {
+            // Return defaults
+            reqs = {
+                company_id: req.user.id,
+                req_cdl: 0,
+                req_license_types: '[]',
+                req_endorsements: '[]',
+                req_operation_types: '[]',
+                req_modalities: '[]',
+                req_truck: 0,
+                offered_payment_methods: '[]',
+                req_relationships: '[]',
+                availability: 'Inmediata',
+                req_experience_years: 0
+            };
+        } else {
+            // Ensure boolean conversion for SQLite
+            reqs.req_cdl = !!reqs.req_cdl;
+            reqs.req_truck = !!reqs.req_truck;
+        }
+        return res.json(reqs);
+    }
+
+    if (req.method === 'PUT') {
+        const {
+            req_cdl, req_license_types, req_endorsements, req_operation_types,
+            req_modalities, req_truck, offered_payment_methods,
+            req_relationships, availability, req_experience_years
+        } = req.body;
+
+        const nowStr = nowIso();
+        try {
+            const stmt = db.prepare(`
+                INSERT INTO company_requirements (
+                    company_id, req_cdl, req_license_types, req_endorsements, req_operation_types,
+                    req_modalities, req_truck, offered_payment_methods, req_relationships,
+                    availability, req_experience_years, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(company_id) DO UPDATE SET
+                    req_cdl=excluded.req_cdl,
+                    req_license_types=excluded.req_license_types,
+                    req_endorsements=excluded.req_endorsements,
+                    req_operation_types=excluded.req_operation_types,
+                    req_modalities=excluded.req_modalities,
+                    req_truck=excluded.req_truck,
+                    offered_payment_methods=excluded.offered_payment_methods,
+                    req_relationships=excluded.req_relationships,
+                    availability=excluded.availability,
+                    req_experience_years=excluded.req_experience_years,
+                    updated_at=excluded.updated_at
+            `);
+
+            stmt.run(
+                req.user.id,
+                req_cdl ? 1 : 0,
+                Array.isArray(req_license_types) ? JSON.stringify(req_license_types) : req_license_types || '[]',
+                Array.isArray(req_endorsements) ? JSON.stringify(req_endorsements) : req_endorsements || '[]',
+                Array.isArray(req_operation_types) ? JSON.stringify(req_operation_types) : req_operation_types || '[]',
+                Array.isArray(req_modalities) ? JSON.stringify(req_modalities) : req_modalities || '[]',
+                req_truck ? 1 : 0,
+                Array.isArray(offered_payment_methods) ? JSON.stringify(offered_payment_methods) : offered_payment_methods || '[]',
+                Array.isArray(req_relationships) ? JSON.stringify(req_relationships) : req_relationships || '[]',
+                availability || 'Inmediata',
+                req_experience_years || 0,
+                nowStr
+            );
+
+            return res.json({ ok: true });
+        } catch (err) {
+            console.error('PUT company_requirements error:', err);
+            return res.status(500).json({ error: 'Failed to save requirements' });
+        }
+    }
+};
+
+app.get(['/api/companies/requirements', '/companies/requirements'], authenticateToken, companyRequirementsHandler);
+app.put(['/api/companies/requirements', '/companies/requirements'], authenticateToken, companyRequirementsHandler);
+
 // PHASE D: AUTOMATED MATCHING ENDPOINTS
 
 // 1. Driver Search Status
