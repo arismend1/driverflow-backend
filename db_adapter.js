@@ -1,68 +1,104 @@
 const { Pool } = require('pg');
+const path = require('path');
+const fs = require('fs');
 
 const IS_POSTGRES = !!process.env.DATABASE_URL;
+let pool = null;
+let sqliteDb = null;
 
-if (!IS_POSTGRES) {
-    console.error("FATAL: DATABASE_URL no está configurada. El sistema requiere PostgreSQL para producción.");
-    process.exit(1);
+if (IS_POSTGRES) {
+    console.log("[DB] Engine: POSTGRES");
+    pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    });
+} else {
+    const dbPath = path.resolve(process.env.DB_PATH || 'driverflow.db');
+    console.log("[DB] Engine: SQLITE");
+    console.log("[DB] Path:", dbPath);
+
+    // Dynamically load better-sqlite3
+    try {
+        const Database = require('better-sqlite3');
+        sqliteDb = new Database(dbPath);
+    } catch (err) {
+        console.error("FATAL: SQLite fallback failed. Ensure 'better-sqlite3' is installed.");
+        process.exit(1);
+    }
 }
-
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-});
 
 module.exports = {
     IS_POSTGRES,
     run: async (sql, ...args) => {
         try {
-            // Convierte "?" de SQLite a "$1", "$2" de PostgreSQL
-            let pgSql = sql;
-            let counter = 1;
-            while (pgSql.includes('?')) {
-                pgSql = pgSql.replace('?', `$${counter}`);
-                counter++;
+            if (IS_POSTGRES) {
+                let pgSql = sql;
+                let counter = 1;
+                while (pgSql.includes('?')) {
+                    pgSql = pgSql.replace('?', `$${counter}`);
+                    counter++;
+                }
+                const res = await pool.query(pgSql, args);
+                // Map lastInsertRowid for compatibility if possible (PG uses RETURNING usually)
+                // But for simple INSERTs, we'll just return the result
+                return { lastInsertRowid: res.oid || (res.rows[0] ? res.rows[0].id : null), ...res };
+            } else {
+                const info = sqliteDb.prepare(sql).run(args);
+                return { lastInsertRowid: info.lastInsertRowid, ...info };
             }
-            const res = await pool.query(pgSql, args);
-            return res; // compatible interface
         } catch (e) {
             throw e;
         }
     },
     all: async (sql, ...args) => {
         try {
-            let pgSql = sql;
-            let counter = 1;
-            while (pgSql.includes('?')) {
-                pgSql = pgSql.replace('?', `$${counter}`);
-                counter++;
+            if (IS_POSTGRES) {
+                let pgSql = sql;
+                let counter = 1;
+                while (pgSql.includes('?')) {
+                    pgSql = pgSql.replace('?', `$${counter}`);
+                    counter++;
+                }
+                const res = await pool.query(pgSql, args);
+                return res.rows;
+            } else {
+                return sqliteDb.prepare(sql).all(args);
             }
-            const res = await pool.query(pgSql, args);
-            return res.rows;
         } catch (e) {
             throw e;
         }
     },
     get: async (sql, ...args) => {
         try {
-            let pgSql = sql;
-            let counter = 1;
-            while (pgSql.includes('?')) {
-                pgSql = pgSql.replace('?', `$${counter}`);
-                counter++;
+            if (IS_POSTGRES) {
+                let pgSql = sql;
+                let counter = 1;
+                while (pgSql.includes('?')) {
+                    pgSql = pgSql.replace('?', `$${counter}`);
+                    counter++;
+                }
+                const res = await pool.query(pgSql, args);
+                return res.rows.length ? res.rows[0] : null;
+            } else {
+                return sqliteDb.prepare(sql).get(args);
             }
-            const res = await pool.query(pgSql, args);
-            return res.rows.length ? res.rows[0] : null;
         } catch (e) {
             throw e;
         }
     },
     exec: async (sql) => {
         try {
-            await pool.query(sql);
+            if (IS_POSTGRES) {
+                await pool.query(sql);
+            } else {
+                sqliteDb.exec(sql);
+            }
         } catch (e) {
             throw e;
         }
     },
-    close: () => pool.end()
+    close: () => {
+        if (pool) pool.end();
+        if (sqliteDb) sqliteDb.close();
+    }
 };

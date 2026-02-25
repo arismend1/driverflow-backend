@@ -1,16 +1,28 @@
 const db = require('./db_adapter');
-// SQLite removed
-// const dbPath = process.env.DB_PATH || 'driverflow.db';
 
 console.log(`[AUTH MIGRATION] Starting Migration (Async/Adapter Mode)`);
 
+let migrationError = false;
+
+async function checkTableExists(table) {
+    try {
+        if (db.IS_POSTGRES) {
+            // Postgres check
+            const res = await db.get(`SELECT to_regclass('public.${table}') as exists`);
+            return !!(res && res.exists);
+        } else {
+            // SQLite check
+            const res = await db.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table);
+            return !!res;
+        }
+    } catch (e) {
+        console.error(`[AUTH MIGRATION] Error checking table ${table}:`, e.message);
+        return false;
+    }
+}
+
 async function addColumn(table, col, type, defaultVal) {
     try {
-        // PRAGMA table_info is SQLite specific. 
-        // For Postgres compatibility without complex introspection, we try to add and ignore error
-        // OR we just use a generic "ADD COLUMN IF NOT EXISTS" pattern which is engine specific.
-        // EASIEST HYBRID: Try ADD COLUMN, catch "duplicate column" error.
-
         let sql = `ALTER TABLE ${table} ADD COLUMN ${col} ${type}`;
         if (defaultVal !== undefined) sql += ` DEFAULT ${defaultVal}`;
 
@@ -18,22 +30,17 @@ async function addColumn(table, col, type, defaultVal) {
             await db.run(sql);
             console.log(`✅ Added ${table}.${col}`);
         } catch (e) {
-            if (e.message.includes('duplicate column') || e.message.includes('exists')) {
-                console.log(`ℹ️  ${table}.${col} exists`);
+            const msg = e.message.toLowerCase();
+            if (msg.includes('duplicate column') || msg.includes('exists')) {
+                console.log(`ℹ️  ${table}.${col} already exists`);
             } else {
-                throw e;
+                console.error(`❌ Error adding ${table}.${col}:`, e.message);
+                migrationError = true;
             }
         }
-
-        /*  
-         // OLD SQLITE INTROSPECTION
-         const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-         if (!cols.find(c => c.name === col)) {
-             // ...
-         } 
-        */
     } catch (e) {
-        console.error(`❌ Error adding ${table}.${col}:`, e.message);
+        console.error(`❌ Unexpected error for ${table}.${col}:`, e.message);
+        migrationError = true;
     }
 }
 
@@ -72,16 +79,34 @@ const schema = [
 ];
 
 (async () => {
-    // 1. Ensure Tables Exist (Base Schema) - Using explicit CREATE IF NOT EXISTS which works in both usually
-    // Note: AUTOINCREMENT is SQLite. SERIAL is PG. 
-    // This script assumes tables exist via init_postgres_db.js for PG.
-    // We only focus on ADDING COLUMNS here to fix schema drift.
+    try {
+        console.log(`[AUTH MIGRATION] Verifying required tables...`);
+        const tablesRequired = ['drivers', 'empresas'];
+        for (const table of tablesRequired) {
+            const exists = await checkTableExists(table);
+            if (!exists) {
+                console.error(`[AUTH MIGRATION] FATAL: Required table '${table}' does not exist.`);
+                process.exit(1);
+            }
+            console.log(`[AUTH MIGRATION] Table '${table}' detected.`);
+        }
 
-    // 2. Add Columns
-    for (const item of schema) {
-        await addColumn(item.table, item.col, item.type, item.def);
+        // 2. Add Columns
+        for (const item of schema) {
+            await addColumn(item.table, item.col, item.type, item.def);
+        }
+
+        if (migrationError) {
+            console.error('[AUTH MIGRATION] Completed with ERRORS.');
+            process.exit(1);
+        } else {
+            console.log('[AUTH MIGRATION] Completed Successfully.');
+            db.close();
+            process.exit(0);
+        }
+    } catch (err) {
+        console.error('[AUTH MIGRATION] FATAL ERROR:', err.message);
+        process.exit(1);
     }
-
-    console.log('[AUTH MIGRATION] Completed Successfully.');
-    process.exit(0);
 })();
+
