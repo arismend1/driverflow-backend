@@ -1,9 +1,0 @@
-# 🔒 CORE TIME & BILLING PROTECTION
-# These files require review from the Principal Engineer.
-
-time_contract.js            @driverflow/principal-eng
-access_control.js           @driverflow/principal-eng
-generate_weekly_invoices.js @driverflow/principal-eng
-worker_queue.js             @driverflow/principal-eng
-time_provider.js            @driverflow/principal-eng
-tests/test_time_regression.js @driverflow/principal-eng

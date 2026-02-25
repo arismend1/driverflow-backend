@@ -109,4 +109,3 @@ const schema = [
         process.exit(1);
     }
 })();
-
