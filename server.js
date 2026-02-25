@@ -1037,6 +1037,73 @@ app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// Checkout for Weekly Invoice (Escape Hatch / Manual Payment)
+app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    const invId = req.params.id;
+
+    try {
+        const invoice = await db.get(`
+            SELECT w.*, c.stripe_customer_id 
+            FROM weekly_invoices w 
+            JOIN empresas c ON w.company_id = c.id 
+            WHERE w.id=? AND w.company_id=?
+        `, invId, req.user.id);
+
+        if (!invoice) return res.status(404).json({ error: 'Invoice Not Found' });
+
+        // Allowed statuses for manual checkout
+        const allowedStatuses = ['pending', 'failed', 'retrying', 'suspended'];
+        if (!allowedStatuses.includes(invoice.status)) {
+            return res.status(409).json({ error: `Checkout not allowed for status: ${invoice.status}` });
+        }
+
+        if (invoice.amount_cents <= 0) {
+            return res.status(400).json({ error: 'Invoice has no amount to pay' });
+        }
+
+        const stripe = getStripe();
+        if (!stripe) return res.status(503).json({ error: 'Stripe Unavailable' });
+
+        // Idempotency: avoid creating too many sessions for the same attempt
+        const idempotencyKey = `inv_checkout_${invoice.id}_${invoice.status}_${req.user.id}`;
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            customer: invoice.stripe_customer_id || undefined,
+            line_items: [{
+                price_data: {
+                    currency: (invoice.currency || 'usd').toLowerCase(),
+                    product_data: {
+                        name: `Weekly Invoice (${invoice.week_start} - ${invoice.week_end})`,
+                        description: `Usage for Company #${invoice.company_id}`
+                    },
+                    unit_amount: invoice.amount_cents
+                },
+                quantity: 1
+            }],
+            mode: 'payment',
+            metadata: {
+                invoice_id: invoice.id,
+                company_id: req.user.id,
+                type: 'weekly_invoice'
+            },
+            success_url: process.env.STRIPE_SUCCESS_URL || 'https://driverflow.app/billing/success',
+            cancel_url: process.env.STRIPE_CANCEL_URL || 'https://driverflow.app/billing/cancel',
+        }, { idempotencyKey });
+
+        // Save reference for tracking
+        await db.run("UPDATE weekly_invoices SET stripe_checkout_session_id=?, updated_at=? WHERE id=?",
+            session.id, nowIso(), invoice.id);
+
+        res.json({ ok: true, url: session.url, session_id: session.id });
+
+    } catch (e) {
+        console.error('Invoice Checkout Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 8. LEGACY / DEPRECATED ROUTES ---
 app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Deprecated. Use /apply_for_request' }));
 
