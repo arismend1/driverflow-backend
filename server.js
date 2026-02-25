@@ -3,6 +3,8 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const path = require('path');
+const { getStripe } = require('./stripe_client');
 
 // ⚠️ TIME AND ACCESS CONTROL IMPORTS
 const { nowIso, nowEpochMs } = require('./time_provider');
@@ -1429,6 +1431,112 @@ app.post('/admin/tickets/void', (req, res) => {
         if (err.message === 'NOT_FOUND') return res.status(404).json({ error: 'Ticket not found' });
         if (err.message === 'ALREADY_VOID') return res.status(400).json({ error: 'Ticket is already voided' });
         res.status(500).json({ error: err.message });
+    }
+});
+
+// --- RESTORED BILLING ENDPOINTS ---
+
+// 12. List Invoices (Company)
+app.get('/api/billing/invoices/me', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    try {
+        let limit = parseInt(req.query.limit) || 20;
+        if (limit > 100) limit = 100;
+        const offset = parseInt(req.query.offset) || 0;
+
+        const rows = db.prepare(`
+            SELECT id, billing_week, issue_date, total_cents, currency, status, created_at 
+            FROM invoices 
+            WHERE company_id = ? 
+            ORDER BY id DESC 
+            LIMIT ? OFFSET ?
+        `).all(req.user.id, limit, offset);
+        res.json(rows || []);
+    } catch (e) {
+        console.error('Invoices List Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 13. Get Invoice Detail (Company)
+app.get('/api/billing/invoices/:id', authenticateToken, (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const inv = db.prepare(`
+            SELECT * FROM invoices 
+            WHERE id = ? AND company_id = ?
+        `).get(req.params.id, req.user.id);
+
+        if (!inv) return res.status(404).json({ error: 'Not Found' });
+
+        const items = db.prepare(`
+            SELECT * FROM invoice_items WHERE invoice_id = ?
+        `).all(inv.id);
+
+        res.json({ ...inv, items });
+    } catch (e) {
+        console.error('Invoice Detail Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 14. Checkout for Invoice (Stripe Checkout)
+app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    const invId = req.params.id;
+
+    try {
+        const invoice = db.prepare(`
+            SELECT i.*, e.nombre as company_name 
+            FROM invoices i
+            JOIN empresas e ON i.company_id = e.id 
+            WHERE i.id = ? AND i.company_id = ?
+        `).get(invId, req.user.id);
+
+        if (!invoice) return res.status(404).json({ error: 'Invoice Not Found' });
+
+        if (invoice.status === 'paid') {
+            return res.status(409).json({ error: 'Invoice already paid' });
+        }
+
+        if (invoice.total_cents <= 0) {
+            return res.status(400).json({ error: 'Invoice has no amount to pay' });
+        }
+
+        const stripe = getStripe();
+        if (!stripe) return res.status(503).json({ error: 'Stripe Unavailable' });
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{
+                price_data: {
+                    currency: (invoice.currency || 'usd').toLowerCase(),
+                    product_data: {
+                        name: `DriverFlow Invoice - Week ${invoice.billing_week}`,
+                        description: `Usage for ${invoice.company_name}`
+                    },
+                    unit_amount: invoice.total_cents
+                },
+                quantity: 1
+            }],
+            mode: 'payment',
+            metadata: {
+                invoice_id: invoice.id,
+                company_id: req.user.id,
+                type: 'invoice_payment'
+            },
+            success_url: process.env.STRIPE_SUCCESS_URL || 'https://driverflow.app/billing/success',
+            cancel_url: process.env.STRIPE_CANCEL_URL || 'https://driverflow.app/billing/cancel',
+        });
+
+        // Save session ID for tracking
+        db.prepare("UPDATE invoices SET stripe_checkout_session_id = ? WHERE id = ?").run(session.id, invoice.id);
+
+        res.json({ ok: true, url: session.url, session_id: session.id });
+
+    } catch (e) {
+        console.error('Checkout Error', e);
+        res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
 
