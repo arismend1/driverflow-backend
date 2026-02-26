@@ -1202,13 +1202,13 @@ const updateCompanyRequirements = async (req, res) => {
         const params = [
             companyId,
             req_cdl ?? true,
-            db.IS_POSTGRES ? req_license_types : JSON.stringify(req_license_types || []),
-            db.IS_POSTGRES ? req_endorsements : JSON.stringify(req_endorsements || []),
-            db.IS_POSTGRES ? req_operation_types : JSON.stringify(req_operation_types || []),
-            db.IS_POSTGRES ? req_modalities : JSON.stringify(req_modalities || []),
+            JSON.stringify(req_license_types || []),
+            JSON.stringify(req_endorsements || []),
+            JSON.stringify(req_operation_types || []),
+            JSON.stringify(req_modalities || []),
             req_truck ?? false,
-            db.IS_POSTGRES ? offered_payment_methods : JSON.stringify(offered_payment_methods || []),
-            db.IS_POSTGRES ? req_relationships : JSON.stringify(req_relationships || []),
+            JSON.stringify(offered_payment_methods || []),
+            JSON.stringify(req_relationships || []),
             availability || 'Inmediata',
             req_experience_years || 0
         ];
