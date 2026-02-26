@@ -30,6 +30,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
         execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
         execSync('node migrate_fix_events.js', { stdio: 'inherit' });
+        execSync('node migrate_company_requirements.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1104,7 +1105,129 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
     }
 });
 
+
+// --- COMPANY REQUIREMENTS ---
+const getCompanyRequirements = async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden acceder' });
+
+    try {
+        const row = await db.get("SELECT * FROM company_requirements WHERE company_id = ?", req.user.id);
+
+        const defaults = {
+            req_cdl: true,
+            req_license_types: [],
+            req_endorsements: [],
+            req_operation_types: [],
+            req_modalities: [],
+            req_truck: false,
+            offered_payment_methods: [],
+            req_relationships: [],
+            availability: 'Inmediata',
+            req_experience_years: 0
+        };
+
+        if (!row) return res.json(defaults);
+
+        // Map and parse JSON fields if SQLite
+        const result = { ...row };
+        const jsonFields = [
+            'req_license_types', 'req_endorsements', 'req_operation_types',
+            'req_modalities', 'offered_payment_methods', 'req_relationships'
+        ];
+
+        if (!db.IS_POSTGRES) {
+            jsonFields.forEach(field => {
+                try {
+                    result[field] = typeof row[field] === 'string' ? JSON.parse(row[field]) : (row[field] || []);
+                } catch (e) {
+                    result[field] = [];
+                }
+            });
+        }
+
+        res.json(result);
+    } catch (e) {
+        console.error('Error fetching requirements:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+};
+
+const updateCompanyRequirements = async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden modificar' });
+
+    const companyId = req.user.id;
+    const {
+        req_cdl, req_license_types, req_endorsements, req_operation_types,
+        req_modalities, req_truck, offered_payment_methods, req_relationships,
+        availability, req_experience_years
+    } = req.body;
+
+    try {
+        const sql = db.IS_POSTGRES
+            ? `INSERT INTO company_requirements (
+                company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
+                req_modalities, req_truck, offered_payment_methods, req_relationships, 
+                availability, req_experience_years, updated_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+              ON CONFLICT (company_id) DO UPDATE SET
+                req_cdl=EXCLUDED.req_cdl,
+                req_license_types=EXCLUDED.req_license_types,
+                req_endorsements=EXCLUDED.req_endorsements,
+                req_operation_types=EXCLUDED.req_operation_types,
+                req_modalities=EXCLUDED.req_modalities,
+                req_truck=EXCLUDED.req_truck,
+                offered_payment_methods=EXCLUDED.offered_payment_methods,
+                req_relationships=EXCLUDED.req_relationships,
+                availability=EXCLUDED.availability,
+                req_experience_years=EXCLUDED.req_experience_years,
+                updated_at=CURRENT_TIMESTAMP`
+            : `INSERT INTO company_requirements (
+                company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
+                req_modalities, req_truck, offered_payment_methods, req_relationships, 
+                availability, req_experience_years, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+              ON CONFLICT(company_id) DO UPDATE SET
+                req_cdl=excluded.req_cdl,
+                req_license_types=excluded.req_license_types,
+                req_endorsements=excluded.req_endorsements,
+                req_operation_types=excluded.req_operation_types,
+                req_modalities=excluded.req_modalities,
+                req_truck=excluded.req_truck,
+                offered_payment_methods=excluded.offered_payment_methods,
+                req_relationships=excluded.req_relationships,
+                availability=excluded.availability,
+                req_experience_years=excluded.req_experience_years,
+                updated_at=CURRENT_TIMESTAMP`;
+
+        const params = [
+            companyId,
+            req_cdl ?? true,
+            db.IS_POSTGRES ? req_license_types : JSON.stringify(req_license_types || []),
+            db.IS_POSTGRES ? req_endorsements : JSON.stringify(req_endorsements || []),
+            db.IS_POSTGRES ? req_operation_types : JSON.stringify(req_operation_types || []),
+            db.IS_POSTGRES ? req_modalities : JSON.stringify(req_modalities || []),
+            req_truck ?? false,
+            db.IS_POSTGRES ? offered_payment_methods : JSON.stringify(offered_payment_methods || []),
+            db.IS_POSTGRES ? req_relationships : JSON.stringify(req_relationships || []),
+            availability || 'Inmediata',
+            req_experience_years || 0
+        ];
+
+        await db.run(sql, ...params);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Error updating requirements:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+};
+
+app.get('/api/companies/requirements', authenticateToken, getCompanyRequirements);
+app.put('/api/companies/requirements', authenticateToken, updateCompanyRequirements);
+app.get('/companies/requirements', authenticateToken, getCompanyRequirements);
+app.put('/companies/requirements', authenticateToken, updateCompanyRequirements);
+
 // --- 8. LEGACY / DEPRECATED ROUTES ---
+
 app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Deprecated. Use /apply_for_request' }));
 
 // --- 9. STARTUP ---
