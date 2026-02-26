@@ -31,6 +31,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
         execSync('node migrate_fix_events.js', { stdio: 'inherit' });
         execSync('node migrate_company_requirements.js', { stdio: 'inherit' });
+        execSync('node migrate_driver_profile.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1225,6 +1226,117 @@ app.get('/api/companies/requirements', authenticateToken, getCompanyRequirements
 app.put('/api/companies/requirements', authenticateToken, updateCompanyRequirements);
 app.get('/companies/requirements', authenticateToken, getCompanyRequirements);
 app.put('/companies/requirements', authenticateToken, updateCompanyRequirements);
+
+// --- DRIVER PROFILE ---
+app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Solo choferes pueden acceder' });
+
+    try {
+        const row = await db.get("SELECT * FROM drivers WHERE id = ?", req.user.id);
+        if (!row) return res.status(404).json({ error: 'Driver not found' });
+
+        const jsonFields = [
+            'license_types', 'endorsements', 'operation_types',
+            'job_preferences', 'payment_methods', 'work_relationships'
+        ];
+
+        const result = { ...row };
+        // Clean sensitive data
+        delete result.password_hash;
+        delete result.verification_token;
+        delete result.reset_token;
+
+        if (!db.IS_POSTGRES) {
+            jsonFields.forEach(field => {
+                try {
+                    result[field] = typeof row[field] === 'string' ? JSON.parse(row[field]) : (row[field] || []);
+                } catch (e) {
+                    result[field] = [];
+                }
+            });
+        }
+        res.json(result);
+    } catch (e) {
+        console.error('Error fetching driver profile:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Solo choferes pueden modificar' });
+
+    const driverId = req.user.id;
+    const {
+        has_cdl, license_types, endorsements, operation_types,
+        experience_years, experience_range, job_preferences,
+        has_truck, payment_methods, work_relationships
+    } = req.body;
+
+    try {
+        const sql = `UPDATE drivers SET 
+            has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
+            experience_years = ?, experience_range = ?, job_preferences = ?,
+            has_truck = ?, payment_methods = ?, work_relationships = ?,
+            updated_at = ?
+            WHERE id = ?`;
+
+        const params = [
+            +!!has_cdl,
+            JSON.stringify(license_types || []),
+            JSON.stringify(endorsements || []),
+            JSON.stringify(operation_types || []),
+            experience_years || 0,
+            experience_range || '',
+            JSON.stringify(job_preferences || []),
+            +!!has_truck,
+            JSON.stringify(payment_methods || []),
+            JSON.stringify(work_relationships || []),
+            nowIso(),
+            driverId
+        ];
+
+        await db.run(sql, ...params);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Error updating driver profile:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+// --- DRIVER TICKETS ---
+app.get('/api/tickets/my', authenticateToken, async (req, res) => {
+    // Both drivers and empresas might want to see their own tickets, but for drivers it's matches.
+    const isDriver = req.user.type === 'driver';
+    const isEmpresa = req.user.type === 'empresa';
+
+    try {
+        let sql = `
+            SELECT t.*, e.nombre as company_name, d.nombre as driver_name 
+            FROM tickets t
+            LEFT JOIN empresas e ON t.company_id = e.id
+            LEFT JOIN drivers d ON t.driver_id = d.id
+        `;
+        if (isDriver) {
+            sql += ` WHERE t.driver_id = ?`;
+        } else if (isEmpresa) {
+            sql += ` WHERE t.company_id = ?`;
+        } else {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        sql += ` ORDER BY t.created_at DESC LIMIT 100`;
+
+        const rows = await db.all(sql, req.user.id);
+        res.json(rows || []);
+    } catch (e) {
+        console.error('Error fetching tickets:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+// Alias for tickets/my if app uses it
+app.get('/tickets/my', authenticateToken, async (req, res) => {
+    res.redirect(307, '/api/tickets/my');
+});
 
 // --- 8. LEGACY / DEPRECATED ROUTES ---
 
