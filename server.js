@@ -101,11 +101,11 @@ app.use((req, res, next) => {
     const rid = req.headers['x-request-id'] || crypto.randomUUID();
     req.requestId = rid;
     res.setHeader('X-Request-Id', rid);
-    res.setHeader('X-App-Version', '1.3.0-fix-profile');
+    res.setHeader('X-App-Version', '1.3.1-fix-json');
     next();
 });
 
-console.log("[SERVER] Starting Version: 1.3.0-fix-profile");
+console.log("[SERVER] Starting Version: 1.3.1-fix-json");
 
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
@@ -1266,40 +1266,78 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     }
 });
 
+function safeJson(value) {
+    if (value === undefined || value === null) return [];
+    if (Array.isArray(value) || (typeof value === 'object' && value !== null)) return value;
+    if (typeof value === 'string') {
+        if (value === '') return [];
+        if (value.startsWith('[') || value.startsWith('{')) {
+            try { return JSON.parse(value); } catch (e) { return []; }
+        }
+    }
+    return [];
+}
+
 app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Solo choferes pueden modificar' });
 
     const driverId = req.user.id;
+    const body = req.body;
+    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD KEYS:", Object.keys(body).join(', '));
+
     const {
         has_cdl, license_types, endorsements, operation_types,
         experience_years, job_preferences,
         has_truck, payment_methods, work_relationships
-    } = req.body;
+    } = body;
 
     try {
-        const sql = `UPDATE drivers SET 
-            has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
-            experience_years = ?, job_preferences = ?,
-            has_truck = ?, payment_methods = ?, work_relationships = ?,
-            updated_at = ?
-            WHERE id = ?`;
+        let sql, params;
 
-        const params = [
-            +!!has_cdl,
-            JSON.stringify(license_types || []),
-            JSON.stringify(endorsements || []),
-            JSON.stringify(operation_types || []),
-            experience_years || 0,
-            JSON.stringify(job_preferences || []),
-            +!!has_truck,
-            JSON.stringify(payment_methods || []),
-            JSON.stringify(work_relationships || []),
-            nowIso(),
-            driverId
-        ];
+        if (db.IS_POSTGRES) {
+            sql = `UPDATE drivers SET 
+                has_cdl = ?, license_types = ?::jsonb, endorsements = ?::jsonb, operation_types = ?::jsonb,
+                experience_years = ?, job_preferences = ?::jsonb,
+                has_truck = ?, payment_methods = ?::jsonb, work_relationships = ?::jsonb,
+                updated_at = ?
+                WHERE id = ?`;
+            params = [
+                !!has_cdl, // Native boolean
+                JSON.stringify(safeJson(license_types)),
+                JSON.stringify(safeJson(endorsements)),
+                JSON.stringify(safeJson(operation_types)),
+                experience_years || 0,
+                JSON.stringify(safeJson(job_preferences)),
+                !!has_truck, // Native boolean
+                JSON.stringify(safeJson(payment_methods)),
+                JSON.stringify(safeJson(work_relationships)),
+                nowIso(),
+                driverId
+            ];
+        } else {
+            sql = `UPDATE drivers SET 
+                has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
+                experience_years = ?, job_preferences = ?,
+                has_truck = ?, payment_methods = ?, work_relationships = ?,
+                updated_at = ?
+                WHERE id = ?`;
+            params = [
+                +!!has_cdl, // 1/0 for SQLite
+                JSON.stringify(safeJson(license_types)),
+                JSON.stringify(safeJson(endorsements)),
+                JSON.stringify(safeJson(operation_types)),
+                experience_years || 0,
+                JSON.stringify(safeJson(job_preferences)),
+                +!!has_truck, // 1/0 for SQLite
+                JSON.stringify(safeJson(payment_methods)),
+                JSON.stringify(safeJson(work_relationships)),
+                nowIso(),
+                driverId
+            ];
+        }
 
         console.log("[DRIVER_PROFILE][PUT] sql", sql);
-        console.log("[DRIVER_PROFILE][PUT] params", params);
+        console.log("[DRIVER_PROFILE][PUT] params (scrubbed)", params.map(p => typeof p === 'string' && p.length > 50 ? p.slice(0, 50) + '...' : p));
 
         await db.run(sql, ...params);
         res.json({ ok: true });
