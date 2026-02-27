@@ -1295,11 +1295,14 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
             driverId
         ];
 
+        console.log("[DRIVER_PROFILE][PUT] sql", sql);
+        console.log("[DRIVER_PROFILE][PUT] params", params);
+
         await db.run(sql, ...params);
         res.json({ ok: true });
     } catch (e) {
-        console.error('Error updating driver profile:', e.message);
-        res.status(500).json({ error: 'Server Error' });
+        console.error("[DRIVER_PROFILE][PUT] ERROR", e);
+        res.status(500).json({ error: e.message, code: "DRIVER_PROFILE_PUT_FAILED" });
     }
 });
 
