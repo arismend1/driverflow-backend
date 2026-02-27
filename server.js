@@ -101,8 +101,11 @@ app.use((req, res, next) => {
     const rid = req.headers['x-request-id'] || crypto.randomUUID();
     req.requestId = rid;
     res.setHeader('X-Request-Id', rid);
+    res.setHeader('X-App-Version', '1.3.0-fix-profile');
     next();
 });
+
+console.log("[SERVER] Starting Version: 1.3.0-fix-profile");
 
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
