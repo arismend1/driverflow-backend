@@ -1245,6 +1245,7 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
         delete result.password_hash;
         delete result.verification_token;
         delete result.reset_token;
+        delete result.experience_range;
 
         if (!db.IS_POSTGRES) {
             jsonFields.forEach(field => {
@@ -1268,14 +1269,14 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
     const driverId = req.user.id;
     const {
         has_cdl, license_types, endorsements, operation_types,
-        experience_years, experience_range, job_preferences,
+        experience_years, job_preferences,
         has_truck, payment_methods, work_relationships
     } = req.body;
 
     try {
         const sql = `UPDATE drivers SET 
             has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
-            experience_years = ?, experience_range = ?, job_preferences = ?,
+            experience_years = ?, job_preferences = ?,
             has_truck = ?, payment_methods = ?, work_relationships = ?,
             updated_at = ?
             WHERE id = ?`;
@@ -1286,7 +1287,6 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
             JSON.stringify(endorsements || []),
             JSON.stringify(operation_types || []),
             experience_years || 0,
-            experience_range || '',
             JSON.stringify(job_preferences || []),
             +!!has_truck,
             JSON.stringify(payment_methods || []),
