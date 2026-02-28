@@ -1249,7 +1249,6 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
         delete result.password_hash;
         delete result.verification_token;
         delete result.reset_token;
-        delete result.experience_range;
 
         if (!db.IS_POSTGRES) {
             jsonFields.forEach(field => {
@@ -1260,6 +1259,14 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
                 }
             });
         }
+
+        // Safety Guarantee: Force all JSON fields to be arrays to prevent React Native .includes() crash
+        jsonFields.forEach(field => {
+            if (!Array.isArray(result[field])) {
+                result[field] = [];
+            }
+        });
+
         res.json(result);
     } catch (e) {
         console.error('Error fetching driver profile:', e.message);
@@ -1314,7 +1321,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 JSON.stringify(safeJson(endorsements, [])),
                 JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
-                JSON.stringify(safeJson(job_preferences, {})), // Assuming job_preferences is an object, if array change fallback
+                JSON.stringify(safeJson(job_preferences, [])),
                 !!has_truck, // Native boolean
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
@@ -1334,7 +1341,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 JSON.stringify(safeJson(endorsements, [])),
                 JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
-                JSON.stringify(safeJson(job_preferences, {})),
+                JSON.stringify(safeJson(job_preferences, [])),
                 +!!has_truck, // 1/0 for SQLite
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
@@ -1404,7 +1411,7 @@ const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.4-db-schema-fixed', status: 'deploy-verified' });
+    res.json({ version: '1.3.5-profile-crash-fix', status: 'deploy-verified' });
 });
 
 app.listen(PORT, () => {
