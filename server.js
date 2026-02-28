@@ -1266,16 +1266,21 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     }
 });
 
-function safeJson(value) {
-    if (value === undefined || value === null) return [];
-    if (Array.isArray(value) || (typeof value === 'object' && value !== null)) return value;
+function safeJson(value, fallback = []) {
+    if (value === undefined || value === null) return fallback;
+    let parsed = value;
     if (typeof value === 'string') {
-        if (value === '') return [];
-        if (value.startsWith('[') || value.startsWith('{')) {
-            try { return JSON.parse(value); } catch (e) { return []; }
+        const trimmed = value.trim();
+        if (trimmed === '') return fallback;
+        if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+            try { parsed = JSON.parse(trimmed); } catch (e) { return fallback; }
         }
     }
-    return [];
+    if (Array.isArray(fallback)) {
+        return Array.isArray(parsed) ? parsed : fallback;
+    } else {
+        return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : fallback;
+    }
 }
 
 app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
@@ -1283,7 +1288,8 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
 
     const driverId = req.user.id;
     const body = req.body;
-    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD KEYS:", Object.keys(body).join(', '));
+    const { token, password, ...safePayload } = body;
+    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD:", JSON.stringify(safePayload));
 
     const {
         has_cdl, license_types, endorsements, operation_types,
@@ -1303,14 +1309,14 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 WHERE id = ?`;
             params = [
                 !!has_cdl, // Native boolean
-                JSON.stringify(safeJson(license_types)),
-                JSON.stringify(safeJson(endorsements)),
-                JSON.stringify(safeJson(operation_types)),
+                JSON.stringify(safeJson(license_types, [])),
+                JSON.stringify(safeJson(endorsements, [])),
+                JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
-                JSON.stringify(safeJson(job_preferences)),
+                JSON.stringify(safeJson(job_preferences, {})), // Assuming job_preferences is an object, if array change fallback
                 !!has_truck, // Native boolean
-                JSON.stringify(safeJson(payment_methods)),
-                JSON.stringify(safeJson(work_relationships)),
+                JSON.stringify(safeJson(payment_methods, [])),
+                JSON.stringify(safeJson(work_relationships, [])),
                 nowIso(),
                 driverId
             ];
@@ -1323,21 +1329,21 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 WHERE id = ?`;
             params = [
                 +!!has_cdl, // 1/0 for SQLite
-                JSON.stringify(safeJson(license_types)),
-                JSON.stringify(safeJson(endorsements)),
-                JSON.stringify(safeJson(operation_types)),
+                JSON.stringify(safeJson(license_types, [])),
+                JSON.stringify(safeJson(endorsements, [])),
+                JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
-                JSON.stringify(safeJson(job_preferences)),
+                JSON.stringify(safeJson(job_preferences, {})),
                 +!!has_truck, // 1/0 for SQLite
-                JSON.stringify(safeJson(payment_methods)),
-                JSON.stringify(safeJson(work_relationships)),
+                JSON.stringify(safeJson(payment_methods, [])),
+                JSON.stringify(safeJson(work_relationships, [])),
                 nowIso(),
                 driverId
             ];
         }
 
-        console.log("[DRIVER_PROFILE][PUT] sql", sql);
-        console.log("[DRIVER_PROFILE][PUT] params (scrubbed)", params.map(p => typeof p === 'string' && p.length > 50 ? p.slice(0, 50) + '...' : p));
+        console.log("[DRIVER_PROFILE][PUT] EXECUTING SQL:", sql);
+        console.log("[DRIVER_PROFILE][PUT] WITH PARAMS:", JSON.stringify(params));
 
         await db.run(sql, ...params);
         res.json({ ok: true });
