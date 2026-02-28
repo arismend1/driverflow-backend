@@ -1349,7 +1349,12 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         res.json({ ok: true });
     } catch (e) {
         console.error("[DRIVER_PROFILE][PUT] ERROR", e);
-        const detailedMessage = `ERROR: ${e.message} \nDETAIL: ${e.detail} \nHINT: ${e.hint} \nPARAMS: ${JSON.stringify(params).slice(0, 150)}`;
+        let detailedMessage = 'Unknown SQL Error';
+        try {
+            detailedMessage = `ERROR: ${e ? e.message : 'No Msg'} \nDETAIL: ${e ? e.detail : 'No Detail'} \nHINT: ${e ? e.hint : 'No Hint'} \nPARAMS: ${params ? JSON.stringify(params).slice(0, 150) : 'Params Undefined'}`;
+        } catch (err) {
+            detailedMessage = `Crash extracting error: ${err.message}`;
+        }
         res.status(500).json({ error: detailedMessage, code: "DRIVER_PROFILE_PUT_FAILED" });
     }
 });
@@ -1398,7 +1403,7 @@ const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.2-debug-profile', status: 'deploy-verified' });
+    res.json({ version: '1.3.3-safe-error', status: 'deploy-verified' });
 });
 
 app.listen(PORT, () => {
