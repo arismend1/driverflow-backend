@@ -1396,6 +1396,10 @@ app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Dep
 const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
+app.get('/api/diagnostics/version', (req, res) => {
+    res.json({ version: '1.3.1-fix-json', status: 'deploy-verified' });
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
     console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
