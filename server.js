@@ -32,6 +32,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_fix_events.js', { stdio: 'inherit' });
         execSync('node migrate_company_requirements.js', { stdio: 'inherit' });
         execSync('node migrate_driver_profile.js', { stdio: 'inherit' });
+        execSync('node migrate_fix_profile_columns.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1403,7 +1404,7 @@ const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.3-safe-error', status: 'deploy-verified' });
+    res.json({ version: '1.3.4-db-schema-fixed', status: 'deploy-verified' });
 });
 
 app.listen(PORT, () => {

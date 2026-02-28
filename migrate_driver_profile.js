@@ -30,7 +30,9 @@ async function migrate() {
             // If it's Postgres, we use a different check if needed.
             if (db.IS_POSTGRES) {
                 try {
-                    await db.run(`ALTER TABLE drivers ADD COLUMN ${col.name} ${col.type === 'TEXT' ? 'JSONB' : col.type} DEFAULT ${col.dflt}`);
+                    const isJsonb = ['license_types', 'endorsements', 'operation_types', 'job_preferences', 'payment_methods', 'work_relationships'].includes(col.name);
+                    const pgType = isJsonb ? 'JSONB' : col.type;
+                    await db.run(`ALTER TABLE drivers ADD COLUMN ${col.name} ${pgType} DEFAULT ${col.dflt}`);
                 } catch (pgErr) {
                     if (!pgErr.message.includes('already exists')) {
                         console.error(`[MIGRATION] Failed to add ${col.name}:`, pgErr.message);
