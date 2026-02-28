@@ -592,6 +592,23 @@ app.post('/reset_password', async (req, res) => {
     }
 });
 
+app.post('/api/company/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can toggle search status' });
+
+    const { status } = req.body;
+    if (status !== 'ON' && status !== 'OFF') {
+        return res.status(400).json({ error: 'Invalid status. Must be ON or OFF.' });
+    }
+
+    try {
+        await db.run('UPDATE empresas SET search_status = ? WHERE id = ?', status, req.user.id);
+        res.json({ ok: true, search_status: status });
+    } catch (e) {
+        console.error('Toggle Search Status Error:', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
 // Reset Web UI (Simple HTML)
 app.get('/reset-password-web', (req, res) => {
     const token = req.query.token;
