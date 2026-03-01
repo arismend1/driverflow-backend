@@ -1513,6 +1513,7 @@ app.get('/api/diagnostics/version', (req, res) => {
 // GET /matches/candidates — Company sees matched drivers
 app.get('/matches/candidates', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can view candidates' });
+    console.log(`[Matches] /matches/candidates called by company_id=${req.user.id} type=${req.user.type}`);
     try {
         const rows = await db.all(`
             SELECT
@@ -1530,9 +1531,10 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             FROM potential_matches pm
             JOIN drivers d ON d.id = pm.driver_id
             WHERE pm.company_id = ?
-              AND pm.status = 'NEW'
+              AND pm.status != 'DECLINED'
             ORDER BY pm.created_at DESC
         `, req.user.id);
+        console.log(`[Matches] /matches/candidates returning ${rows.length} rows for company_id=${req.user.id}`);
         res.json(rows);
     } catch (e) {
         console.error('[Matches] /matches/candidates error:', e.message);
@@ -1543,6 +1545,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
 // GET /matches/opportunities — Driver sees matched companies
 app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can view opportunities' });
+    console.log(`[Matches] /matches/opportunities called by driver_id=${req.user.id} type=${req.user.type}`);
     try {
         const rows = await db.all(`
             SELECT
@@ -1559,9 +1562,10 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = e.id
             WHERE pm.driver_id = ?
-              AND pm.status = 'NEW'
+              AND pm.status != 'DECLINED'
             ORDER BY pm.created_at DESC
         `, req.user.id);
+        console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${req.user.id}`);
         res.json(rows);
     } catch (e) {
         console.error('[Matches] /matches/opportunities error:', e.message);
