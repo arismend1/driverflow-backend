@@ -382,7 +382,13 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
 
     try {
-        const row = await db.get(`SELECT * FROM ${table} WHERE LOWER(contacto) = LOWER(?)`, contacto);
+        // ORDER BY id ASC: when duplicate emails exist, always use the oldest (canonical) account.
+        // Without ORDER BY, Postgres returns non-deterministic rows which causes company_id mismatch.
+        const rows = await db.all(`SELECT * FROM ${table} WHERE LOWER(contacto) = LOWER(?) ORDER BY id ASC`, contacto);
+        if (rows.length > 1) {
+            console.warn(`[Login] WARNING: ${rows.length} duplicate accounts for contacto="${contacto}" in ${table}. Using id=${rows[0].id} (oldest).`);
+        }
+        const row = rows.length > 0 ? rows[0] : null;
 
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
