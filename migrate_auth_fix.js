@@ -112,13 +112,15 @@ const schema = [
             await addColumn(item.table, item.col, item.type, item.def);
         }
 
-        // 3. Auto-Patch Historic Currency Displays
-        try {
-            await db.run("UPDATE billing_invoices SET currency = 'usd'");
-            await db.run("UPDATE tickets SET currency = 'usd'");
-            console.log("✅ Successfully patched legacy MXN records to USD.");
-        } catch (e) {
-            console.log("ℹ️ Skipping currency patch (Tables might not exist yet).");
+        // 3. Auto-Patch Historic Currency Displays (weekly_invoices is the real table name)
+        const currencyTables = ['weekly_invoices', 'tickets'];
+        for (const tbl of currencyTables) {
+            try {
+                await db.run(`UPDATE ${tbl} SET currency = 'usd' WHERE currency IS NULL OR currency = 'mxn' OR currency = 'MXN'`);
+                console.log(`✅ Patched ${tbl} currency to USD.`);
+            } catch (e) {
+                console.log(`ℹ️ Skipping currency patch for ${tbl} (may not exist yet): ${e.message}`);
+            }
         }
 
         if (migrationError) {

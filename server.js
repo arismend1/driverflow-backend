@@ -1233,30 +1233,56 @@ app.put('/api/companies/requirements', authenticateToken, updateCompanyRequireme
 app.get('/companies/requirements', authenticateToken, getCompanyRequirements);
 app.put('/companies/requirements', authenticateToken, updateCompanyRequirements);
 
-app.post('/api/company/search_status', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can modify their search status' });
-    const { status } = req.body;
-    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
-
+// GET company search_status (reads from empresas table directly)
+app.get('/api/company/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can access' });
     try {
-        await db.run("UPDATE empresas SET search_status = ? WHERE id = ?", status, req.user.id);
+        const row = await db.get("SELECT search_status FROM empresas WHERE id = ?", req.user.id);
+        const status = row ? (row.search_status || 'ON') : 'ON';
         res.json({ ok: true, status });
     } catch (e) {
-        console.error('Error actualizando search_status:', e.message);
+        console.error('Error fetching company search_status:', e.message);
         res.status(500).json({ error: 'Server Error' });
     }
 });
 
+// POST to update company search_status
+app.post('/api/company/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can modify their search status' });
+    const { status } = req.body;
+    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
+    try {
+        await db.run("UPDATE empresas SET search_status = ? WHERE id = ?", status, req.user.id);
+        res.json({ ok: true, status });
+    } catch (e) {
+        console.error('Error updating company search_status:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+// GET driver search_status (reads from drivers table directly)
+app.get('/api/driver/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can access' });
+    try {
+        const row = await db.get("SELECT search_status FROM drivers WHERE id = ?", req.user.id);
+        const status = row ? (row.search_status || 'ON') : 'ON';
+        res.json({ ok: true, status });
+    } catch (e) {
+        console.error('Error fetching driver search_status:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+// POST to update driver search_status
 app.post('/api/driver/search_status', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can modify their search status' });
     const { status } = req.body;
     if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
-
     try {
         await db.run("UPDATE drivers SET search_status = ? WHERE id = ?", status, req.user.id);
         res.json({ ok: true, status });
     } catch (e) {
-        console.error('Error actualizando search_status chofer:', e.message);
+        console.error('Error updating driver search_status:', e.message);
         res.status(500).json({ error: 'Server Error' });
     }
 });
