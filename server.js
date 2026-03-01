@@ -1508,7 +1508,71 @@ app.get('/api/diagnostics/version', (req, res) => {
     res.json({ version: '1.3.5-profile-crash-fix', status: 'deploy-verified' });
 });
 
+// ─── MATCHES READER ENDPOINTS ───────────────────────────────────────────────
+
+// GET /matches/candidates — Company sees matched drivers
+app.get('/matches/candidates', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can view candidates' });
+    try {
+        const rows = await db.all(`
+            SELECT
+                pm.id           AS match_id,
+                pm.match_score,
+                pm.status,
+                pm.created_at,
+                d.id            AS driver_id,
+                d.nombre        AS display_name,
+                d.experience_years,
+                d.license_types AS license_summ,
+                d.operation_types AS op_types,
+                d.payment_methods AS pay_methods,
+                d.availability
+            FROM potential_matches pm
+            JOIN drivers d ON d.id = pm.driver_id
+            WHERE pm.company_id = ?
+              AND pm.status = 'NEW'
+            ORDER BY pm.created_at DESC
+        `, req.user.id);
+        res.json(rows);
+    } catch (e) {
+        console.error('[Matches] /matches/candidates error:', e.message);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /matches/opportunities — Driver sees matched companies
+app.get('/matches/opportunities', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can view opportunities' });
+    try {
+        const rows = await db.all(`
+            SELECT
+                pm.id           AS match_id,
+                pm.match_score,
+                pm.status,
+                pm.created_at,
+                e.id            AS company_id,
+                e.nombre        AS display_name,
+                cr.req_operation_types AS op_types,
+                cr.offered_payment_methods AS pay_methods,
+                cr.availability
+            FROM potential_matches pm
+            JOIN empresas e ON e.id = pm.company_id
+            LEFT JOIN company_requirements cr ON cr.company_id = e.id
+            WHERE pm.driver_id = ?
+              AND pm.status = 'NEW'
+            ORDER BY pm.created_at DESC
+        `, req.user.id);
+        res.json(rows);
+    } catch (e) {
+        console.error('[Matches] /matches/opportunities error:', e.message);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 app.listen(PORT, () => {
+
     console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
     console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
 });
