@@ -1,132 +1,127 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+/**
+ * run_matching.js
+ *
+ * Matching scheduler script. Called via: exec('node run_matching.js')
+ * in worker_queue.js every 5 minutes.
+ *
+ * FIX (2026-03-01): Removed better-sqlite3 entirely.
+ * Now uses db_adapter which handles both Postgres (production/Render)
+ * and SQLite (local dev) transparently via async API.
+ */
 
-// 1. Resolve DB Path
-const dbPathRaw = process.env.DB_PATH || 'driverflow.db';
-const dbPath = path.resolve(dbPathRaw);
+const db = require('./db_adapter');
 
-// 2. SAFETY GUARD: Prevent Accidental Production Usage
-const normalizedPath = dbPath.toLowerCase().replace(/\//g, '\\');
-const isProdPath = normalizedPath.includes('\\driverflow\\data\\') || normalizedPath.endsWith('\\driverflow_prod.db');
-const env = (process.env.NODE_ENV || 'development').trim().toLowerCase();
-const isProdEnv = env === 'production' || env === 'prod';
-
-if (isProdPath && !isProdEnv) {
-    console.error(`
-❌ FATAL: SAFETY GUARD TRIGGERED
----------------------------------------------------
-You are attempting to modify a PRODUCTION database:
-  ${dbPath}
-But NODE_ENV is NOT set to 'production' (Current: '${env}').
-
-ABORTING to prevent accidental data corruption.
-To bypass, set NODE_ENV="production".
----------------------------------------------------
-    `);
-    process.exit(1);
+// GUARDRAIL: If neither DATABASE_URL (Postgres) nor DB_PATH (SQLite) is configured,
+// skip silently instead of crashing.
+if (!process.env.DATABASE_URL && !process.env.DB_PATH) {
+    // Check if the default driverflow.db exists locally
+    const fs = require('fs');
+    const path = require('path');
+    const defaultPath = path.resolve('driverflow.db');
+    if (!fs.existsSync(defaultPath)) {
+        console.log('[Scheduler] Matching skipped: no DB configured');
+        process.exit(0);
+    }
 }
-
-const db = new Database(dbPath);
 
 const nowIso = () => new Date().toISOString();
 
-console.log(`--- Running Matching Logic [DB: ${dbPath}] ---`);
+async function runMatching() {
+    console.log('--- Running Matching Logic ---');
 
-try {
-    // 1. Fetch Eligible Companies (ON + Unblocked)
-    // We also need their match prefs
-    // Note: account_state is not strictly filtered by user req, but 'is_blocked=0' is mandatory.
-    // 'search_status' must be 'ON'.
-    const companies = db.prepare(`
+    // 1. Fetch eligible companies (search_status = ON)
+    // Uses the new English-column schema (company_requirements) for matching prefs.
+    const companies = await db.all(`
         SELECT e.id, e.nombre, e.contacto,
-               mp.req_license, mp.req_experience, mp.req_team_driving, mp.req_start, mp.req_restrictions
+               cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
+               cr.req_operation_types, cr.req_modalities, cr.req_truck,
+               cr.offered_payment_methods, cr.req_relationships, cr.availability
         FROM empresas e
-        JOIN company_match_prefs mp ON e.id = mp.company_id
-        WHERE e.search_status = 'ON' 
-          AND e.is_blocked = 0
-    `).all();
+        LEFT JOIN company_requirements cr ON e.id = cr.company_id
+        WHERE e.search_status = 'ON'
+    `);
 
-    // 2. Fetch Eligible Drivers (ON + Available)
-    // 'estado'='DISPONIBLE' and 'search_status'='ON'
-    const drivers = db.prepare(`
-        SELECT id, nombre, tipo_licencia, experience_level, team_driving, available_start, restrictions 
+    // 2. Fetch eligible drivers (search_status = ON)
+    const drivers = await db.all(`
+        SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
+               operation_types, job_preferences, has_truck, payment_methods,
+               work_relationships, availability, search_status
         FROM drivers
-        WHERE search_status = 'ON' 
-          AND estado = 'DISPONIBLE'
-    `).all();
+        WHERE search_status = 'ON'
+    `);
 
     console.log(`Found ${companies.length} eligible companies and ${drivers.length} eligible drivers.`);
 
+    const nowStr = nowIso();
     let newMatchesCount = 0;
 
-    // 3. Matching Loop
-    const insertMatch = db.prepare(`
-        INSERT OR IGNORE INTO potential_matches (company_id, driver_id, match_score, status, created_at)
-        VALUES (?, ?, ?, 'NEW', ?)
-    `);
+    // 3. Matching loop
+    for (const co of companies) {
+        for (const dr of drivers) {
+            // RULE 1: CDL required
+            if (co.req_cdl && !dr.has_cdl) continue;
 
-    const insertEvent = db.prepare(`
-        INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
-        VALUES (?, ?, ?, ?, ?, ?)
-    `);
+            // RULE 2: Truck required
+            if (co.req_truck && !dr.has_truck) continue;
 
-    db.transaction(() => {
-        for (const co of companies) {
-            for (const dr of drivers) {
-                // RULE 1: License (Strict)
-                if (co.req_license !== 'Any' && co.req_license !== dr.tipo_licencia) continue;
+            // RULE 3: Experience
+            if (co.req_experience_years > 0 && (dr.experience_years || 0) < co.req_experience_years) continue;
 
-                // RULE 2: Experience (Strict)
-                if (co.req_experience !== 'Any' && co.req_experience !== dr.experience_level) continue;
+            // Passed all rules — calculate score
+            const matchScore = 1;
 
-                // RULE 3: Team Driving
-                if (co.req_team_driving === 'Team' && dr.team_driving !== 'YES') continue;
-                if (co.req_team_driving === 'Solo' && dr.team_driving !== 'NO') continue;
+            // INSERT OR IGNORE equivalent: catch unique constraint violation silently
+            try {
+                const result = await db.run(
+                    `INSERT INTO potential_matches (company_id, driver_id, match_score, status, created_at)
+                     VALUES (?, ?, ?, 'NEW', ?)
+                     ON CONFLICT (company_id, driver_id) DO NOTHING`,
+                    co.id, dr.id, matchScore, nowStr
+                );
 
-                // RULE 4: Start
-                if (co.req_start === 'Now' && dr.available_start !== 'NOW') continue;
+                // Emit outbox events only if the row was actually inserted
+                // (rowCount > 0 in Postgres, changes > 0 in SQLite)
+                const wasInserted = (result.rowCount > 0) || (result.changes > 0);
 
-                // RULE 5: Restrictions
-                if (co.req_restrictions === 'Yes' && dr.restrictions !== 'YES') continue;
-
-                // MATCH FOUND -> Score = 1
-                const matchScore = 1;
-                const nowStr = nowIso();
-
-                // 1. Insert Match
-                const info = insertMatch.run(co.id, dr.id, matchScore, nowStr);
-
-                if (info.changes > 0) {
+                if (wasInserted) {
                     newMatchesCount++;
 
-                    // 2. Emit Events (CRITICAL: request_id = NULL)
-                    // For Company
-                    insertEvent.run(
+                    // Company notification event
+                    await db.run(
+                        `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
+                         VALUES (?, ?, ?, ?, NULL, ?)`,
                         'potential_match_company',
                         nowStr,
                         co.id,
-                        null,      // driver_id (optional here, schema has it, good to link)
-                        null,      // request_id (EXPLICIT NULL)
-                        JSON.stringify({ driver_id: dr.id, summary: `Lic: ${dr.tipo_licencia}, Exp: ${dr.experience_level}` })
+                        dr.id,
+                        JSON.stringify({ driver_id: dr.id, summary: `Match found for company ${co.id}` })
                     );
 
-                    // For Driver
-                    insertEvent.run(
+                    // Driver notification event
+                    await db.run(
+                        `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
+                         VALUES (?, ?, ?, ?, NULL, ?)`,
                         'potential_match_driver',
                         nowStr,
-                        null,      // company_id (optional here)
+                        co.id,
                         dr.id,
-                        null,      // request_id (EXPLICIT NULL)
-                        JSON.stringify({ company_id: co.id, summary: `Company searching for ${co.req_license} drivers` })
+                        JSON.stringify({ company_id: co.id, summary: `Match found for driver ${dr.id}` })
                     );
                 }
+            } catch (insertErr) {
+                // Log but don't abort: a single failed insert shouldn't kill the whole run
+                console.error(`[Scheduler] Insert error for (${co.id}, ${dr.id}):`, insertErr.message);
             }
         }
-    })();
+    }
 
     console.log(`✅ Matching run complete. Generated ${newMatchesCount} new potential matches.`);
-
-} catch (e) {
-    console.error('❌ Matching run failed:', e);
-    process.exit(1);
+    db.close();
+    process.exit(0);
 }
+
+runMatching().catch(err => {
+    console.error('❌ Matching run failed:', err.message);
+    db.close();
+    process.exit(1);
+});
