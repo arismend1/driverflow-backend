@@ -387,7 +387,7 @@ app.post('/login', async (req, res) => {
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
             await auditLog('login_failed', 'unknown', contacto, { reason: 'not_found' }, req);
-            return res.status(401).json({ error: 'Credenciales inválidas' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         // Lockout Check
@@ -462,15 +462,15 @@ app.post('/register', async (req, res) => {
                 nombre, contacto, hash, extras.tipo_licencia || 'B', now, token, expires);
             newId = result.lastInsertRowid;
 
-            await db.run(`INSERT INTO events_outbox (event_name, created_at, driver_id, metadata) VALUES (?,?,?,?)`,
-                'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
+            await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
+                req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         } else {
             const result = await db.run(`INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,false,?,?,?)`,
                 nombre, contacto, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
             newId = result.lastInsertRowid;
 
-            await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?,?,?,?)`,
-                'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
+            await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?,?,?,?,?)`,
+                req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
 
         res.json({ ok: true, message: 'Registered. Please check your email to verify.' });
@@ -593,24 +593,7 @@ app.post('/reset_password', async (req, res) => {
     }
 });
 
-app.post('/api/company/search_status', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can toggle search status' });
-
-    const { status } = req.body;
-    if (status !== 'ON' && status !== 'OFF') {
-        return res.status(400).json({ error: 'Invalid status. Must be ON or OFF.' });
-    }
-
-    try {
-        await db.run('UPDATE empresas SET search_status = ? WHERE id = ?', status, req.user.id);
-        res.json({ ok: true, search_status: status });
-    } catch (e) {
-        console.error('Toggle Search Status Error:', e);
-        res.status(500).json({ error: 'Server Error' });
-    }
-});
-
-// Reset Web UI (Simple HTML)
+// Removed duplicate search_status endpoint here; true implementation is at line 1262.// Reset Web UI (Simple HTML)
 app.get('/reset-password-web', (req, res) => {
     const token = req.query.token;
     if (!token) return res.status(400).send('Token missing');
@@ -1131,7 +1114,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
 
 // --- COMPANY REQUIREMENTS ---
 const getCompanyRequirements = async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden acceder' });
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can access' });
 
     try {
         const row = await db.get("SELECT * FROM company_requirements WHERE company_id = ?", req.user.id);
@@ -1176,7 +1159,7 @@ const getCompanyRequirements = async (req, res) => {
 };
 
 const updateCompanyRequirements = async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden modificar' });
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can modify' });
 
     const companyId = req.user.id;
     const {
@@ -1184,6 +1167,16 @@ const updateCompanyRequirements = async (req, res) => {
         req_modalities, req_truck, offered_payment_methods, req_relationships,
         availability, req_experience_years
     } = req.body;
+
+    const safeJson = (val) => Array.isArray(val) ? JSON.stringify(val) : (typeof val === 'string' ? val : JSON.stringify(val || []));
+
+    const p_req_license_types = safeJson(req_license_types);
+    const p_req_endorsements = safeJson(req_endorsements);
+    const p_req_operation_types = safeJson(req_operation_types);
+    const p_req_modalities = safeJson(req_modalities);
+    const p_offered_payment_methods = safeJson(offered_payment_methods);
+    const p_req_relationships = safeJson(req_relationships);
+
 
     try {
         const sql = db.IS_POSTGRES
@@ -1208,34 +1201,25 @@ const updateCompanyRequirements = async (req, res) => {
                 company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
                 req_modalities, req_truck, offered_payment_methods, req_relationships, 
                 availability, req_experience_years, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-              ON CONFLICT(company_id) DO UPDATE SET
-                req_cdl=excluded.req_cdl,
-                req_license_types=excluded.req_license_types,
-                req_endorsements=excluded.req_endorsements,
-                req_operation_types=excluded.req_operation_types,
-                req_modalities=excluded.req_modalities,
-                req_truck=excluded.req_truck,
-                offered_payment_methods=excluded.offered_payment_methods,
-                req_relationships=excluded.req_relationships,
-                availability=excluded.availability,
-                req_experience_years=excluded.req_experience_years,
-                updated_at=CURRENT_TIMESTAMP`;
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
 
         const params = [
             companyId,
-            req_cdl ?? true,
+            (req_cdl ?? true) ? 1 : 0,
             JSON.stringify(req_license_types || []),
             JSON.stringify(req_endorsements || []),
             JSON.stringify(req_operation_types || []),
             JSON.stringify(req_modalities || []),
-            req_truck ?? false,
+            (req_truck ?? false) ? 1 : 0,
             JSON.stringify(offered_payment_methods || []),
             JSON.stringify(req_relationships || []),
             availability || 'Inmediata',
             req_experience_years || 0
         ];
 
+        if (!db.IS_POSTGRES) {
+            await db.run('DELETE FROM company_requirements WHERE company_id = ?', companyId);
+        }
         await db.run(sql, ...params);
         res.json({ ok: true });
     } catch (e) {
@@ -1250,22 +1234,22 @@ app.get('/companies/requirements', authenticateToken, getCompanyRequirements);
 app.put('/companies/requirements', authenticateToken, updateCompanyRequirements);
 
 app.post('/api/company/search_status', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden modificar su estado de búsqueda' });
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can modify their search status' });
     const { status } = req.body;
-    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Estado inválido' });
+    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
 
     try {
-        await db.run("UPDATE empresas SET search_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", status, req.user.id);
+        await db.run("UPDATE empresas SET search_status = ? WHERE id = ?", status, req.user.id);
         res.json({ ok: true, status });
     } catch (e) {
         console.error('Error actualizando search_status:', e.message);
-        res.status(500).json({ error: 'Error del servidor' });
+        res.status(500).json({ error: 'Server Error' });
     }
 });
 
 // --- DRIVER PROFILE ---
 app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Solo choferes pueden acceder' });
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can access' });
 
     try {
         const row = await db.get("SELECT * FROM drivers WHERE id = ?", req.user.id);
@@ -1324,7 +1308,7 @@ function safeJson(value, fallback = []) {
 }
 
 app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Solo choferes pueden modificar' });
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can modify' });
 
     const driverId = req.user.id;
     const body = req.body;
@@ -1393,11 +1377,47 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         console.error("[DRIVER_PROFILE][PUT] ERROR", e);
         let detailedMessage = 'Unknown SQL Error';
         try {
-            detailedMessage = `ERROR: ${e ? e.message : 'No Msg'} \nDETAIL: ${e ? e.detail : 'No Detail'} \nHINT: ${e ? e.hint : 'No Hint'} \nPARAMS: ${params ? JSON.stringify(params).slice(0, 150) : 'Params Undefined'}`;
+            detailedMessage = `ERROR: ${e ? e.message : 'No Msg'} \nDETAIL: ${e ? e.detail : 'No Detail'}`;
         } catch (err) {
             detailedMessage = `Crash extracting error: ${err.message}`;
         }
         res.status(500).json({ error: detailedMessage, code: "DRIVER_PROFILE_PUT_FAILED" });
+    }
+});
+
+// --- MATCHES (Restored API for Mobile App) ---
+app.get('/matches/candidates', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies' });
+    try {
+        const rows = await db.all(`
+            SELECT pm.match_score, d.id, d.nombre as display_name, d.experience_level as experience_years, d.tipo_licencia as license_summ
+            FROM potential_matches pm
+            JOIN drivers d ON pm.driver_id = d.id
+            WHERE pm.company_id = ?
+            ORDER BY pm.match_score DESC, pm.created_at DESC
+        `, req.user.id);
+        res.json(rows);
+    } catch (e) {
+        console.error('Error fetching candidates:', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.get('/matches/opportunities', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers' });
+    try {
+        const rows = await db.all(`
+            SELECT pm.match_score, e.id, e.nombre as display_name, c.req_operation_types as op_types, c.offered_payment_methods as pay_methods, c.availability
+            FROM potential_matches pm
+            JOIN empresas e ON pm.company_id = e.id
+            LEFT JOIN company_requirements c ON e.id = c.company_id
+            WHERE pm.driver_id = ?
+            ORDER BY pm.match_score DESC, pm.created_at DESC
+        `, req.user.id);
+        res.json(rows);
+    } catch (e) {
+        console.error('Error fetching opportunities:', e);
+        res.status(500).json({ error: 'Server Error' });
     }
 });
 
