@@ -33,6 +33,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_company_requirements.js', { stdio: 'inherit' });
         execSync('node migrate_driver_profile.js', { stdio: 'inherit' });
         execSync('node migrate_fix_profile_columns.js', { stdio: 'inherit' });
+        execSync('node migrate_availability.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1319,7 +1320,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
     const {
         has_cdl, license_types, endorsements, operation_types,
         experience_years, job_preferences,
-        has_truck, payment_methods, work_relationships
+        has_truck, payment_methods, work_relationships, availability
     } = body;
 
     try {
@@ -1329,7 +1330,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
             sql = `UPDATE drivers SET 
                 has_cdl = ?, license_types = ?::jsonb, endorsements = ?::jsonb, operation_types = ?::jsonb,
                 experience_years = ?, job_preferences = ?::jsonb,
-                has_truck = ?, payment_methods = ?::jsonb, work_relationships = ?::jsonb,
+                has_truck = ?, payment_methods = ?::jsonb, work_relationships = ?::jsonb, availability = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
@@ -1342,6 +1343,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 !!has_truck, // Native boolean
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
+                availability || 'Inmediata',
                 nowIso(),
                 driverId
             ];
@@ -1349,7 +1351,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
             sql = `UPDATE drivers SET 
                 has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
                 experience_years = ?, job_preferences = ?,
-                has_truck = ?, payment_methods = ?, work_relationships = ?,
+                has_truck = ?, payment_methods = ?, work_relationships = ?, availability = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
@@ -1362,6 +1364,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 +!!has_truck, // 1/0 for SQLite
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
+                availability || 'Inmediata',
                 nowIso(),
                 driverId
             ];
