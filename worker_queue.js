@@ -211,7 +211,7 @@ const handlers = {
             const total = usage ? (usage.cnt || 0) : 0;
             const drivers = usage ? (usage.drv || 0) : 0;
 
-            // 2. Pricing Logic (Placeholder: $10 MXN per request -> 1000 cents)
+            // 2. Pricing Logic (Placeholder: $10 USD per request -> 1000 cents)
             const PRICE_PER_REQ_CENTS = 1000;
             const amount = total * PRICE_PER_REQ_CENTS;
 
@@ -325,7 +325,7 @@ const handlers = {
                 logger.info(`${logPrefix} Creating new PI with key: ${idempotencyKey}`);
                 paymentIntent = await stripe.paymentIntents.create({
                     amount: invoice.amount_cents,
-                    currency: invoice.currency || 'mxn',
+                    currency: invoice.currency || 'usd',
                     customer: invoice.stripe_customer_id,
                     confirm: true, // Try to charge immediately
                     off_session: true,

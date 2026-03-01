@@ -112,6 +112,15 @@ const schema = [
             await addColumn(item.table, item.col, item.type, item.def);
         }
 
+        // 3. Auto-Patch Historic Currency Displays
+        try {
+            await db.run("UPDATE billing_invoices SET currency = 'usd'");
+            await db.run("UPDATE tickets SET currency = 'usd'");
+            console.log("✅ Successfully patched legacy MXN records to USD.");
+        } catch (e) {
+            console.log("ℹ️ Skipping currency patch (Tables might not exist yet).");
+        }
+
         if (migrationError) {
             console.error('[AUTH MIGRATION] Completed with ERRORS.');
             process.exit(1);

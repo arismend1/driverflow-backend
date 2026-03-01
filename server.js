@@ -1247,6 +1247,20 @@ app.post('/api/company/search_status', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/driver/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can modify their search status' });
+    const { status } = req.body;
+    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
+
+    try {
+        await db.run("UPDATE drivers SET search_status = ? WHERE id = ?", status, req.user.id);
+        res.json({ ok: true, status });
+    } catch (e) {
+        console.error('Error actualizando search_status chofer:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
 // --- DRIVER PROFILE ---
 app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can access' });
