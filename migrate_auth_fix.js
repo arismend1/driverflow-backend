@@ -112,6 +112,41 @@ const schema = [
             await addColumn(item.table, item.col, item.type, item.def);
         }
 
+        // 2b. Create matching tables if they don't exist yet (Postgres and SQLite)
+        const createTableSqls = [
+            `CREATE TABLE IF NOT EXISTS potential_matches (
+                id         SERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL,
+                driver_id  INTEGER NOT NULL,
+                match_score INTEGER DEFAULT 1,
+                status     TEXT DEFAULT 'NEW',
+                created_at TEXT,
+                UNIQUE(company_id, driver_id)
+            )`,
+            `CREATE TABLE IF NOT EXISTS events_outbox (
+                id         SERIAL PRIMARY KEY,
+                event_name TEXT NOT NULL,
+                created_at TEXT,
+                company_id INTEGER,
+                driver_id  INTEGER,
+                request_id INTEGER,
+                ticket_id  INTEGER,
+                metadata   TEXT
+            )`
+        ];
+        for (const sql of createTableSqls) {
+            try {
+                // SQLite doesn't support SERIAL — use INTEGER PRIMARY KEY AUTOINCREMENT
+                const finalSql = db.IS_POSTGRES
+                    ? sql
+                    : sql.replace(/SERIAL PRIMARY KEY/g, 'INTEGER PRIMARY KEY AUTOINCREMENT');
+                await db.exec(finalSql);
+                console.log(`✅ Table ensured: ${sql.match(/TABLE IF NOT EXISTS (\w+)/)?.[1]}`);
+            } catch (e) {
+                console.log(`ℹ️ Table create skipped: ${e.message}`);
+            }
+        }
+
         // 3. Auto-Patch Historic Currency Displays (weekly_invoices is the real table name)
         const currencyTables = ['weekly_invoices', 'tickets'];
         for (const tbl of currencyTables) {
