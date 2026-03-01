@@ -415,8 +415,8 @@ app.post('/login', async (req, res) => {
             const token = jwt.sign({ id: row.id, type: type === 'empresa' ? 'empresa' : 'driver' }, JWT_SECRET, { expiresIn: '24h' });
 
             await auditLog('login_success', row.id, table, {}, req);
-            // console.log(`[Login] Success: ${contacto}`);
-            res.json({ ok: true, token, type, id: row.id, name: row.nombre });
+            await auditLog('login_success', row.id, table, {}, req);
+            res.json({ ok: true, token, type, id: row.id, name: row.nombre, search_status: row.search_status || 'ON' });
         } else {
             // Bad Password
             const fails = (row.failed_attempts || 0) + 1;
@@ -1248,6 +1248,20 @@ app.get('/api/companies/requirements', authenticateToken, getCompanyRequirements
 app.put('/api/companies/requirements', authenticateToken, updateCompanyRequirements);
 app.get('/companies/requirements', authenticateToken, getCompanyRequirements);
 app.put('/companies/requirements', authenticateToken, updateCompanyRequirements);
+
+app.post('/api/company/search_status', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Solo empresas pueden modificar su estado de búsqueda' });
+    const { status } = req.body;
+    if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Estado inválido' });
+
+    try {
+        await db.run("UPDATE empresas SET search_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", status, req.user.id);
+        res.json({ ok: true, status });
+    } catch (e) {
+        console.error('Error actualizando search_status:', e.message);
+        res.status(500).json({ error: 'Error del servidor' });
+    }
+});
 
 // --- DRIVER PROFILE ---
 app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
