@@ -75,7 +75,23 @@ const schema = [
     { table: 'drivers', col: 'lockout_until', type: 'TEXT' },
 
     // OUTBOX
-    { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' }
+    { table: 'events_outbox', col: 'ticket_id', type: 'INTEGER' },
+
+    // DRIVERS (English API Payloads)
+    { table: 'drivers', col: 'has_cdl', type: 'INTEGER', def: 0 },
+    { table: 'drivers', col: 'license_types', type: 'TEXT' },
+    { table: 'drivers', col: 'endorsements', type: 'TEXT' },
+    { table: 'drivers', col: 'operation_types', type: 'TEXT' },
+    { table: 'drivers', col: 'experience_years', type: 'INTEGER', def: 0 },
+    { table: 'drivers', col: 'job_preferences', type: 'TEXT' },
+    { table: 'drivers', col: 'has_truck', type: 'INTEGER', def: 0 },
+    { table: 'drivers', col: 'payment_methods', type: 'TEXT' },
+    { table: 'drivers', col: 'work_relationships', type: 'TEXT' },
+    { table: 'drivers', col: 'availability', type: 'TEXT' },
+    { table: 'drivers', col: 'updated_at', type: 'TEXT' },
+
+    // COMPANY REQUIREMENTS (English API Payloads)
+    { table: 'company_requirements', col: 'req_experience_years', type: 'INTEGER', def: 0 }
 ];
 
 (async () => {

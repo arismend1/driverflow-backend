@@ -654,76 +654,20 @@ async function startQueueWorker() {
         }
     });
 
-    // --- AUTO-MATCHMAKING SCHEDULER (Every 30 Minutes) ---
-    cron.schedule('*/30 * * * *', async () => {
-        logger.info('[Scheduler] Running Auto-Matchmaking Loop...');
-        try {
-            // 1. Fetch Eligible Companies and Match Prefs
-            const companies = await db.all(`
-                SELECT e.id, e.nombre, e.contacto,
-                       mp.req_license, mp.req_experience, mp.req_team_driving, mp.req_start, mp.req_restrictions
-                FROM empresas e
-                JOIN company_match_prefs mp ON e.id = mp.company_id
-                WHERE e.search_status = 'ON' 
-                  AND e.is_blocked = 0
-            `);
-
-            // 2. Fetch Eligible Drivers
-            const drivers = await db.all(`
-                SELECT id, nombre, tipo_licencia, experience_level, team_driving, available_start, restrictions 
-                FROM drivers
-                WHERE search_status = 'ON' 
-                  AND estado = 'DISPONIBLE'
-            `);
-
-            logger.info(`[Matchmaking] Found ${companies.length} companies, ${drivers.length} drivers.`);
-            let newMatchesCount = 0;
-
-            // 3. Evaluate rules (Async loop)
-            for (const co of companies) {
-                for (const dr of drivers) {
-                    // RULES
-                    if (co.req_license !== 'Any' && co.req_license !== dr.tipo_licencia) continue;
-                    if (co.req_experience !== 'Any' && co.req_experience !== dr.experience_level) continue;
-                    if (co.req_team_driving === 'Team' && dr.team_driving !== 'YES') continue;
-                    if (co.req_team_driving === 'Solo' && dr.team_driving !== 'NO') continue;
-                    if (co.req_start === 'Now' && dr.available_start !== 'NOW') continue;
-                    if (co.req_restrictions === 'Yes' && dr.restrictions !== 'YES') continue;
-
-                    // Match Found -> Register in DB if unique
-                    const nowStr = nowIso();
-                    try {
-                        const info = await db.run(`
-                            INSERT INTO potential_matches (company_id, driver_id, match_score, status, created_at)
-                            VALUES (?, ?, 1, 'NEW', ?)
-                            ON CONFLICT(company_id, driver_id) DO NOTHING
-                        `, co.id, dr.id, nowStr);
-
-                        // If changes > 0 or lastInsertRowid exists, we successfully inserted a NEW match
-                        if (info && (info.changes > 0 || info.rowCount > 0)) {
-                            newMatchesCount++;
-                            // Fire Events to Outbox
-                            await db.run(
-                                `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata) VALUES (?, ?, ?, ?, NULL, ?)`,
-                                'potential_match_company', nowStr, co.id, null, JSON.stringify({ driver_id: dr.id, summary: `Lic: ${dr.tipo_licencia}, Exp: ${dr.experience_level}` })
-                            );
-                            await db.run(
-                                `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata) VALUES (?, ?, ?, ?, NULL, ?)`,
-                                'potential_match_driver', nowStr, null, dr.id, JSON.stringify({ company_id: co.id, summary: `Company searching for ${co.req_license} drivers` })
-                            );
-                        }
-                    } catch (dbErr) {
-                        // Ignore SQLite uniqueness errors if ON CONFLICT DO NOTHING didn't work natively on generic adapter
-                        if (!dbErr.message.includes('UNIQUE')) {
-                            logger.error(`[Matchmaking] DB Insert Error for Co:${co.id} Drv:${dr.id}`, dbErr);
-                        }
-                    }
-                }
+    // --- AUTO-MATCHMAKING SCHEDULER (Every 5 Minutes) ---
+    cron.schedule('*/5 * * * *', () => {
+        logger.info('[Scheduler] Triggering Auto-Matchmaking script...');
+        const { exec } = require('child_process');
+        exec('node run_matching.js', (error, stdout, stderr) => {
+            if (error) {
+                logger.error(`[Scheduler] Auto-Matchmaking Error: ${error.message}`);
+                return;
             }
-            logger.info(`[Matchmaking] Complete. Generated ${newMatchesCount} new potential matches.`);
-        } catch (err) {
-            logger.error('[Scheduler] Auto-Matchmaking Failed', err);
-        }
+            if (stderr) {
+                logger.warn(`[Scheduler] Auto-Matchmaking Warning: ${stderr}`);
+            }
+            logger.info(`[Scheduler] Auto-Matchmaking Success:\n${stdout}`);
+        });
     });
 
     // Heartbeat Loop
