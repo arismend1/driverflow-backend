@@ -1431,41 +1431,8 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
     }
 });
 
-// --- MATCHES (Restored API for Mobile App) ---
-app.get('/matches/candidates', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies' });
-    try {
-        const rows = await db.all(`
-            SELECT pm.match_score, d.id, d.nombre as display_name, d.experience_level as experience_years, d.tipo_licencia as license_summ
-            FROM potential_matches pm
-            JOIN drivers d ON pm.driver_id = d.id
-            WHERE pm.company_id = ?
-            ORDER BY pm.match_score DESC, pm.created_at DESC
-        `, req.user.id);
-        res.json(rows);
-    } catch (e) {
-        console.error('Error fetching candidates:', e);
-        res.status(500).json({ error: 'Server Error' });
-    }
-});
 
-app.get('/matches/opportunities', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers' });
-    try {
-        const rows = await db.all(`
-            SELECT pm.match_score, e.id, e.nombre as display_name, c.req_operation_types as op_types, c.offered_payment_methods as pay_methods, c.availability
-            FROM potential_matches pm
-            JOIN empresas e ON pm.company_id = e.id
-            LEFT JOIN company_requirements c ON e.id = c.company_id
-            WHERE pm.driver_id = ?
-            ORDER BY pm.match_score DESC, pm.created_at DESC
-        `, req.user.id);
-        res.json(rows);
-    } catch (e) {
-        console.error('Error fetching opportunities:', e);
-        res.status(500).json({ error: 'Server Error' });
-    }
-});
+
 
 // --- DRIVER TICKETS ---
 app.get('/api/tickets/my', authenticateToken, async (req, res) => {
