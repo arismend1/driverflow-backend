@@ -1558,6 +1558,33 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── MATCH STATE TRANSITIONS ───────────────────────────────────────────────────
+
+const updateMatchStatus = async (req, res, newStatus) => {
+    const matchId = req.params.id;
+    const userId = req.user.id;
+    const userType = req.user.type; // 'empresa' or 'driver'
+    try {
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        if (userType === 'empresa' && match.company_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
+        if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
+
+        await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', newStatus, new Date().toISOString(), matchId);
+        console.log(`[Matches] Match ${matchId} updated to ${newStatus} by ${userType} ${userId}`);
+        res.json({ success: true, status: newStatus });
+    } catch (e) {
+        console.error(`[Matches] Error updating match ${matchId} to ${newStatus}:`, e.message);
+        res.status(500).json({ error: 'Server error' });
+    }
+};
+
+app.post('/matches/:id/viewed', authenticateToken, (req, res) => updateMatchStatus(req, res, 'VIEWED'));
+app.post('/matches/:id/contacted', authenticateToken, (req, res) => updateMatchStatus(req, res, 'CONTACTED'));
+app.post('/matches/:id/accept', authenticateToken, (req, res) => updateMatchStatus(req, res, 'ACCEPTED'));
+app.post('/matches/:id/decline', authenticateToken, (req, res) => updateMatchStatus(req, res, 'DECLINED'));
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
