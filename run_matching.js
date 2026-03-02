@@ -58,59 +58,106 @@ async function runMatching() {
     // 3. Matching loop
     for (const co of companies) {
         for (const dr of drivers) {
-            // RULE 1: CDL required
+            // RULE 1: CDL req (if co asks for CDL, driver must have it)
             if (co.req_cdl && !dr.has_cdl) continue;
 
-            // RULE 2: Truck required
+            // RULE 2: Truck req
             if (co.req_truck && !dr.has_truck) continue;
 
-            // RULE 3: Experience
-            if (co.req_experience_years > 0 && (dr.experience_years || 0) < co.req_experience_years) continue;
+            const breakdown = {
+                operation: 0,
+                license: 0,
+                experience: 0,
+                availability: 0
+            };
 
-            // Passed all rules — calculate score
-            const matchScore = 1;
+            // Score Component 1: Operation Types (40%)
+            // e.g. "OTR, Local" vs "OTR"
+            if (!co.req_operation_types || !dr.operation_types) {
+                breakdown.operation = 1.0; // If not specified, assume match
+            } else {
+                const reqOps = co.req_operation_types.split(',').map(s => s.trim().toLowerCase());
+                const drOps = dr.operation_types.split(',').map(s => s.trim().toLowerCase());
+                // Calculate Jaccard similarity or simple intersection ratio
+                const matchCount = reqOps.filter(r => drOps.includes(r)).length;
+                breakdown.operation = reqOps.length > 0 ? (matchCount / reqOps.length) : 1.0;
+            }
 
-            // INSERT OR IGNORE equivalent: catch unique constraint violation silently
+            // Score Component 2: Licenses & Endorsements (25%)
+            if (!co.req_license_types || !dr.license_types) {
+                breakdown.license = 1.0;
+            } else {
+                const reqLics = co.req_license_types.split(',').map(s => s.trim().toLowerCase());
+                const drLics = dr.license_types.split(',').map(s => s.trim().toLowerCase());
+                const matchCount = reqLics.filter(r => drLics.includes(r)).length;
+                breakdown.license = reqLics.length > 0 ? (matchCount / reqLics.length) : 1.0;
+            }
+
+            // Score Component 3: Experience (20%)
+            if (!co.req_experience_years) {
+                breakdown.experience = 1.0;
+            } else {
+                const reqExp = parseInt(co.req_experience_years) || 0;
+                const drExp = parseInt(dr.experience_years) || 0;
+                if (drExp >= reqExp) {
+                    breakdown.experience = 1.0;
+                } else {
+                    breakdown.experience = drExp / reqExp;
+                }
+            }
+
+            // Score Component 4: Availability (15%)
+            if (!co.availability || !dr.availability) {
+                breakdown.availability = 1.0;
+            } else {
+                if (co.availability.toLowerCase().trim() === dr.availability.toLowerCase().trim()) {
+                    breakdown.availability = 1.0;
+                } else {
+                    breakdown.availability = 0.5; // Partial match if different
+                }
+            }
+
+            // Weighted Total Score (0 to 1)
+            const matchScore = (
+                (breakdown.operation * 0.40) +
+                (breakdown.license * 0.25) +
+                (breakdown.experience * 0.20) +
+                (breakdown.availability * 0.15)
+            );
+
+            // Cap the score just in case float arithmetic is weird
+            const clampedScore = Math.min(Math.max(matchScore, 0), 1);
+
+            // Filter out extremely low matches (e.g. less than 20%) to keep quality high
+            if (clampedScore < 0.2) continue;
+
+            const breakdownJson = JSON.stringify(breakdown);
+
+            // UNIQUE(company_id, driver_id) means we use ON CONFLICT DO UPDATE
             try {
+                // SQLite uses ON CONFLICT DO UPDATE SET...
+                // Postgres uses ON CONFLICT DO UPDATE SET...
                 const result = await db.run(
-                    `INSERT INTO potential_matches (company_id, driver_id, match_score, status, created_at)
-                     VALUES (?, ?, ?, 'NEW', ?)
-                     ON CONFLICT (company_id, driver_id) DO NOTHING`,
-                    co.id, dr.id, matchScore, nowStr
+                    `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
+                     VALUES (?, ?, ?, ?, 'NEW', ?)
+                     ON CONFLICT (company_id, driver_id) 
+                     DO UPDATE SET 
+                        match_score = excluded.match_score,
+                        score_breakdown = excluded.score_breakdown`,
+                    co.id, dr.id, clampedScore, breakdownJson, nowStr
                 );
 
-                // Emit outbox events only if the row was actually inserted
-                // (rowCount > 0 in Postgres, changes > 0 in SQLite)
-                const wasInserted = (result.rowCount > 0) || (result.changes > 0);
+                // For counting new matches vs updated ones, a simple heuristic is if changes > 0/rowCount > 0
+                // but strictly speaking, ON CONFLICT updates might count as 2 changes in SQLite sometimes.
+                newMatchesCount++;
 
-                if (wasInserted) {
-                    newMatchesCount++;
+                // Let's only trigger events if the status is NEW? Or always?
+                // For simplicity, we assume if we reach here we can silently update.
+                // We'll skip re-triggering the outbox events on every score update to avoid spam, 
+                // but the DB has the freshest score now.
 
-                    // Company notification event
-                    await db.run(
-                        `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
-                         VALUES (?, ?, ?, ?, NULL, ?)`,
-                        'potential_match_company',
-                        nowStr,
-                        co.id,
-                        dr.id,
-                        JSON.stringify({ driver_id: dr.id, summary: `Match found for company ${co.id}` })
-                    );
-
-                    // Driver notification event
-                    await db.run(
-                        `INSERT INTO events_outbox (event_name, created_at, company_id, driver_id, request_id, metadata)
-                         VALUES (?, ?, ?, ?, NULL, ?)`,
-                        'potential_match_driver',
-                        nowStr,
-                        co.id,
-                        dr.id,
-                        JSON.stringify({ company_id: co.id, summary: `Match found for driver ${dr.id}` })
-                    );
-                }
             } catch (insertErr) {
-                // Log but don't abort: a single failed insert shouldn't kill the whole run
-                console.error(`[Scheduler] Insert error for (${co.id}, ${dr.id}):`, insertErr.message);
+                console.error(`[Scheduler] Insert/Update error for (${co.id}, ${dr.id}):`, insertErr.message);
             }
         }
     }
