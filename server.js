@@ -1518,8 +1518,18 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
 // GET /matches/opportunities — Driver sees matched companies
 app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can view opportunities' });
-    console.log(`[Matches] /matches/opportunities called by driver_id=${req.user.id} type=${req.user.type}`);
+
+    // --- DIAGNOSTIC: log full token payload ---
+    console.log(`[Matches] /matches/opportunities req.user =`, JSON.stringify(req.user));
+
+    const driverId = req.user.id;
+    console.log(`[Matches] /matches/opportunities called by driver_id=${driverId} type=${req.user.type}`);
+
     try {
+        // --- DIAGNOSTIC: raw count of matches for this driver ---
+        const rawCount = await db.get('SELECT COUNT(*) AS cnt FROM potential_matches WHERE driver_id = ?', driverId);
+        console.log(`[Matches] RAW potential_matches count for driver_id=${driverId}: ${rawCount?.cnt || 0}`);
+
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
@@ -1537,19 +1547,12 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
             WHERE pm.driver_id = ?
               AND pm.status != 'DECLINED'
-              AND e.id IS NOT NULL
-              AND cr.company_id IS NOT NULL
-              AND COALESCE(cr.req_operation_types, '') <> ''
-              AND COALESCE(cr.offered_payment_methods, '') <> ''
-              AND COALESCE(cr.availability, '') <> ''
-              AND LOWER(e.nombre) NOT LIKE '%smoke%'
-              AND LOWER(e.nombre) NOT LIKE '%test%'
-              AND LOWER(e.nombre) NOT LIKE '%prodcomp%'
-            ORDER BY pm.created_at DESC
-        `, req.user.id);
-        console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${req.user.id}`);
+            ORDER BY pm.match_score DESC, pm.created_at DESC
+        `, driverId);
+
+        console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${driverId}`);
         if (rows.length > 0) {
-            console.log(`[Matches] sample row: company_id=${rows[0].company_id} display_name=${rows[0].display_name} status=${rows[0].status}`);
+            console.log(`[Matches] sample row: match_id=${rows[0].match_id} company_id=${rows[0].company_id} display_name=${rows[0].display_name} status=${rows[0].status} score=${rows[0].match_score}`);
         }
         res.json(rows);
     } catch (e) {
