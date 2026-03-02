@@ -1526,19 +1526,23 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 pm.match_score,
                 pm.status,
                 pm.created_at,
-                e.id            AS company_id,
-                e.nombre        AS display_name,
+                pm.company_id,
+                COALESCE(e.nombre, 'Company #' || pm.company_id::text) AS display_name,
+                e.contacto      AS company_email,
                 cr.req_operation_types AS op_types,
                 cr.offered_payment_methods AS pay_methods,
                 cr.availability
             FROM potential_matches pm
-            JOIN empresas e ON e.id = pm.company_id
-            LEFT JOIN company_requirements cr ON cr.company_id = e.id
+            LEFT JOIN empresas e ON e.id = pm.company_id
+            LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
             WHERE pm.driver_id = ?
               AND pm.status != 'DECLINED'
             ORDER BY pm.created_at DESC
         `, req.user.id);
         console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${req.user.id}`);
+        if (rows.length > 0) {
+            console.log(`[Matches] sample row: company_id=${rows[0].company_id} display_name=${rows[0].display_name} status=${rows[0].status}`);
+        }
         res.json(rows);
     } catch (e) {
         console.error('[Matches] /matches/opportunities error:', e.message);
