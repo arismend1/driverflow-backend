@@ -1537,6 +1537,14 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
             WHERE pm.driver_id = ?
               AND pm.status != 'DECLINED'
+              AND e.id IS NOT NULL
+              AND cr.company_id IS NOT NULL
+              AND COALESCE(cr.req_operation_types, '') <> ''
+              AND COALESCE(cr.offered_payment_methods, '') <> ''
+              AND COALESCE(cr.availability, '') <> ''
+              AND LOWER(e.nombre) NOT LIKE '%smoke%'
+              AND LOWER(e.nombre) NOT LIKE '%test%'
+              AND LOWER(e.nombre) NOT LIKE '%prodcomp%'
             ORDER BY pm.created_at DESC
         `, req.user.id);
         console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${req.user.id}`);
