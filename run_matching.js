@@ -26,6 +26,40 @@ if (!process.env.DATABASE_URL && !process.env.DB_PATH) {
 
 const nowIso = () => new Date().toISOString();
 
+/**
+ * Normaliza un campo que puede venir como:
+ * - JSONB array (Postgres): ["OTR","LOCAL"]
+ * - string JSON: '["OTR","LOCAL"]'
+ * - string CSV: "OTR, LOCAL"
+ * - null/undefined
+ */
+function toArray(val) {
+    if (!val) return [];
+    if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
+
+    if (typeof val === 'string') {
+        const s = val.trim();
+
+        // si viene como JSON string: '["OTR","LOCAL"]'
+        if (s.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(s);
+                if (Array.isArray(parsed)) {
+                    return parsed.map(x => String(x).trim()).filter(Boolean);
+                }
+            } catch (_) {
+                // ignore y hacemos fallback a CSV
+            }
+        }
+
+        // fallback CSV: "OTR, LOCAL"
+        return s.split(',').map(x => x.trim()).filter(Boolean);
+    }
+
+    // fallback final
+    return [String(val).trim()].filter(Boolean);
+}
+
 async function runMatching() {
     console.log('--- Running Matching Logic ---');
 
@@ -58,8 +92,9 @@ async function runMatching() {
     // 3. Matching loop
     for (const co of companies) {
         for (const dr of drivers) {
-            // RULE 1: CDL req (if co asks for CDL, driver must have it)
-            if (co.req_cdl && !dr.has_cdl) continue;
+            // RULE 1 (REMOVED): CDL requirement
+            // Nota: este script referenciaba co.req_cdl, pero NO se selecciona en la query
+            // y puede no existir en el schema. Se elimina para evitar fallos en producción.
 
             // RULE 2: Truck req
             if (co.req_truck && !dr.has_truck) continue;
@@ -72,25 +107,31 @@ async function runMatching() {
             };
 
             // Score Component 1: Operation Types (40%)
-            // e.g. "OTR, Local" vs "OTR"
-            if (!co.req_operation_types || !dr.operation_types) {
-                breakdown.operation = 1.0; // If not specified, assume match
-            } else {
-                const reqOps = co.req_operation_types.split(',').map(s => s.trim().toLowerCase());
-                const drOps = dr.operation_types.split(',').map(s => s.trim().toLowerCase());
-                // Calculate Jaccard similarity or simple intersection ratio
-                const matchCount = reqOps.filter(r => drOps.includes(r)).length;
-                breakdown.operation = reqOps.length > 0 ? (matchCount / reqOps.length) : 1.0;
+            // Soporta JSONB array (["OTR"]) y strings ("OTR, Local")
+            {
+                const reqOps = toArray(co.req_operation_types).map(s => s.toLowerCase());
+                const drOps = toArray(dr.operation_types).map(s => s.toLowerCase());
+
+                if (reqOps.length === 0 || drOps.length === 0) {
+                    breakdown.operation = 1.0; // Si no se especifica, asumimos match
+                } else {
+                    const matchCount = reqOps.filter(r => drOps.includes(r)).length;
+                    breakdown.operation = reqOps.length > 0 ? (matchCount / reqOps.length) : 1.0;
+                }
             }
 
             // Score Component 2: Licenses & Endorsements (25%)
-            if (!co.req_license_types || !dr.license_types) {
-                breakdown.license = 1.0;
-            } else {
-                const reqLics = co.req_license_types.split(',').map(s => s.trim().toLowerCase());
-                const drLics = dr.license_types.split(',').map(s => s.trim().toLowerCase());
-                const matchCount = reqLics.filter(r => drLics.includes(r)).length;
-                breakdown.license = reqLics.length > 0 ? (matchCount / reqLics.length) : 1.0;
+            // Soporta JSONB array y strings CSV
+            {
+                const reqLics = toArray(co.req_license_types).map(s => s.toLowerCase());
+                const drLics = toArray(dr.license_types).map(s => s.toLowerCase());
+
+                if (reqLics.length === 0 || drLics.length === 0) {
+                    breakdown.license = 1.0;
+                } else {
+                    const matchCount = reqLics.filter(r => drLics.includes(r)).length;
+                    breakdown.license = reqLics.length > 0 ? (matchCount / reqLics.length) : 1.0;
+                }
             }
 
             // Score Component 3: Experience (20%)
@@ -99,7 +140,10 @@ async function runMatching() {
             } else {
                 const reqExp = parseInt(co.req_experience_years) || 0;
                 const drExp = parseInt(dr.experience_years) || 0;
-                if (drExp >= reqExp) {
+
+                if (reqExp <= 0) {
+                    breakdown.experience = 1.0;
+                } else if (drExp >= reqExp) {
                     breakdown.experience = 1.0;
                 } else {
                     breakdown.experience = drExp / reqExp;
@@ -110,7 +154,7 @@ async function runMatching() {
             if (!co.availability || !dr.availability) {
                 breakdown.availability = 1.0;
             } else {
-                if (co.availability.toLowerCase().trim() === dr.availability.toLowerCase().trim()) {
+                if (String(co.availability).toLowerCase().trim() === String(dr.availability).toLowerCase().trim()) {
                     breakdown.availability = 1.0;
                 } else {
                     breakdown.availability = 0.5; // Partial match if different
@@ -137,7 +181,7 @@ async function runMatching() {
             try {
                 // SQLite uses ON CONFLICT DO UPDATE SET...
                 // Postgres uses ON CONFLICT DO UPDATE SET...
-                const result = await db.run(
+                await db.run(
                     `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
                      VALUES (?, ?, ?, ?, 'NEW', ?)
                      ON CONFLICT (company_id, driver_id) 
@@ -150,12 +194,6 @@ async function runMatching() {
                 // For counting new matches vs updated ones, a simple heuristic is if changes > 0/rowCount > 0
                 // but strictly speaking, ON CONFLICT updates might count as 2 changes in SQLite sometimes.
                 newMatchesCount++;
-
-                // Let's only trigger events if the status is NEW? Or always?
-                // For simplicity, we assume if we reach here we can silently update.
-                // We'll skip re-triggering the outbox events on every score update to avoid spam, 
-                // but the DB has the freshest score now.
-
             } catch (insertErr) {
                 console.error(`[Scheduler] Insert/Update error for (${co.id}, ${dr.id}):`, insertErr.message);
             }
