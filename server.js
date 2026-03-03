@@ -1574,11 +1574,15 @@ const updateMatchStatus = async (req, res, newStatus) => {
         if (userType === 'empresa' && match.company_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
         if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
 
-        await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', newStatus, new Date().toISOString(), matchId);
+        await db.run(
+            'UPDATE potential_matches SET status = ? WHERE id = ?',
+            newStatus,
+            matchId
+        );
         console.log(`[Matches] Match ${matchId} updated to ${newStatus} by ${userType} ${userId}`);
         res.json({ success: true, status: newStatus });
     } catch (e) {
-        console.error(`[Matches] Error updating match ${matchId} to ${newStatus}:`, e.message);
+        console.error(`[Matches] Error updating match ${matchId} to ${newStatus}:`, e);
         res.status(500).json({ error: 'Server error' });
     }
 };
