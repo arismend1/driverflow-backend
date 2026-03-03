@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -420,7 +421,6 @@ app.post('/login', async (req, res) => {
             }
             const token = jwt.sign({ id: row.id, type: type === 'empresa' ? 'empresa' : 'driver' }, JWT_SECRET, { expiresIn: '24h' });
 
-            await auditLog('login_success', row.id, table, {}, req);
             await auditLog('login_success', row.id, table, {}, req);
             res.json({ ok: true, token, type, id: row.id, name: row.nombre, search_status: row.search_status || 'ON' });
         } else {
@@ -1486,7 +1486,6 @@ app.get('/api/diagnostics/version', (req, res) => {
 // GET /matches/candidates — Company sees matched drivers
 app.get('/matches/candidates', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can view candidates' });
-    console.log(`[Matches] /matches/candidates called by company_id=${req.user.id} type=${req.user.type}`);
     try {
         const rows = await db.all(`
             SELECT
@@ -1494,8 +1493,13 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 pm.match_score,
                 pm.status,
                 pm.created_at,
+                pm.driver_step1_accepted_at,
+                pm.company_step1_accepted_at,
+                pm.driver_share_consent_at,
+                pm.company_share_consent_at,
                 d.id            AS driver_id,
                 d.nombre        AS display_name,
+                d.contacto      AS driver_email,
                 d.experience_years,
                 d.license_types AS license_summ,
                 d.operation_types AS op_types,
@@ -1507,8 +1511,15 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
               AND pm.status != 'DECLINED'
             ORDER BY pm.created_at DESC
         `, req.user.id);
-        console.log(`[Matches] /matches/candidates returning ${rows.length} rows for company_id=${req.user.id}`);
-        res.json(rows);
+
+        const sanitized = rows.map(r => {
+            if (r.status !== 'INFO_SHARED') {
+                return { ...r, driver_email: null };
+            }
+            return r;
+        });
+
+        res.json(sanitized);
     } catch (e) {
         console.error('[Matches] /matches/candidates error:', e.message);
         res.status(500).json({ error: 'Server error' });
@@ -1521,7 +1532,6 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     const userType = req.user.type; // 'driver' or 'empresa'
 
     try {
-        // Enforce ownership: drivers see their matches, companies see theirs.
         let filterColumn = '';
         if (userType === 'driver') {
             filterColumn = 'pm.driver_id';
@@ -1537,8 +1547,12 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 pm.match_score,
                 pm.status,
                 pm.created_at,
+                pm.driver_step1_accepted_at,
+                pm.company_step1_accepted_at,
+                pm.driver_share_consent_at,
+                pm.company_share_consent_at,
                 pm.company_id,
-                COALESCE(e.nombre, 'Company #' || pm.company_id::text) AS display_name,
+                COALESCE(e.nombre, 'Company #' || CAST(pm.company_id AS TEXT)) AS display_name,
                 e.contacto      AS company_email,
                 cr.req_operation_types AS op_types,
                 cr.offered_payment_methods AS pay_methods,
@@ -1551,7 +1565,14 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             ORDER BY pm.match_score DESC, pm.created_at DESC
         `, userId);
 
-        res.json(rows);
+        const sanitized = rows.map(r => {
+            if (r.status !== 'INFO_SHARED') {
+                return { ...r, company_email: null };
+            }
+            return r;
+        });
+
+        res.json(sanitized);
     } catch (e) {
         console.error('[Matches] /matches/opportunities error:', e.message);
         res.status(500).json({ error: 'Server error' });
@@ -1564,6 +1585,8 @@ const updateMatchStatus = async (req, res, newStatus) => {
     const matchId = req.params.id;
     const userId = req.user.id;
     const userType = req.user.type; // 'empresa' or 'driver'
+    const now = new Date().toISOString();
+
     try {
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         if (!match) return res.status(404).json({ error: 'Match not found' });
@@ -1571,11 +1594,34 @@ const updateMatchStatus = async (req, res, newStatus) => {
         if (userType === 'empresa' && match.company_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
         if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
 
-        await db.run(
-            'UPDATE potential_matches SET status = ? WHERE id = ?',
-            newStatus,
-            matchId
-        );
+        let updateSql = 'UPDATE potential_matches SET status = ?, updated_at = ?';
+        let params = [newStatus, now];
+
+        if (newStatus === 'ACCEPTED') {
+            if (userType === 'driver') {
+                updateSql = 'UPDATE potential_matches SET driver_step1_accepted_at = ?, updated_at = ?';
+                params = [now, now];
+            } else {
+                updateSql = 'UPDATE potential_matches SET company_step1_accepted_at = ?, updated_at = ?';
+                params = [now, now];
+            }
+
+            // Check if both accepted
+            const dAccept = userType === 'driver' ? now : match.driver_step1_accepted_at;
+            const cAccept = userType === 'empresa' ? now : match.company_step1_accepted_at;
+
+            if (dAccept && cAccept) {
+                updateSql = 'UPDATE potential_matches SET driver_step1_accepted_at = COALESCE(driver_step1_accepted_at, ?), company_step1_accepted_at = COALESCE(company_step1_accepted_at, ?), status = ?, updated_at = ?';
+                params = [now, now, 'PREMATCH_READY', now];
+                newStatus = 'PREMATCH_READY';
+            }
+        }
+
+        updateSql += ' WHERE id = ?';
+        params.push(matchId);
+
+        await db.run(updateSql, ...params);
+
         console.log(`[Matches] Match ${matchId} updated to ${newStatus} by ${userType} ${userId}`);
         res.json({ success: true, status: newStatus });
     } catch (e) {
@@ -1583,6 +1629,89 @@ const updateMatchStatus = async (req, res, newStatus) => {
         res.status(500).json({ error: 'Server error' });
     }
 };
+
+const finalizeShare = async (matchId) => {
+    const now = new Date().toISOString();
+    await db.run(
+        "UPDATE potential_matches SET status = 'INFO_SHARED', info_shared_at = ?, updated_at = ? WHERE id = ?",
+        now, now, matchId
+    );
+};
+
+app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers' });
+    const matchId = req.params.id;
+    const now = new Date().toISOString();
+
+    try {
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND driver_id = ?', matchId, req.user.id);
+        if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        if (!['PREMATCH_READY', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'ACCEPTED'].includes(match.status)) {
+            // Include 'ACCEPTED' as fallback if status didn't flip yet
+            // return res.status(409).json({ error: 'Invalid state for consent' });
+        }
+
+        await db.run(
+            'UPDATE potential_matches SET driver_share_consent_at = ?, updated_at = ? WHERE id = ?',
+            now, now, matchId
+        );
+
+        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        if (updated.company_share_consent_at && updated.ticket_id) {
+            await finalizeShare(matchId);
+            return res.json({ success: true, status: 'INFO_SHARED' });
+        }
+
+        res.json({ success: true, status: updated.status });
+    } catch (e) {
+        console.error('[Matches] driver confirm-share error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies' });
+    const matchId = req.params.id;
+    const now = new Date().toISOString();
+
+    try {
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND company_id = ?', matchId, req.user.id);
+        if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        if (!match.driver_share_consent_at) {
+            return res.status(409).json({ error: 'Driver must consent first' });
+        }
+
+        // Double Click Protection
+        if (match.ticket_id) {
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        }
+
+        // Weekly charge (ticket) Parametrized
+        const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
+        const currency = 'USD';
+
+        const t = await db.run(
+            "INSERT INTO tickets (company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,'pending',?)",
+            match.company_id, match.driver_id, amount, amount, currency, now, `Match ID: ${matchId}`
+        );
+        const ticketId = t.lastInsertRowid || t.insertId;
+
+        await db.run(
+            'UPDATE potential_matches SET company_share_consent_at = ?, ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
+            now, ticketId, amount, currency, now, matchId
+        );
+
+        await finalizeShare(matchId);
+
+        console.log(`[Matches] Company confirmed share for match ${matchId}. Created ticket ${ticketId}`);
+        res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+    } catch (e) {
+        console.error('[Matches] company confirm-share error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 app.post('/matches/:id/viewed', authenticateToken, (req, res) => updateMatchStatus(req, res, 'VIEWED'));
 app.post('/matches/:id/contacted', authenticateToken, (req, res) => updateMatchStatus(req, res, 'CONTACTED'));
