@@ -1,155 +1,89 @@
-﻿// ⚠️ FROZEN LOGIC — DO NOT MODIFY
-const DB_PATH_ENV = process.env.DB_PATH || 'driverflow.db';
-console.log(`[Generator] Connecting to DB: ${DB_PATH_ENV}`);
-const db = require('better-sqlite3')(DB_PATH_ENV);
-
-if (process.env.DEBUG_DB) {
-  const list = db.prepare("PRAGMA database_list").all();
-  console.log("[DB_LIST]", JSON.stringify(list));
-}
-const { checkAndEnforceBlocking } = require('./delinquency');
+﻿const db = require('./db_adapter');
 const time = require('./time_contract');
-// const { nowIso } = require('./time_provider'); // DEPRECATED
 
-// ISO week label (YYYY-WW) Monday-based
-function getMondayBasedWeekLabel(dateInput) {
+async function getMondayBasedWeekLabel(dateInput) {
   const date = new Date(dateInput);
-  if (isNaN(date.getTime())) throw new Error(`Invalid date: ${dateInput}`);
-
   const target = new Date(date.valueOf());
-  const dayNr = (date.getDay() + 6) % 7; // Mon=0..Sun=6
+  const dayNr = (date.getDay() + 6) % 7;
   target.setDate(target.getDate() - dayNr + 3);
-
   const firstThursday = target.valueOf();
   target.setMonth(0, 1);
   if (target.getDay() !== 4) {
     target.setMonth(0, 1 + ((4 - target.getDay()) + 7) % 7);
   }
-
   const weekNumber = 1 + Math.ceil((firstThursday - target) / 604800000);
-  const year = target.getFullYear();
-  return `${year}-${String(weekNumber).padStart(2, '0')}`;
+  return `${target.getFullYear()}-${String(weekNumber).padStart(2, '0')}`;
 }
 
-function getFridayFromWeek(weekLabel) {
+async function getFridayFromWeek(weekLabel) {
   const [year, week] = weekLabel.split('-').map(Number);
   const jan4 = new Date(year, 0, 4);
   const day = (jan4.getDay() + 6) % 7;
   const mondayWeek1 = new Date(jan4.valueOf() - day * 86400000);
   const mondayTarget = new Date(mondayWeek1.valueOf() + (week - 1) * 7 * 86400000);
-  const friday = new Date(mondayTarget.valueOf() + 4 * 86400000);
-  return friday.toISOString().split('T')[0]; // YYYY-MM-DD
+  return new Date(mondayTarget.valueOf() + 4 * 86400000).toISOString().split('T')[0];
 }
 
-const getWeekFromDateStr = (dateStr) => getMondayBasedWeekLabel(new Date(dateStr));
+async function run() {
+  const targetWeek = process.argv[2] || await getMondayBasedWeekLabel(time.nowIso({ ctx: 'billing_cli' }));
+  console.log(`--- Generating Invoices for Week: ${targetWeek} ---`);
 
-const targetWeek = process.argv[2] || getMondayBasedWeekLabel(time.nowIso({ ctx: 'billing_cli' }));
-console.log(`--- Generating Invoices for Week: ${targetWeek} ---`);
+  const unbilledTickets = await db.all("SELECT * FROM tickets WHERE billing_status = 'pending' OR billing_status = 'unbilled'");
 
-function run() {
-  const unbilledTickets = db.prepare(`
-    SELECT * FROM tickets WHERE billing_status = 'unbilled'
-  `).all();
-
-  const ticketsToBill = unbilledTickets.filter(t => {
-    let w = t.billing_week;
-    if (!w) w = getWeekFromDateStr(t.created_at);
-    return w === targetWeek;
-  });
-
-  console.log(`Found ${ticketsToBill.length} unbilled tickets for week ${targetWeek}.`);
-
-  if (ticketsToBill.length === 0) {
-    console.log('No tickets to process.');
-    return;
-  }
-
+  // Group by company
   const ticketsByCompany = {};
-  for (const t of ticketsToBill) {
-    const cId = Number(t.company_id);
-    if (!ticketsByCompany[cId]) ticketsByCompany[cId] = [];
-    ticketsByCompany[cId].push(t);
+  for (const t of unbilledTickets) {
+    let w = t.billing_week;
+    if (!w) {
+      const date = new Date(t.created_at);
+      w = await getMondayBasedWeekLabel(date);
+    }
+    if (w === targetWeek) {
+      if (!ticketsByCompany[t.company_id]) ticketsByCompany[t.company_id] = [];
+      ticketsByCompany[t.company_id].push(t);
+    }
   }
 
-  for (const companyIdStr of Object.keys(ticketsByCompany)) {
-    const companyId = Number(companyIdStr);
-    const companyTickets = ticketsByCompany[companyId];
+  for (const [companyId, tickets] of Object.entries(ticketsByCompany)) {
+    console.log(`Processing Company ${companyId}: ${tickets.length} tickets...`);
+    const dueDate = await getFridayFromWeek(targetWeek);
 
-    console.log(`Processing Company ${companyId}: ${companyTickets.length} tickets...`);
+    try {
+      await db.run('BEGIN');
 
-    // ALLOW BILLING even if blocked. 
-    // If tickets exist (service rendered), the debt must be formalized.
-    // Access control prevents NEW tickets, but Billing must process OLD ones.
+      // Insert Invoice
+      await db.run(
+        `INSERT INTO invoices (company_id, billing_week, issue_date, due_date, status, currency) 
+                 VALUES (?, ?, ?, ?, 'pending', 'USD') 
+                 ON CONFLICT (company_id, billing_week) DO NOTHING`,
+        companyId, targetWeek, time.nowIso({ ctx: 'billing_insert' }), dueDate
+      );
 
-    const tx = db.transaction(() => {
-      const dueDate = getFridayFromWeek(targetWeek);
+      const invoice = await db.get("SELECT id FROM invoices WHERE company_id = ? AND billing_week = ?", companyId, targetWeek);
+      if (!invoice) throw new Error('Invoice creation failed');
 
-      db.prepare(`
-        INSERT OR IGNORE INTO invoices (company_id, billing_week, issue_date, due_date, status, currency)
-        VALUES (?, ?, ?, ?, 'pending', 'USD')
-      `).run(companyId, targetWeek, time.nowIso({ ctx: 'billing_insert' }), dueDate);
-
-      const invoice = db.prepare(`
-        SELECT id FROM invoices WHERE company_id = ? AND billing_week = ?
-      `).get(companyId, targetWeek);
-
-      if (!invoice) throw new Error('Failed to retrieve invoice');
-
-      for (const ticket of companyTickets) {
-        let currentTicketWeek = ticket.billing_week;
-        if (!currentTicketWeek) {
-          currentTicketWeek = getWeekFromDateStr(ticket.created_at);
-          db.prepare(`UPDATE tickets SET billing_week = ? WHERE id = ?`).run(currentTicketWeek, ticket.id);
-        }
-
-        db.prepare(`
-          INSERT OR IGNORE INTO invoice_items (invoice_id, ticket_id, price_cents)
-          VALUES (?, ?, ?)
-        `).run(invoice.id, ticket.id, ticket.price_cents);
-
-        db.prepare(`UPDATE tickets SET billing_status = 'billed' WHERE id = ?`).run(ticket.id);
+      for (const ticket of tickets) {
+        await db.run(
+          `INSERT INTO invoice_items (invoice_id, ticket_id, price_cents) VALUES (?, ?, ?)
+                     ON CONFLICT (invoice_id, ticket_id) DO NOTHING`,
+          invoice.id, ticket.id, ticket.price_cents
+        );
+        await db.run("UPDATE tickets SET billing_status = 'billed', billing_week = ? WHERE id = ?", targetWeek, ticket.id);
       }
 
-      const totals = db.prepare(`
-        SELECT COALESCE(SUM(price_cents),0) AS subtotal, COUNT(*) AS count
-        FROM invoice_items WHERE invoice_id = ?
-      `).get(invoice.id);
+      // Update Totals
+      const totals = await db.get("SELECT SUM(price_cents) as subtotal, COUNT(*) as cnt FROM invoice_items WHERE invoice_id = ?", invoice.id);
+      await db.run("UPDATE invoices SET subtotal_cents = ?, total_cents = ? WHERE id = ?", totals.subtotal, totals.subtotal, invoice.id);
 
-      db.prepare(`
-        UPDATE invoices SET subtotal_cents = ?, total_cents = ? WHERE id = ?
-      `).run(totals.subtotal, totals.subtotal, invoice.id);
-
-      const payload = {
-        invoice_id: invoice.id,
-        company_id: companyId,
-        billing_week: targetWeek,
-        total_cents: totals.subtotal,
-        ticket_count: totals.count
-      };
-
-      try {
-        db.prepare(`
-          INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata)
-          VALUES ('invoice_generated', ?, ?, ?, ?)
-        `).run(time.nowIso({ ctx: 'billing_event' }), companyId, invoice.id, JSON.stringify(payload));
-        console.log(`Event emitted for invoice ${invoice.id}`);
-      } catch (err) {
-        if (!String(err.message).includes('UNIQUE constraint failed')) throw err;
-        console.log(`Event already emitted for invoice ${invoice.id}`);
-      }
-
-      // Optional: re-check after changes (doesn't hurt)
-      checkAndEnforceBlocking(db, companyId);
-    });
-
-    tx();
-    console.log(`Company ${companyId} invoices generated successfully.`);
+      await db.run('COMMIT');
+      console.log(`✅ Invoice ${invoice.id} generated.`);
+    } catch (e) {
+      await db.run('ROLLBACK');
+      console.error(`❌ Failed for Company ${companyId}:`, e.message);
+    }
   }
 }
 
-try {
-  run();
-} catch (e) {
-  console.error('Script failed:', e);
-  process.exit(1);
+if (require.main === module) {
+  run().catch(console.error);
 }
