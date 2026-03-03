@@ -33,8 +33,6 @@ const db = require('./db_adapter');
             console.log('[SQLite] Relaxing tickets.request_id constraint via table recreation...');
             await db.run("PRAGMA foreign_keys=off");
             try {
-                // We check if it's already nullable by inspecting schema or just doing it if needed.
-                // Re-running table recreation is safe if logic is correct.
                 await db.run("BEGIN TRANSACTION");
                 await db.run("DROP TABLE IF EXISTS tickets_new");
                 await db.run(`
@@ -78,13 +76,11 @@ const db = require('./db_adapter');
         } else {
             console.log('[Postgres] Relaxing tickets.request_id constraint...');
             try {
-                // Drop NOT NULL and UNIQUE if they exist
                 await db.run('ALTER TABLE tickets ALTER COLUMN request_id DROP NOT NULL');
-                // Drop unique constraint if it exists (might need name inspection, usually it's tickets_request_id_key)
                 try {
                     await db.run('ALTER TABLE tickets DROP CONSTRAINT IF EXISTS tickets_request_id_key');
                 } catch (e) {
-                    console.log('⚠️ Could not drop unique constraint (might already be gone or different name):', e.message);
+                    console.log('⚠️ Could not drop unique constraint:', e.message);
                 }
                 console.log('✅ Postgres tickets.request_id relaxed.');
             } catch (e) {
