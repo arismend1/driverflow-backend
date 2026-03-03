@@ -1515,20 +1515,21 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
     }
 });
 
-// GET /matches/opportunities — Driver sees matched companies
+// GET /matches/opportunities — User sees their specific matches
 app.get('/matches/opportunities', authenticateToken, async (req, res) => {
-    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can view opportunities' });
-
-    // --- DIAGNOSTIC: log full token payload ---
-    console.log(`[Matches] /matches/opportunities req.user =`, JSON.stringify(req.user));
-
-    const driverId = req.user.id;
-    console.log(`[Matches] /matches/opportunities called by driver_id=${driverId} type=${req.user.type}`);
+    const userId = req.user.id;
+    const userType = req.user.type; // 'driver' or 'empresa'
 
     try {
-        // --- DIAGNOSTIC: raw count of matches for this driver ---
-        const rawCount = await db.get('SELECT COUNT(*) AS cnt FROM potential_matches WHERE driver_id = ?', driverId);
-        console.log(`[Matches] RAW potential_matches count for driver_id=${driverId}: ${rawCount?.cnt || 0}`);
+        // Enforce ownership: drivers see their matches, companies see theirs.
+        let filterColumn = '';
+        if (userType === 'driver') {
+            filterColumn = 'pm.driver_id';
+        } else if (userType === 'empresa') {
+            filterColumn = 'pm.company_id';
+        } else {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
 
         const rows = await db.all(`
             SELECT
@@ -1545,15 +1546,11 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             FROM potential_matches pm
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
-            WHERE pm.driver_id = ?
+            WHERE ${filterColumn} = ?
               AND pm.status != 'DECLINED'
             ORDER BY pm.match_score DESC, pm.created_at DESC
-        `, driverId);
+        `, userId);
 
-        console.log(`[Matches] /matches/opportunities returning ${rows.length} rows for driver_id=${driverId}`);
-        if (rows.length > 0) {
-            console.log(`[Matches] sample row: match_id=${rows[0].match_id} company_id=${rows[0].company_id} display_name=${rows[0].display_name} status=${rows[0].status} score=${rows[0].match_score}`);
-        }
         res.json(rows);
     } catch (e) {
         console.error('[Matches] /matches/opportunities error:', e.message);
