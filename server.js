@@ -36,6 +36,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_fix_profile_columns.js', { stdio: 'inherit' });
         execSync('node migrate_availability.js', { stdio: 'inherit' });
         execSync('node migrate_matches_consent.js', { stdio: 'inherit' });
+        execSync('node migrate_ticket_match_unique.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1684,9 +1685,21 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Driver must consent first' });
         }
 
-        // Double Click Protection
+        // Double Click Protection (match-level)
         if (match.ticket_id) {
             return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        }
+
+        // Double Click Protection (ticket-level — prevents NULL match_id duplicates)
+        const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ? LIMIT 1', matchId);
+        if (existingTicket) {
+            // Ticket already exists for this match — sync match record and return success
+            await db.run(
+                'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, updated_at = ? WHERE id = ?',
+                now, existingTicket.id, now, matchId
+            );
+            await finalizeShare(matchId);
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: existingTicket.id });
         }
 
         // Weekly charge (ticket) Parametrized
@@ -1694,10 +1707,10 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
         const currency = 'USD';
 
         const t = await db.run(
-            "INSERT INTO tickets (company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,'pending',?)",
-            match.company_id, match.driver_id, amount, amount, currency, now, `Match ID: ${matchId}`
+            "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,?,'pending',?) RETURNING id",
+            parseInt(matchId), match.company_id, match.driver_id, amount, amount, currency, now, `Match ID: ${matchId}`
         );
-        const ticketId = t.lastInsertRowid || t.insertId;
+        const ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : (t.lastInsertRowid || t.insertId);
 
         await db.run(
             'UPDATE potential_matches SET company_share_consent_at = ?, ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
