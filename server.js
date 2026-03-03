@@ -35,6 +35,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_driver_profile.js', { stdio: 'inherit' });
         execSync('node migrate_fix_profile_columns.js', { stdio: 'inherit' });
         execSync('node migrate_availability.js', { stdio: 'inherit' });
+        execSync('node migrate_matches_consent.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
