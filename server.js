@@ -37,6 +37,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_availability.js', { stdio: 'inherit' });
         execSync('node migrate_matches_consent.js', { stdio: 'inherit' });
         execSync('node migrate_ticket_match_unique.js', { stdio: 'inherit' });
+        execSync('node migrate_ticket_payment.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -190,6 +191,21 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     WHERE stripe_payment_intent_id=$5 AND status != 'charged'
                 `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
                 console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
+            }
+        }
+
+        // 4. Ticket Checkout Reconciliation
+        if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const ticketId = session.metadata?.ticket_id || session.client_reference_id;
+            if (ticketId) {
+                const piId = session.payment_intent || null;
+                const customerId = session.customer || null;
+                await db.run(
+                    `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
+                    nowIso(), piId, customerId, ticketId
+                );
+                console.log(`[Stripe Webhook] Ticket #${ticketId} marked PAID (PI: ${piId})`);
             }
         }
 
@@ -769,8 +785,8 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
     const tid = req.params.id;
 
     try {
-        const ticket = await db.get("SELECT * FROM tickets WHERE id=?", tid);
-        if (!ticket || ticket.company_id !== req.user.id) return res.status(404).json({ error: 'Not Found' });
+        const ticket = await db.get("SELECT * FROM tickets WHERE id=? AND company_id=?", tid, req.user.id);
+        if (!ticket) return res.status(404).json({ error: 'Not Found' });
         if (ticket.billing_status === 'paid') return res.status(409).json({ error: 'Already Paid' });
 
         const stripe = getStripe();
@@ -781,18 +797,25 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
             line_items: [{
                 price_data: {
                     currency: (ticket.currency || 'usd').toLowerCase(),
-                    product_data: { name: `Ticket #${ticket.id}`, description: `Service for Req #${ticket.request_id}` },
+                    product_data: { name: `Ticket #${ticket.id}`, description: `Match #${ticket.match_id}` },
                     unit_amount: ticket.price_cents
                 },
                 quantity: 1
             }],
             mode: 'payment',
-            metadata: { ticket_id: ticket.id, company_id: req.user.id },
+            client_reference_id: String(ticket.id),
+            metadata: { ticket_id: String(ticket.id), company_id: String(req.user.id), match_id: String(ticket.match_id) },
+            payment_intent_data: {
+                metadata: { ticket_id: String(ticket.id), company_id: String(req.user.id), match_id: String(ticket.match_id) }
+            },
             success_url: process.env.STRIPE_SUCCESS_URL || 'http://localhost:3000/success',
             cancel_url: process.env.STRIPE_CANCEL_URL || 'http://localhost:3000/cancel',
         });
 
-        await db.run("UPDATE tickets SET stripe_checkout_session_id=? WHERE id=?", session.id, tid);
+        await db.run(
+            "UPDATE tickets SET stripe_checkout_session_id=?, billing_status='checkout_created' WHERE id=? AND billing_status <> 'paid'",
+            session.id, tid
+        );
         res.json({ success: true, checkout_url: session.url });
 
     } catch (e) {
