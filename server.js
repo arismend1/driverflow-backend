@@ -1685,41 +1685,28 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Driver must consent first' });
         }
 
-        // Double Click Protection (match-level)
-        if (match.ticket_id) {
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
-        }
-
-        // Double Click Protection (ticket-level — prevents NULL match_id duplicates)
-        const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ? LIMIT 1', matchId);
-        if (existingTicket) {
-            // Ticket already exists for this match — sync match record and return success
-            await db.run(
-                'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, updated_at = ? WHERE id = ?',
-                now, existingTicket.id, now, matchId
-            );
-            await finalizeShare(matchId);
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: existingTicket.id });
-        }
-
-        // Weekly charge (ticket) Parametrized
+        // Weekly charge (ticket) — Atomic UPSERT (race-condition safe)
         const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
-        const currency = 'USD';
 
         const t = await db.run(
-            "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,?,'pending',?) RETURNING id",
-            parseInt(matchId), match.company_id, match.driver_id, amount, amount, currency, now, `Match ID: ${matchId}`
+            `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
+             VALUES (?,?,?,?,?,'USD',?,'pending',?)
+             ON CONFLICT (match_id)
+             DO UPDATE SET match_id = EXCLUDED.match_id
+             RETURNING *`,
+            parseInt(matchId), match.company_id, match.driver_id, amount, amount, now, `Match ID: ${matchId}`
         );
-        const ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : (t.lastInsertRowid || t.insertId);
+        const ticket = (t.rows && t.rows[0]) ? t.rows[0] : null;
+        const ticketId = ticket ? ticket.id : t.lastInsertRowid;
 
         await db.run(
-            'UPDATE potential_matches SET company_share_consent_at = ?, ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
-            now, ticketId, amount, currency, now, matchId
+            'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
+            now, ticketId, amount, 'USD', now, matchId
         );
 
         await finalizeShare(matchId);
 
-        console.log(`[Matches] Company confirmed share for match ${matchId}. Created ticket ${ticketId}`);
+        console.log(`[Matches] Company confirmed share for match ${matchId}. Ticket ${ticketId}`);
         res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] company confirm-share error:', e);
