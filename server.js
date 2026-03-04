@@ -1649,9 +1649,9 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND driver_id = ?', matchId, req.user.id);
         if (!match) return res.status(404).json({ error: 'Match not found' });
 
-        if (!['PREMATCH_READY', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'ACCEPTED'].includes(match.status)) {
-            // Include 'ACCEPTED' as fallback if status didn't flip yet
-            // return res.status(409).json({ error: 'Invalid state for consent' });
+        const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
+        if (!validDriverStates.includes(match.status)) {
+            return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
 
         await db.run(
@@ -1680,6 +1680,11 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
     try {
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND company_id = ?', matchId, req.user.id);
         if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
+        if (!validCompanyStates.includes(match.status)) {
+            return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
+        }
 
         if (!match.driver_share_consent_at) {
             return res.status(409).json({ error: 'Driver must consent first' });
