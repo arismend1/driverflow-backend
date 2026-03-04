@@ -7,6 +7,7 @@
  *   - Race conditions: pg_advisory_lock prevents duplicate generation
  *   - Eligibility: only search_status='ON' users
  *   - Scoring: same algorithm as run_matching.js
+ *   - DEFENSIVE: all infrastructure calls wrapped in try/catch to prevent 500s
  */
 
 const db = require('./db_adapter');
@@ -42,7 +43,6 @@ function computeScore(co, dr) {
 
     const breakdown = { operation: 0, license: 0, experience: 0, availability: 0 };
 
-    // Operation Types (40%)
     const reqOps = toArray(co.req_operation_types).map(s => s.toLowerCase());
     const drOps = toArray(dr.operation_types).map(s => s.toLowerCase());
     if (reqOps.length === 0 || drOps.length === 0) {
@@ -51,7 +51,6 @@ function computeScore(co, dr) {
         breakdown.operation = reqOps.filter(r => drOps.includes(r)).length / reqOps.length;
     }
 
-    // Licenses (25%)
     const reqLics = toArray(co.req_license_types).map(s => s.toLowerCase());
     const drLics = toArray(dr.license_types).map(s => s.toLowerCase());
     if (reqLics.length === 0 || drLics.length === 0) {
@@ -60,7 +59,6 @@ function computeScore(co, dr) {
         breakdown.license = reqLics.filter(r => drLics.includes(r)).length / reqLics.length;
     }
 
-    // Experience (20%)
     if (!co.req_experience_years) {
         breakdown.experience = 1.0;
     } else {
@@ -69,7 +67,6 @@ function computeScore(co, dr) {
         breakdown.experience = (reqExp <= 0) ? 1.0 : (drExp >= reqExp) ? 1.0 : drExp / reqExp;
     }
 
-    // Availability (15%)
     if (!co.availability || !dr.availability) {
         breakdown.availability = 1.0;
     } else {
@@ -84,65 +81,88 @@ function computeScore(co, dr) {
     return score >= MIN_SCORE ? { score, breakdown } : null;
 }
 
-// --- Cooldown check ---
+// --- Cooldown check (DEFENSIVE: if table missing → not in cooldown) ---
 async function checkCooldown(userId, userType) {
-    const row = await db.get(
-        'SELECT last_generated_at FROM user_match_generation_log WHERE user_id = ? AND user_type = ?',
-        userId, userType
-    );
-    if (!row) return false; // No record = not in cooldown
-
-    const lastGen = new Date(row.last_generated_at);
-    const cooldownMs = MATCH_COOLDOWN_MINUTES * 60 * 1000;
-    return (Date.now() - lastGen.getTime()) < cooldownMs;
+    try {
+        const row = await db.get(
+            'SELECT last_generated_at FROM user_match_generation_log WHERE user_id = ? AND user_type = ?',
+            userId, userType
+        );
+        if (!row) return false;
+        const lastGen = new Date(row.last_generated_at);
+        const cooldownMs = MATCH_COOLDOWN_MINUTES * 60 * 1000;
+        return (Date.now() - lastGen.getTime()) < cooldownMs;
+    } catch (e) {
+        console.error(`[LazyMatch] checkCooldown error (table may not exist): ${e.message}`);
+        return false; // Fail open: allow generation if cooldown table broken
+    }
 }
 
 async function updateCooldown(userId, userType) {
-    await db.run(
-        `INSERT INTO user_match_generation_log (user_id, user_type, last_generated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT (user_id, user_type) DO UPDATE SET last_generated_at = EXCLUDED.last_generated_at`,
-        userId, userType, nowIso()
-    );
+    try {
+        await db.run(
+            `INSERT INTO user_match_generation_log (user_id, user_type, last_generated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (user_id, user_type) DO UPDATE SET last_generated_at = EXCLUDED.last_generated_at`,
+            userId, userType, nowIso()
+        );
+    } catch (e) {
+        console.error(`[LazyMatch] updateCooldown error: ${e.message}`);
+        // Non-fatal: generation still succeeds even if cooldown can't be recorded
+    }
 }
 
 // --- Advisory lock (Postgres) / no-op (SQLite) ---
+// IMPORTANT: Uses ? placeholder so db_adapter converts to $1 for Postgres
 async function acquireLock(lockKey) {
     if (db.IS_POSTGRES) {
-        const result = await db.get('SELECT pg_try_advisory_lock($1) AS acquired', lockKey);
-        return result && result.acquired;
+        try {
+            const result = await db.get('SELECT pg_try_advisory_lock(?) AS acquired', lockKey);
+            return result && result.acquired === true;
+        } catch (e) {
+            console.error(`[LazyMatch] acquireLock error: ${e.message}`);
+            return true; // Fail open: allow generation if lock fails
+        }
     }
-    return true; // SQLite: no concurrent requests in practice
+    return true;
 }
 
 async function releaseLock(lockKey) {
     if (db.IS_POSTGRES) {
-        await db.run('SELECT pg_advisory_unlock($1)', lockKey);
+        try {
+            await db.get('SELECT pg_advisory_unlock(?) AS released', lockKey);
+        } catch (e) {
+            console.error(`[LazyMatch] releaseLock error: ${e.message}`);
+        }
     }
 }
 
 // --- Freshness check ---
 async function countRecentActive(userId, userType) {
-    const col = userType === 'driver' ? 'driver_id' : 'company_id';
-    const intervalClause = db.IS_POSTGRES
-        ? `AND pm.created_at >= NOW() - INTERVAL '${MATCH_FRESH_HOURS} hours'`
-        : `AND pm.created_at >= datetime('now', '-${MATCH_FRESH_HOURS} hours')`;
+    try {
+        const col = userType === 'driver' ? 'driver_id' : 'company_id';
+        const intervalClause = db.IS_POSTGRES
+            ? `AND pm.created_at >= NOW() - INTERVAL '${MATCH_FRESH_HOURS} hours'`
+            : `AND pm.created_at >= datetime('now', '-${MATCH_FRESH_HOURS} hours')`;
 
-    const row = await db.get(
-        `SELECT COUNT(*) AS cnt FROM potential_matches pm
-         WHERE pm.${col} = ?
-           AND pm.status NOT IN ('DECLINED','EXPIRED')
-           ${intervalClause}`,
-        userId
-    );
-    return row ? parseInt(row.cnt) : 0;
+        const row = await db.get(
+            `SELECT COUNT(*) AS cnt FROM potential_matches pm
+             WHERE pm.${col} = ?
+               AND pm.status NOT IN ('DECLINED','EXPIRED')
+               ${intervalClause}`,
+            userId
+        );
+        return row ? parseInt(row.cnt) : 0;
+    } catch (e) {
+        console.error(`[LazyMatch] countRecentActive error: ${e.message}`);
+        return 0; // Fail open: treat as 0 active → will generate
+    }
 }
 
-// --- Should generate? (freshness + minCount + cooldown) ---
+// --- Should generate? ---
 async function shouldGenerate(userId, userType) {
     const recentActive = await countRecentActive(userId, userType);
     const inCooldown = await checkCooldown(userId, userType);
-
     const needsMore = recentActive < MATCH_MIN_ACTIVE;
 
     console.log(`[LazyMatch] user=${userType} id=${userId} recent_active=${recentActive} min=${MATCH_MIN_ACTIVE} freshHours=${MATCH_FRESH_HOURS} cooldown=${inCooldown ? 'IN_COOLDOWN' : 'OK'} needsMore=${needsMore}`);
@@ -167,7 +187,6 @@ async function generateMatchesForDriver(driverId) {
         return 0;
     }
 
-    // Advisory lock (hash driverId to int for pg_advisory_lock)
     const lockKey = 100000 + driverId;
     const acquired = await acquireLock(lockKey);
     if (!acquired) {
@@ -220,7 +239,7 @@ async function generateMatchesForDriver(driverId) {
                 );
 
                 if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) {
-                    continue; // Respect declined/expired — don't resurrect
+                    continue;
                 }
 
                 if (existing) {
@@ -239,7 +258,7 @@ async function generateMatchesForDriver(driverId) {
                 }
             } catch (e) {
                 if (e.code === '23505' || (e.message && e.message.includes('UNIQUE'))) {
-                    updated++; // Race condition: another request already inserted
+                    updated++;
                 } else {
                     console.error(`[LazyMatch] Insert error (company=${company.id}, driver=${driverId}):`, e.message);
                 }
