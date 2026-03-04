@@ -1519,16 +1519,126 @@ app.get('/api/diagnostics/version', (req, res) => {
     res.json({ version: '1.3.5-profile-crash-fix', status: 'deploy-verified' });
 });
 
+// ─── MATCHES HELPERS (defensive, crash-proof) ──────────────────────────────
+
+async function ensureUserMatchGenerationLogTable() {
+    try {
+        await db.run(`
+            CREATE TABLE IF NOT EXISTS user_match_generation_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                user_type TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await db.run(`
+            CREATE INDEX IF NOT EXISTS idx_umgl_user_time
+            ON user_match_generation_log (user_type, user_id, created_at DESC)
+        `);
+    } catch (e) {
+        console.error("[matches] ensureUserMatchGenerationLogTable failed:", e.message);
+    }
+}
+
+async function getLastGenerationAt(userType, userId) {
+    try {
+        const row = await db.get(
+            `SELECT created_at FROM user_match_generation_log
+             WHERE user_type = ? AND user_id = ?
+             ORDER BY created_at DESC LIMIT 1`,
+            userType, userId
+        );
+        return row ? row.created_at : null;
+    } catch (e) {
+        if (String(e.message || "").includes("does not exist") || e.code === "42P01") {
+            console.warn("[matches] user_match_generation_log missing; creating...");
+            await ensureUserMatchGenerationLogTable();
+            return null;
+        }
+        throw e;
+    }
+}
+
+async function writeGenerationLog(userType, userId) {
+    try {
+        await db.run(
+            `INSERT INTO user_match_generation_log (user_type, user_id) VALUES (?, ?)`,
+            userType, userId
+        );
+    } catch (e) {
+        if (String(e.message || "").includes("does not exist") || e.code === "42P01") {
+            await ensureUserMatchGenerationLogTable();
+            try {
+                await db.run(
+                    `INSERT INTO user_match_generation_log (user_type, user_id) VALUES (?, ?)`,
+                    userType, userId
+                );
+            } catch (e2) {
+                console.error("[matches] writeGenerationLog retry failed:", e2.message);
+            }
+            return;
+        }
+        console.error("[matches] writeGenerationLog failed:", e.message);
+    }
+}
+
+async function tryUserAdvisoryLock(lockKey) {
+    try {
+        const row = await db.get(`SELECT pg_try_advisory_lock(?) AS locked`, lockKey);
+        return !!(row && (row.locked === true || row.locked === 1));
+    } catch (e) {
+        console.warn("[matches] advisory lock failed, continuing without lock:", e.message);
+        return true; // fail open
+    }
+}
+
+async function unlockUserAdvisoryLock(lockKey) {
+    try {
+        await db.get(`SELECT pg_advisory_unlock(?)`, lockKey);
+    } catch (_) { }
+}
+
 // ─── MATCHES READER ENDPOINTS ───────────────────────────────────────────────
 
 // GET /matches/candidates — Company sees matched drivers
 app.get('/matches/candidates', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can view candidates' });
-    try {
-        // Lazy matching: generate on-demand if too few fresh matches
-        const { generateMatchesForCompany } = require('./lazy_matching');
-        await generateMatchesForCompany(req.user.id);
 
+    try {
+        const freshHours = Number(process.env.MATCH_FRESH_HOURS || 24);
+        const minActive = Number(process.env.MATCH_MIN_ACTIVE || 5);
+        const cooldownMin = Number(process.env.MATCH_COOLDOWN_MINUTES || 10);
+        const cutoff = new Date(Date.now() - freshHours * 3600 * 1000).toISOString();
+
+        // 1) Count fresh active matches
+        const recentRow = await db.get(
+            `SELECT COUNT(*) AS c FROM potential_matches
+             WHERE company_id = ? AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+            req.user.id, cutoff
+        );
+        const recentCount = recentRow ? parseInt(recentRow.c) : 0;
+
+        // 2) Generate if needed
+        if (recentCount < minActive) {
+            const lastGen = await getLastGenerationAt('empresa', req.user.id);
+            const inCooldown = lastGen && (Date.now() - new Date(lastGen).getTime()) < cooldownMin * 60 * 1000;
+
+            if (!inCooldown) {
+                const lockKey = 200000 + req.user.id;
+                const locked = await tryUserAdvisoryLock(lockKey);
+                if (locked) {
+                    try {
+                        const { generateMatchesForCompany } = require('./lazy_matching');
+                        await generateMatchesForCompany(req.user.id);
+                        await writeGenerationLog('empresa', req.user.id);
+                    } finally {
+                        await unlockUserAdvisoryLock(lockKey);
+                    }
+                }
+            }
+        }
+
+        // 3) Return matches (existing query)
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
@@ -1563,7 +1673,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
 
         res.json(sanitized);
     } catch (e) {
-        console.error('[Matches] /matches/candidates error:', e.message);
+        console.error('[matches/candidates] fatal:', e);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -1574,23 +1684,55 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     const userType = req.user.type; // 'driver' or 'empresa'
 
     try {
-        // Lazy matching: generate on-demand if too few fresh matches
-        const { generateMatchesForDriver, generateMatchesForCompany } = require('./lazy_matching');
-        if (userType === 'driver') {
-            await generateMatchesForDriver(userId);
-        } else if (userType === 'empresa') {
-            await generateMatchesForCompany(userId);
-        }
+        const freshHours = Number(process.env.MATCH_FRESH_HOURS || 24);
+        const minActive = Number(process.env.MATCH_MIN_ACTIVE || 5);
+        const cooldownMin = Number(process.env.MATCH_COOLDOWN_MINUTES || 10);
+        const cutoff = new Date(Date.now() - freshHours * 3600 * 1000).toISOString();
 
-        let filterColumn = '';
-        if (userType === 'driver') {
-            filterColumn = 'pm.driver_id';
-        } else if (userType === 'empresa') {
-            filterColumn = 'pm.company_id';
-        } else {
+        const filterColumn = userType === 'driver' ? 'driver_id' : 'company_id';
+        if (userType !== 'driver' && userType !== 'empresa') {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
+        // 1) Count fresh active matches
+        const recentRow = await db.get(
+            `SELECT COUNT(*) AS c FROM potential_matches
+             WHERE ${filterColumn} = ? AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+            userId, cutoff
+        );
+        const recentCount = recentRow ? parseInt(recentRow.c) : 0;
+        console.log(`[matches/opportunities] user=${userType} id=${userId} recentActive=${recentCount} min=${minActive}`);
+
+        // 2) Generate if needed (freshness + cooldown + lock)
+        if (recentCount < minActive) {
+            const lastGen = await getLastGenerationAt(userType, userId);
+            const inCooldown = lastGen && (Date.now() - new Date(lastGen).getTime()) < cooldownMin * 60 * 1000;
+
+            if (inCooldown) {
+                console.log(`[matches/opportunities] user=${userType} id=${userId} inCooldown=true, skipping generation`);
+            } else {
+                const lockKey = (userType === 'driver' ? 100000 : 200000) + userId;
+                const locked = await tryUserAdvisoryLock(lockKey);
+
+                if (!locked) {
+                    console.log(`[matches/opportunities] user=${userType} id=${userId} lock=blocked`);
+                } else {
+                    try {
+                        const { generateMatchesForDriver, generateMatchesForCompany } = require('./lazy_matching');
+                        if (userType === 'driver') {
+                            await generateMatchesForDriver(userId);
+                        } else {
+                            await generateMatchesForCompany(userId);
+                        }
+                        await writeGenerationLog(userType, userId);
+                    } finally {
+                        await unlockUserAdvisoryLock(lockKey);
+                    }
+                }
+            }
+        }
+
+        // 3) Return matches (existing query)
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
@@ -1610,7 +1752,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             FROM potential_matches pm
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
-            WHERE ${filterColumn} = ?
+            WHERE pm.${filterColumn} = ?
               AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.match_score DESC, pm.created_at DESC
         `, userId);
@@ -1624,7 +1766,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
 
         res.json(sanitized);
     } catch (e) {
-        console.error('[Matches] /matches/opportunities error:', e.message);
+        console.error('[matches/opportunities] fatal:', e);
         res.status(500).json({ error: 'Server error' });
     }
 });
