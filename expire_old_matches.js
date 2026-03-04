@@ -2,23 +2,29 @@ require('dotenv').config();
 const db = require('./db_adapter');
 const { nowIso } = require('./time_provider');
 
-const STALE_HOURS = parseInt(process.env.EXPIRE_MATCH_HOURS) || 24;
+const STALE_HOURS = parseInt(process.env.EXPIRE_MATCH_HOURS) || 48;
+
+const EXPIRABLE_STATES = ['NEW', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
 
 async function expireOldMatches() {
-    console.log(`[Expirer] Starting — looking for NEW matches older than ${STALE_HOURS}h`);
+    console.log(`[Expirer] Starting — looking for stale matches (${EXPIRABLE_STATES.join(', ')}) older than ${STALE_HOURS}h`);
 
+    const placeholders = EXPIRABLE_STATES.map(() => '?').join(',');
     let staleMatches;
+
     if (db.IS_POSTGRES) {
         staleMatches = await db.all(
-            `SELECT id FROM potential_matches
-             WHERE status = 'NEW'
-               AND created_at < NOW() - INTERVAL '${STALE_HOURS} hours'`
+            `SELECT id, status FROM potential_matches
+             WHERE status IN (${placeholders})
+               AND created_at < NOW() - INTERVAL '${STALE_HOURS} hours'`,
+            ...EXPIRABLE_STATES
         );
     } else {
         staleMatches = await db.all(
-            `SELECT id FROM potential_matches
-             WHERE status = 'NEW'
-               AND created_at < datetime('now', '-${STALE_HOURS} hours')`
+            `SELECT id, status FROM potential_matches
+             WHERE status IN (${placeholders})
+               AND created_at < datetime('now', '-${STALE_HOURS} hours')`,
+            ...EXPIRABLE_STATES
         );
     }
 
@@ -27,9 +33,10 @@ async function expireOldMatches() {
     for (const match of staleMatches) {
         try {
             await db.run(
-                `UPDATE potential_matches SET status = 'EXPIRED', updated_at = ? WHERE id = ? AND status = 'NEW'`,
-                nowIso(), match.id
+                `UPDATE potential_matches SET status = 'EXPIRED', updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+                nowIso(), match.id, ...EXPIRABLE_STATES
             );
+            console.log(`[Expirer] ✅ Match #${match.id} (was ${match.status}) → EXPIRED`);
             expiredCount++;
         } catch (e) {
             console.error(`[Expirer] ❌ Match #${match.id} error:`, e.message);
@@ -42,19 +49,10 @@ async function expireOldMatches() {
 }
 
 // --- Execution modes ---
-
-// 1. Direct run: node expire_old_matches.js
 if (require.main === module) {
     expireOldMatches()
-        .then(r => {
-            console.log('[Expirer] Exit:', JSON.stringify(r));
-            process.exit(0);
-        })
-        .catch(e => {
-            console.error('[Expirer] Fatal:', e);
-            process.exit(1);
-        });
+        .then(r => { console.log('[Expirer] Exit:', JSON.stringify(r)); process.exit(0); })
+        .catch(e => { console.error('[Expirer] Fatal:', e); process.exit(1); });
 }
 
-// 2. Import for use in worker_queue.js
 module.exports = { expireOldMatches };
