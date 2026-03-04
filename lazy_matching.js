@@ -1,11 +1,14 @@
 /**
- * lazy_matching.js — Scalable match generation with candidate pool filtering
+ * lazy_matching.js — Scalable match generation with SQL-level overlap filtering
  *
  * Architecture (100k+ scale):
- *   Phase 1: SQL hard filters → candidate pool (max CANDIDATE_POOL_SIZE)
- *   Phase 2: JS pre-filter    → operation/license overlap check (fast, no scoring)
- *   Phase 3: Full scoring      → existing weighted algorithm
- *   Phase 4: Top N insert      → potential_matches (ON CONFLICT)
+ *   Phase 1: SQL hard filters + overlap (&&) → candidate pool (max CANDIDATE_POOL_SIZE)
+ *   Phase 2: Full scoring on reduced pool    → weighted algorithm (40/25/20/15)
+ *   Phase 3: Dynamic pool scaling            → expand to 400 if not enough scored
+ *   Phase 4: Top N insert/update             → potential_matches (ON CONFLICT)
+ *
+ * The overlap is now done in Postgres using && (array overlap) on text columns
+ * converted via regexp_split_to_array + REPLACE to strip JSON brackets/quotes.
  *
  * Infrastructure (cooldown, locks, freshness) is handled by server.js helpers.
  */
@@ -13,7 +16,9 @@
 const db = require('./db_adapter');
 
 const MATCH_MAX_GENERATE = parseInt(process.env.MATCH_MAX_GENERATE) || 20;
+const MATCH_MIN_ACTIVE = parseInt(process.env.MATCH_MIN_ACTIVE) || 5;
 const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
+const CANDIDATE_POOL_EXPAND = parseInt(process.env.CANDIDATE_POOL_EXPAND) || 400;
 const MIN_SCORE = 0.2;
 
 const nowIso = () => new Date().toISOString();
@@ -36,12 +41,13 @@ function toArray(val) {
     return [String(val).trim()].filter(Boolean);
 }
 
-/** Fast overlap check — returns true if any element in A exists in B */
-function hasOverlap(arrA, arrB) {
-    if (arrA.length === 0 || arrB.length === 0) return true; // no filter = compatible
-    const setB = new Set(arrB);
-    return arrA.some(a => setB.has(a));
-}
+/**
+ * SQL expression that converts a TEXT column (JSON array or CSV) to text[]
+ * Strips [ ] " then splits by comma with optional whitespace
+ * Used in WHERE ... && ?::text[] for overlap checks
+ */
+const TEXT_TO_ARRAY = (col) =>
+    `regexp_split_to_array(LOWER(TRIM(REPLACE(REPLACE(REPLACE(COALESCE(${col},''),'\"',''),'[',''),']',''))), '\\s*,\\s*')`;
 
 // ─── Scoring (unchanged: 40/25/20/15 weights) ──────────────────────────────
 
@@ -116,10 +122,120 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
     }
 }
 
+// ─── Candidate pool: Driver → Companies ─────────────────────────────────────
+
+async function fetchCompanyCandidates(driver, limit, excludeIds) {
+    const drOps = toArray(driver.operation_types).map(s => s.toLowerCase().trim()).filter(Boolean);
+    const drLics = toArray(driver.license_types).map(s => s.toLowerCase().trim()).filter(Boolean);
+    const driverHasTruck = driver.has_truck ? 1 : 0;
+
+    // Build dynamic WHERE clauses for overlap filters
+    let opFilter = '';
+    let licFilter = '';
+    let excludeFilter = '';
+    const params = [driverHasTruck];
+
+    // Operation types overlap (SQL-level)
+    if (drOps.length > 0) {
+        opFilter = `AND (cr.req_operation_types IS NULL OR cr.req_operation_types = '' OR ${TEXT_TO_ARRAY('cr.req_operation_types')} && ?::text[])`;
+        params.push(drOps);
+    }
+
+    // License types overlap (SQL-level)
+    if (drLics.length > 0) {
+        licFilter = `AND (cr.req_license_types IS NULL OR cr.req_license_types = '' OR ${TEXT_TO_ARRAY('cr.req_license_types')} && ?::text[])`;
+        params.push(drLics);
+    }
+
+    // Exclude already-evaluated IDs
+    if (excludeIds && excludeIds.length > 0) {
+        excludeFilter = `AND e.id NOT IN (${excludeIds.map(() => '?').join(',')})`;
+        params.push(...excludeIds);
+    }
+
+    params.push(limit);
+
+    const query = `
+        SELECT e.id, e.nombre,
+               cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
+               cr.req_operation_types, cr.req_modalities, cr.req_truck,
+               cr.offered_payment_methods, cr.req_relationships, cr.availability
+        FROM empresas e
+        LEFT JOIN company_requirements cr ON e.id = cr.company_id
+        WHERE e.search_status = 'ON'
+          AND (cr.req_truck IS NULL OR cr.req_truck = false OR ? = 1)
+          ${opFilter}
+          ${licFilter}
+          ${excludeFilter}
+        ORDER BY e.updated_at DESC NULLS LAST
+        LIMIT ?
+    `;
+
+    return db.all(query, ...params);
+}
+
+// ─── Candidate pool: Company → Drivers ──────────────────────────────────────
+
+async function fetchDriverCandidates(company, limit, excludeIds) {
+    const reqOps = toArray(company.req_operation_types).map(s => s.toLowerCase().trim()).filter(Boolean);
+    const reqLics = toArray(company.req_license_types).map(s => s.toLowerCase().trim()).filter(Boolean);
+    const reqTruck = company.req_truck ? 1 : 0;
+
+    let opFilter = '';
+    let licFilter = '';
+    let excludeFilter = '';
+    const params = [reqTruck];
+
+    if (reqOps.length > 0) {
+        opFilter = `AND (d.operation_types IS NULL OR d.operation_types = '' OR ${TEXT_TO_ARRAY('d.operation_types')} && ?::text[])`;
+        params.push(reqOps);
+    }
+
+    if (reqLics.length > 0) {
+        licFilter = `AND (d.license_types IS NULL OR d.license_types = '' OR ${TEXT_TO_ARRAY('d.license_types')} && ?::text[])`;
+        params.push(reqLics);
+    }
+
+    if (excludeIds && excludeIds.length > 0) {
+        excludeFilter = `AND d.id NOT IN (${excludeIds.map(() => '?').join(',')})`;
+        params.push(...excludeIds);
+    }
+
+    params.push(limit);
+
+    const query = `
+        SELECT d.id, d.nombre, d.has_cdl, d.license_types, d.endorsements, d.experience_years,
+               d.operation_types, d.job_preferences, d.has_truck, d.payment_methods,
+               d.work_relationships, d.availability
+        FROM drivers d
+        WHERE d.search_status = 'ON'
+          AND (? = 0 OR d.has_truck = true)
+          ${opFilter}
+          ${licFilter}
+          ${excludeFilter}
+        ORDER BY d.updated_at DESC NULLS LAST
+        LIMIT ?
+    `;
+
+    return db.all(query, ...params);
+}
+
+// ─── Score a pool of candidates ─────────────────────────────────────────────
+
+function scorePool(candidates, scorer) {
+    const scored = [];
+    for (const c of candidates) {
+        const result = scorer(c);
+        if (result) scored.push({ candidate: c, ...result });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored;
+}
+
 // ─── Generate matches for driver ────────────────────────────────────────────
 
 async function generateMatchesForDriver(driverId) {
-    console.log(`[LazyMatch] driver #${driverId}: starting candidate pool filtering`);
+    console.log(`[LazyMatch] driver #${driverId}: starting SQL-filtered candidate pool`);
 
     // Phase 0: Load driver profile
     const driver = await db.get(`
@@ -134,62 +250,45 @@ async function generateMatchesForDriver(driverId) {
         return 0;
     }
 
-    // Phase 1: SQL hard filters → candidate pool
-    // Filter: search_status=ON + truck requirement + LIMIT pool size
-    const driverHasTruck = driver.has_truck ? 1 : 0;
-    const candidates = await db.all(`
-        SELECT e.id, e.nombre,
-               cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
-               cr.req_operation_types, cr.req_modalities, cr.req_truck,
-               cr.offered_payment_methods, cr.req_relationships, cr.availability
-        FROM empresas e
-        LEFT JOIN company_requirements cr ON e.id = cr.company_id
-        WHERE e.search_status = 'ON'
-          AND (cr.req_truck IS NULL OR cr.req_truck = false OR ? = 1)
-        LIMIT ?
-    `, driverHasTruck, CANDIDATE_POOL_SIZE);
+    // Phase 1: SQL candidate pool (hard filters + overlap in SQL)
+    let pool = await fetchCompanyCandidates(driver, CANDIDATE_POOL_SIZE, []);
+    console.log(`[LazyMatch] driver #${driverId}: pool=${pool.length}/${CANDIDATE_POOL_SIZE} (SQL overlap filter)`);
 
-    console.log(`[LazyMatch] driver #${driverId}: pool=${candidates.length}/${CANDIDATE_POOL_SIZE} (SQL hard filter)`);
+    // Phase 2: Score the pool
+    const scorer = (co) => computeScore(co, driver);
+    let scored = scorePool(pool, scorer);
+    console.log(`[LazyMatch] driver #${driverId}: scored=${scored.length} (min_score >= ${MIN_SCORE})`);
 
-    // Phase 2: JS pre-filter — operation type & license overlap
-    const drOps = toArray(driver.operation_types).map(s => s.toLowerCase());
-    const drLics = toArray(driver.license_types).map(s => s.toLowerCase());
-
-    const preFiltered = candidates.filter(co => {
-        const reqOps = toArray(co.req_operation_types).map(s => s.toLowerCase());
-        const reqLics = toArray(co.req_license_types).map(s => s.toLowerCase());
-        return hasOverlap(reqOps, drOps) && hasOverlap(reqLics, drLics);
-    });
-
-    console.log(`[LazyMatch] driver #${driverId}: preFiltered=${preFiltered.length} (op+license overlap)`);
-
-    // Phase 3: Full scoring
-    const scored = [];
-    for (const co of preFiltered) {
-        const result = computeScore(co, driver);
-        if (result) scored.push({ company: co, ...result });
+    // Phase 3: Dynamic pool scaling — expand if not enough matches
+    if (scored.length < MATCH_MIN_ACTIVE && pool.length >= CANDIDATE_POOL_SIZE) {
+        const evaluatedIds = pool.map(c => c.id);
+        console.log(`[LazyMatch] driver #${driverId}: expanding pool to ${CANDIDATE_POOL_EXPAND} (scored ${scored.length} < min ${MATCH_MIN_ACTIVE})`);
+        const extraPool = await fetchCompanyCandidates(driver, CANDIDATE_POOL_EXPAND, evaluatedIds);
+        console.log(`[LazyMatch] driver #${driverId}: extra_pool=${extraPool.length}`);
+        const extraScored = scorePool(extraPool, scorer);
+        scored = scored.concat(extraScored);
+        scored.sort((a, b) => b.score - a.score);
+        pool = pool.concat(extraPool);
     }
 
-    scored.sort((a, b) => b.score - a.score);
+    // Phase 4: Take top N and insert/update
     const top = scored.slice(0, MATCH_MAX_GENERATE);
-
-    // Phase 4: Insert/update
     const nowStr = nowIso();
     let inserted = 0, updated = 0;
-    for (const { company, score, breakdown } of top) {
-        const result = await upsertMatch(company.id, driverId, score, breakdown, nowStr);
+    for (const { candidate, score, breakdown } of top) {
+        const result = await upsertMatch(candidate.id, driverId, score, breakdown, nowStr);
         if (result === 'inserted') inserted++;
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
-    console.log(`[LazyMatch] driver #${driverId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${candidates.length}`);
+    console.log(`[LazyMatch] driver #${driverId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${pool.length}`);
     return inserted + updated;
 }
 
 // ─── Generate matches for company ───────────────────────────────────────────
 
 async function generateMatchesForCompany(companyId) {
-    console.log(`[LazyMatch] company #${companyId}: starting candidate pool filtering`);
+    console.log(`[LazyMatch] company #${companyId}: starting SQL-filtered candidate pool`);
 
     // Phase 0: Load company profile
     const company = await db.get(`
@@ -207,52 +306,38 @@ async function generateMatchesForCompany(companyId) {
         return 0;
     }
 
-    // Phase 1: SQL hard filters → candidate pool
-    const reqTruck = company.req_truck ? 1 : 0;
-    const candidates = await db.all(`
-        SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
-               operation_types, job_preferences, has_truck, payment_methods,
-               work_relationships, availability
-        FROM drivers
-        WHERE search_status = 'ON'
-          AND (? = 0 OR has_truck = true)
-        LIMIT ?
-    `, reqTruck, CANDIDATE_POOL_SIZE);
+    // Phase 1: SQL candidate pool
+    let pool = await fetchDriverCandidates(company, CANDIDATE_POOL_SIZE, []);
+    console.log(`[LazyMatch] company #${companyId}: pool=${pool.length}/${CANDIDATE_POOL_SIZE} (SQL overlap filter)`);
 
-    console.log(`[LazyMatch] company #${companyId}: pool=${candidates.length}/${CANDIDATE_POOL_SIZE} (SQL hard filter)`);
+    // Phase 2: Score the pool
+    const scorer = (dr) => computeScore(company, dr);
+    let scored = scorePool(pool, scorer);
+    console.log(`[LazyMatch] company #${companyId}: scored=${scored.length} (min_score >= ${MIN_SCORE})`);
 
-    // Phase 2: JS pre-filter — operation type & license overlap
-    const reqOps = toArray(company.req_operation_types).map(s => s.toLowerCase());
-    const reqLics = toArray(company.req_license_types).map(s => s.toLowerCase());
-
-    const preFiltered = candidates.filter(dr => {
-        const drOps = toArray(dr.operation_types).map(s => s.toLowerCase());
-        const drLics = toArray(dr.license_types).map(s => s.toLowerCase());
-        return hasOverlap(reqOps, drOps) && hasOverlap(reqLics, drLics);
-    });
-
-    console.log(`[LazyMatch] company #${companyId}: preFiltered=${preFiltered.length} (op+license overlap)`);
-
-    // Phase 3: Full scoring
-    const scored = [];
-    for (const dr of preFiltered) {
-        const result = computeScore(company, dr);
-        if (result) scored.push({ driver: dr, ...result });
+    // Phase 3: Dynamic pool scaling
+    if (scored.length < MATCH_MIN_ACTIVE && pool.length >= CANDIDATE_POOL_SIZE) {
+        const evaluatedIds = pool.map(d => d.id);
+        console.log(`[LazyMatch] company #${companyId}: expanding pool to ${CANDIDATE_POOL_EXPAND} (scored ${scored.length} < min ${MATCH_MIN_ACTIVE})`);
+        const extraPool = await fetchDriverCandidates(company, CANDIDATE_POOL_EXPAND, evaluatedIds);
+        console.log(`[LazyMatch] company #${companyId}: extra_pool=${extraPool.length}`);
+        const extraScored = scorePool(extraPool, scorer);
+        scored = scored.concat(extraScored);
+        scored.sort((a, b) => b.score - a.score);
+        pool = pool.concat(extraPool);
     }
 
-    scored.sort((a, b) => b.score - a.score);
+    // Phase 4: Take top N and insert/update
     const top = scored.slice(0, MATCH_MAX_GENERATE);
-
-    // Phase 4: Insert/update
     const nowStr = nowIso();
     let inserted = 0, updated = 0;
-    for (const { driver, score, breakdown } of top) {
-        const result = await upsertMatch(companyId, driver.id, score, breakdown, nowStr);
+    for (const { candidate, score, breakdown } of top) {
+        const result = await upsertMatch(companyId, candidate.id, score, breakdown, nowStr);
         if (result === 'inserted') inserted++;
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
-    console.log(`[LazyMatch] company #${companyId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${candidates.length}`);
+    console.log(`[LazyMatch] company #${companyId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${pool.length}`);
     return inserted + updated;
 }
 
