@@ -1685,7 +1685,19 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Driver must consent first' });
         }
 
-        // Weekly charge (ticket) — Idempotent INSERT (race-condition safe via unique index)
+        // 1. Check if ticket already exists for this match (idempotent)
+        const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+        if (existingTicket) {
+            // Idempotent: sync match record and return existing ticket
+            await db.run(
+                'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, updated_at = ? WHERE id = ?',
+                now, existingTicket.id, now, matchId
+            );
+            await finalizeShare(matchId);
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: existingTicket.id });
+        }
+
+        // 2. Create new ticket (match_id is NOT NULL + UNIQUE enforced by DB)
         const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
         let ticketId = null;
 
@@ -1698,10 +1710,10 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             );
             ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
         } catch (insertErr) {
-            // Unique constraint violation — ticket already exists for this match
-            if (insertErr.message && (insertErr.message.includes('unique') || insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate') || insertErr.code === '23505')) {
-                const existing = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
-                ticketId = existing ? existing.id : null;
+            // Race condition safety: concurrent request already inserted
+            if (insertErr.code === '23505' || (insertErr.message && (insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate')))) {
+                const race = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+                ticketId = race ? race.id : null;
             } else {
                 throw insertErr;
             }
@@ -1712,6 +1724,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(500).json({ error: 'Ticket creation failed' });
         }
 
+        // 3. Update match record
         await db.run(
             'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
             now, ticketId, amount, 'USD', now, matchId
