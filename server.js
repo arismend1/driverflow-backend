@@ -41,6 +41,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_matches_index.js', { stdio: 'inherit' });
         execSync('node migrate_matches_query_indexes.js', { stdio: 'inherit' });
         execSync('node migrate_lazy_matching.js', { stdio: 'inherit' });
+        execSync('node migrate_candidate_pool.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');

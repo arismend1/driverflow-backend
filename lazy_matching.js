@@ -1,21 +1,25 @@
 /**
- * lazy_matching.js — Pure match generation (scoring + insert)
+ * lazy_matching.js — Scalable match generation with candidate pool filtering
  *
- * All infrastructure (cooldown, freshness, advisory locks) is now handled
- * by the endpoint helpers in server.js. This module only does:
- *   1. Load user profile
- *   2. Score against candidates
- *   3. Insert/update potential_matches
+ * Architecture (100k+ scale):
+ *   Phase 1: SQL hard filters → candidate pool (max CANDIDATE_POOL_SIZE)
+ *   Phase 2: JS pre-filter    → operation/license overlap check (fast, no scoring)
+ *   Phase 3: Full scoring      → existing weighted algorithm
+ *   Phase 4: Top N insert      → potential_matches (ON CONFLICT)
+ *
+ * Infrastructure (cooldown, locks, freshness) is handled by server.js helpers.
  */
 
 const db = require('./db_adapter');
 
 const MATCH_MAX_GENERATE = parseInt(process.env.MATCH_MAX_GENERATE) || 20;
+const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
 const MIN_SCORE = 0.2;
 
 const nowIso = () => new Date().toISOString();
 
-// --- Utility ---
+// ─── Utility ────────────────────────────────────────────────────────────────
+
 function toArray(val) {
     if (!val) return [];
     if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
@@ -31,6 +35,15 @@ function toArray(val) {
     }
     return [String(val).trim()].filter(Boolean);
 }
+
+/** Fast overlap check — returns true if any element in A exists in B */
+function hasOverlap(arrA, arrB) {
+    if (arrA.length === 0 || arrB.length === 0) return true; // no filter = compatible
+    const setB = new Set(arrB);
+    return arrA.some(a => setB.has(a));
+}
+
+// ─── Scoring (unchanged: 40/25/20/15 weights) ──────────────────────────────
 
 function computeScore(co, dr) {
     if (co.req_truck && !dr.has_truck) return null;
@@ -58,7 +71,8 @@ function computeScore(co, dr) {
     if (!co.availability || !dr.availability) {
         breakdown.availability = 1.0;
     } else {
-        breakdown.availability = String(co.availability).toLowerCase().trim() === String(dr.availability).toLowerCase().trim() ? 1.0 : 0.5;
+        breakdown.availability = String(co.availability).toLowerCase().trim()
+            === String(dr.availability).toLowerCase().trim() ? 1.0 : 0.5;
     }
 
     const score = Math.min(Math.max(
@@ -69,10 +83,45 @@ function computeScore(co, dr) {
     return score >= MIN_SCORE ? { score, breakdown } : null;
 }
 
-// --- Generate matches for driver ---
-async function generateMatchesForDriver(driverId) {
-    console.log(`[LazyMatch] Generating matches for driver #${driverId}`);
+// ─── Upsert helper ──────────────────────────────────────────────────────────
 
+async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
+    try {
+        const existing = await db.get(
+            'SELECT id, status FROM potential_matches WHERE company_id = ? AND driver_id = ?',
+            companyId, driverId
+        );
+        if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) return 'skipped';
+
+        if (existing) {
+            await db.run(
+                'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
+                score, JSON.stringify(breakdown), nowStr, existing.id
+            );
+            return 'updated';
+        } else {
+            await db.run(
+                `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
+                 VALUES (?, ?, ?, ?, 'NEW', ?)`,
+                companyId, driverId, score, JSON.stringify(breakdown), nowStr
+            );
+            return 'inserted';
+        }
+    } catch (e) {
+        if (e.code === '23505' || (e.message && e.message.includes('UNIQUE'))) {
+            return 'conflict';
+        }
+        console.error(`[LazyMatch] upsert error (company=${companyId}, driver=${driverId}):`, e.message);
+        return 'error';
+    }
+}
+
+// ─── Generate matches for driver ────────────────────────────────────────────
+
+async function generateMatchesForDriver(driverId) {
+    console.log(`[LazyMatch] driver #${driverId}: starting candidate pool filtering`);
+
+    // Phase 0: Load driver profile
     const driver = await db.get(`
         SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
                operation_types, job_preferences, has_truck, payment_methods,
@@ -85,7 +134,10 @@ async function generateMatchesForDriver(driverId) {
         return 0;
     }
 
-    const companies = await db.all(`
+    // Phase 1: SQL hard filters → candidate pool
+    // Filter: search_status=ON + truck requirement + LIMIT pool size
+    const driverHasTruck = driver.has_truck ? 1 : 0;
+    const candidates = await db.all(`
         SELECT e.id, e.nombre,
                cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
                cr.req_operation_types, cr.req_modalities, cr.req_truck,
@@ -93,11 +145,27 @@ async function generateMatchesForDriver(driverId) {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
-    `);
+          AND (cr.req_truck IS NULL OR cr.req_truck = false OR ? = 1)
+        LIMIT ?
+    `, driverHasTruck, CANDIDATE_POOL_SIZE);
 
-    const nowStr = nowIso();
+    console.log(`[LazyMatch] driver #${driverId}: pool=${candidates.length}/${CANDIDATE_POOL_SIZE} (SQL hard filter)`);
+
+    // Phase 2: JS pre-filter — operation type & license overlap
+    const drOps = toArray(driver.operation_types).map(s => s.toLowerCase());
+    const drLics = toArray(driver.license_types).map(s => s.toLowerCase());
+
+    const preFiltered = candidates.filter(co => {
+        const reqOps = toArray(co.req_operation_types).map(s => s.toLowerCase());
+        const reqLics = toArray(co.req_license_types).map(s => s.toLowerCase());
+        return hasOverlap(reqOps, drOps) && hasOverlap(reqLics, drLics);
+    });
+
+    console.log(`[LazyMatch] driver #${driverId}: preFiltered=${preFiltered.length} (op+license overlap)`);
+
+    // Phase 3: Full scoring
     const scored = [];
-    for (const co of companies) {
+    for (const co of preFiltered) {
         const result = computeScore(co, driver);
         if (result) scored.push({ company: co, ...result });
     }
@@ -105,46 +173,25 @@ async function generateMatchesForDriver(driverId) {
     scored.sort((a, b) => b.score - a.score);
     const top = scored.slice(0, MATCH_MAX_GENERATE);
 
+    // Phase 4: Insert/update
+    const nowStr = nowIso();
     let inserted = 0, updated = 0;
     for (const { company, score, breakdown } of top) {
-        try {
-            const existing = await db.get(
-                'SELECT id, status FROM potential_matches WHERE company_id = ? AND driver_id = ?',
-                company.id, driverId
-            );
-            if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) continue;
-
-            if (existing) {
-                await db.run(
-                    'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
-                    score, JSON.stringify(breakdown), nowStr, existing.id
-                );
-                updated++;
-            } else {
-                await db.run(
-                    `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
-                     VALUES (?, ?, ?, ?, 'NEW', ?)`,
-                    company.id, driverId, score, JSON.stringify(breakdown), nowStr
-                );
-                inserted++;
-            }
-        } catch (e) {
-            if (e.code === '23505' || (e.message && e.message.includes('UNIQUE'))) {
-                updated++;
-            } else {
-                console.error(`[LazyMatch] Insert error (company=${company.id}, driver=${driverId}):`, e.message);
-            }
-        }
+        const result = await upsertMatch(company.id, driverId, score, breakdown, nowStr);
+        if (result === 'inserted') inserted++;
+        if (result === 'updated' || result === 'conflict') updated++;
     }
 
-    console.log(`[LazyMatch] driver #${driverId}: generated=${inserted} updated=${updated} scored=${scored.length}`);
+    console.log(`[LazyMatch] driver #${driverId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${candidates.length}`);
     return inserted + updated;
 }
 
-// --- Generate matches for company ---
-async function generateMatchesForCompany(companyId) {
-    console.log(`[LazyMatch] Generating matches for company #${companyId}`);
+// ─── Generate matches for company ───────────────────────────────────────────
 
+async function generateMatchesForCompany(companyId) {
+    console.log(`[LazyMatch] company #${companyId}: starting candidate pool filtering`);
+
+    // Phase 0: Load company profile
     const company = await db.get(`
         SELECT e.id, e.nombre,
                cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
@@ -160,17 +207,35 @@ async function generateMatchesForCompany(companyId) {
         return 0;
     }
 
-    const drivers = await db.all(`
+    // Phase 1: SQL hard filters → candidate pool
+    const reqTruck = company.req_truck ? 1 : 0;
+    const candidates = await db.all(`
         SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
                operation_types, job_preferences, has_truck, payment_methods,
                work_relationships, availability
         FROM drivers
         WHERE search_status = 'ON'
-    `);
+          AND (? = 0 OR has_truck = true)
+        LIMIT ?
+    `, reqTruck, CANDIDATE_POOL_SIZE);
 
-    const nowStr = nowIso();
+    console.log(`[LazyMatch] company #${companyId}: pool=${candidates.length}/${CANDIDATE_POOL_SIZE} (SQL hard filter)`);
+
+    // Phase 2: JS pre-filter — operation type & license overlap
+    const reqOps = toArray(company.req_operation_types).map(s => s.toLowerCase());
+    const reqLics = toArray(company.req_license_types).map(s => s.toLowerCase());
+
+    const preFiltered = candidates.filter(dr => {
+        const drOps = toArray(dr.operation_types).map(s => s.toLowerCase());
+        const drLics = toArray(dr.license_types).map(s => s.toLowerCase());
+        return hasOverlap(reqOps, drOps) && hasOverlap(reqLics, drLics);
+    });
+
+    console.log(`[LazyMatch] company #${companyId}: preFiltered=${preFiltered.length} (op+license overlap)`);
+
+    // Phase 3: Full scoring
     const scored = [];
-    for (const dr of drivers) {
+    for (const dr of preFiltered) {
         const result = computeScore(company, dr);
         if (result) scored.push({ driver: dr, ...result });
     }
@@ -178,39 +243,16 @@ async function generateMatchesForCompany(companyId) {
     scored.sort((a, b) => b.score - a.score);
     const top = scored.slice(0, MATCH_MAX_GENERATE);
 
+    // Phase 4: Insert/update
+    const nowStr = nowIso();
     let inserted = 0, updated = 0;
     for (const { driver, score, breakdown } of top) {
-        try {
-            const existing = await db.get(
-                'SELECT id, status FROM potential_matches WHERE company_id = ? AND driver_id = ?',
-                companyId, driver.id
-            );
-            if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) continue;
-
-            if (existing) {
-                await db.run(
-                    'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
-                    score, JSON.stringify(breakdown), nowStr, existing.id
-                );
-                updated++;
-            } else {
-                await db.run(
-                    `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
-                     VALUES (?, ?, ?, ?, 'NEW', ?)`,
-                    companyId, driver.id, score, JSON.stringify(breakdown), nowStr
-                );
-                inserted++;
-            }
-        } catch (e) {
-            if (e.code === '23505' || (e.message && e.message.includes('UNIQUE'))) {
-                updated++;
-            } else {
-                console.error(`[LazyMatch] Insert error (company=${companyId}, driver=${driver.id}):`, e.message);
-            }
-        }
+        const result = await upsertMatch(companyId, driver.id, score, breakdown, nowStr);
+        if (result === 'inserted') inserted++;
+        if (result === 'updated' || result === 'conflict') updated++;
     }
 
-    console.log(`[LazyMatch] company #${companyId}: generated=${inserted} updated=${updated} scored=${scored.length}`);
+    console.log(`[LazyMatch] company #${companyId}: generated=${inserted} updated=${updated} scored=${scored.length} pool=${candidates.length}`);
     return inserted + updated;
 }
 
