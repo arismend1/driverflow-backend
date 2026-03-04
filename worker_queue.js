@@ -654,21 +654,17 @@ async function startQueueWorker() {
         }
     });
 
-    // --- AUTO-MATCHMAKING SCHEDULER (Every 5 Minutes) ---
-    cron.schedule('*/5 * * * *', () => {
-        logger.info('[Scheduler] Triggering Auto-Matchmaking script...');
-        const { exec } = require('child_process');
-        exec('node run_matching.js', (error, stdout, stderr) => {
-            if (error) {
-                logger.error(`[Scheduler] Auto-Matchmaking Error: ${error.message}`);
-                return;
-            }
-            if (stderr) {
-                logger.warn(`[Scheduler] Auto-Matchmaking Warning: ${stderr}`);
-            }
-            logger.info(`[Scheduler] Auto-Matchmaking Success:\n${stdout}`);
-        });
-    });
+    // --- AUTO-MATCHMAKING SCHEDULER — DISABLED (now on-demand via lazy_matching.js) ---
+    // Matches are generated lazily when users open /matches/opportunities or /matches/candidates.
+    // cron.schedule('*/5 * * * *', () => {
+    //     logger.info('[Scheduler] Triggering Auto-Matchmaking script...');
+    //     const { exec } = require('child_process');
+    //     exec('node run_matching.js', (error, stdout, stderr) => {
+    //         if (error) { logger.error(`[Scheduler] Error: ${error.message}`); return; }
+    //         if (stderr) { logger.warn(`[Scheduler] Warning: ${stderr}`); }
+    //         logger.info(`[Scheduler] Success:\n${stdout}`);
+    //     });
+    // });
 
     // Heartbeat Loop
     setInterval(async () => {

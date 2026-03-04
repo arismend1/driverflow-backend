@@ -39,6 +39,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_ticket_match_unique.js', { stdio: 'inherit' });
         execSync('node migrate_ticket_payment.js', { stdio: 'inherit' });
         execSync('node migrate_matches_index.js', { stdio: 'inherit' });
+        execSync('node migrate_matches_query_indexes.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1523,6 +1524,16 @@ app.get('/api/diagnostics/version', (req, res) => {
 app.get('/matches/candidates', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can view candidates' });
     try {
+        // Lazy matching: generate on-demand if no active matches exist
+        const { generateMatchesForCompany } = require('./lazy_matching');
+        const hasActive = await db.get(
+            "SELECT id FROM potential_matches WHERE company_id = ? AND status NOT IN ('DECLINED','EXPIRED') LIMIT 1",
+            req.user.id
+        );
+        if (!hasActive) {
+            await generateMatchesForCompany(req.user.id);
+        }
+
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
@@ -1568,6 +1579,22 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     const userType = req.user.type; // 'driver' or 'empresa'
 
     try {
+        // Lazy matching: generate on-demand if no active matches exist
+        const { generateMatchesForDriver, generateMatchesForCompany } = require('./lazy_matching');
+        if (userType === 'driver') {
+            const hasActive = await db.get(
+                "SELECT id FROM potential_matches WHERE driver_id = ? AND status NOT IN ('DECLINED','EXPIRED') LIMIT 1",
+                userId
+            );
+            if (!hasActive) await generateMatchesForDriver(userId);
+        } else if (userType === 'empresa') {
+            const hasActive = await db.get(
+                "SELECT id FROM potential_matches WHERE company_id = ? AND status NOT IN ('DECLINED','EXPIRED') LIMIT 1",
+                userId
+            );
+            if (!hasActive) await generateMatchesForCompany(userId);
+        }
+
         let filterColumn = '';
         if (userType === 'driver') {
             filterColumn = 'pm.driver_id';
