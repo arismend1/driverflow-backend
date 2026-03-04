@@ -721,6 +721,21 @@ if (require.main === module) {
     // Run once at startup after 30s delay
     setTimeout(() => reconcileStripePayments().catch(e => console.error('[Worker] Initial reconcile error:', e.message)), 30000);
 
+    // Match expiration (every 1 hour)
+    const { expireOldMatches } = require('./expire_old_matches');
+    const EXPIRE_INTERVAL = 60 * 60 * 1000; // 1 hour
+
+    setInterval(async () => {
+        try {
+            await expireOldMatches();
+        } catch (e) {
+            console.error('[Worker] Expirer error:', e.message);
+        }
+    }, EXPIRE_INTERVAL);
+
+    // Run once at startup after 60s delay
+    setTimeout(() => expireOldMatches().catch(e => console.error('[Worker] Initial expire error:', e.message)), 60000);
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);

@@ -199,13 +199,23 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             const session = event.data.object;
             const ticketId = session.metadata?.ticket_id || session.client_reference_id;
             if (ticketId) {
-                const piId = session.payment_intent || null;
-                const customerId = session.customer || null;
-                await db.run(
-                    `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
-                    nowIso(), piId, customerId, ticketId
-                );
-                console.log(`[Stripe Webhook] Ticket #${ticketId} marked PAID (PI: ${piId})`);
+                // Load ticket from DB for amount validation
+                const ticket = await db.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
+                if (!ticket) {
+                    console.error(`[Stripe Webhook] Ticket #${ticketId} NOT FOUND in DB. Skipping.`);
+                } else if (session.amount_total !== ticket.price_cents) {
+                    console.error(`[Stripe Webhook] ❌ AMOUNT MISMATCH for Ticket #${ticketId}: Stripe=${session.amount_total}, DB=${ticket.price_cents}. NOT marking as paid.`);
+                } else if (session.currency && ticket.currency && session.currency.toLowerCase() !== ticket.currency.toLowerCase()) {
+                    console.error(`[Stripe Webhook] ❌ CURRENCY MISMATCH for Ticket #${ticketId}: Stripe=${session.currency}, DB=${ticket.currency}. NOT marking as paid.`);
+                } else {
+                    const piId = session.payment_intent || null;
+                    const customerId = session.customer || null;
+                    await db.run(
+                        `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
+                        nowIso(), piId, customerId, ticketId
+                    );
+                    console.log(`[Stripe Webhook] ✅ Ticket #${ticketId} marked PAID (PI: ${piId}, amount: ${session.amount_total})`);
+                }
             }
         }
 
@@ -1533,7 +1543,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             FROM potential_matches pm
             JOIN drivers d ON d.id = pm.driver_id
             WHERE pm.company_id = ?
-              AND pm.status != 'DECLINED'
+              AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.created_at DESC
         `, req.user.id);
 
@@ -1586,7 +1596,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
             WHERE ${filterColumn} = ?
-              AND pm.status != 'DECLINED'
+              AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.match_score DESC, pm.created_at DESC
         `, userId);
 
