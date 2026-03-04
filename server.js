@@ -1685,19 +1685,32 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Driver must consent first' });
         }
 
-        // Weekly charge (ticket) — Atomic UPSERT (race-condition safe)
+        // Weekly charge (ticket) — Idempotent INSERT (race-condition safe via unique index)
         const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
+        let ticketId = null;
 
-        const t = await db.run(
-            `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
-             VALUES (?,?,?,?,?,'USD',?,'pending',?)
-             ON CONFLICT (match_id)
-             DO UPDATE SET match_id = EXCLUDED.match_id
-             RETURNING *`,
-            parseInt(matchId), match.company_id, match.driver_id, amount, amount, now, `Match ID: ${matchId}`
-        );
-        const ticket = (t.rows && t.rows[0]) ? t.rows[0] : null;
-        const ticketId = ticket ? ticket.id : t.lastInsertRowid;
+        try {
+            const t = await db.run(
+                `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
+                 VALUES (?,?,?,?,?,'USD',?,'pending',?)
+                 RETURNING id`,
+                parseInt(matchId), match.company_id, match.driver_id, amount, amount, now, `Match ID: ${matchId}`
+            );
+            ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
+        } catch (insertErr) {
+            // Unique constraint violation — ticket already exists for this match
+            if (insertErr.message && (insertErr.message.includes('unique') || insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate') || insertErr.code === '23505')) {
+                const existing = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+                ticketId = existing ? existing.id : null;
+            } else {
+                throw insertErr;
+            }
+        }
+
+        if (!ticketId) {
+            console.error(`[Matches] Failed to create or find ticket for match ${matchId}`);
+            return res.status(500).json({ error: 'Ticket creation failed' });
+        }
 
         await db.run(
             'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
