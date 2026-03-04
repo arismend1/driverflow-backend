@@ -57,6 +57,23 @@ function getStripe() {
                     }
 
                     return res.json();
+                },
+                retrieve: async (sessionId) => {
+                    const res = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${apiKey}`,
+                            'Stripe-Version': API_VERSION,
+                        }
+                    });
+
+                    if (!res.ok) {
+                        const txt = await res.text();
+                        console.error('Stripe Retrieve Error:', txt);
+                        throw new Error(`Stripe API Error: ${res.status}`);
+                    }
+
+                    return res.json();
                 }
             }
         },

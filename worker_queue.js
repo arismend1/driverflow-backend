@@ -706,6 +706,21 @@ if (require.main === module) {
         process.exit(1);
     }
 
+    // Stripe payment reconciliation (every 15 minutes)
+    const { reconcileStripePayments } = require('./reconcile_stripe_payments');
+    const RECONCILE_INTERVAL = 15 * 60 * 1000; // 15 minutes
+
+    setInterval(async () => {
+        try {
+            await reconcileStripePayments();
+        } catch (e) {
+            console.error('[Worker] Reconciler error:', e.message);
+        }
+    }, RECONCILE_INTERVAL);
+
+    // Run once at startup after 30s delay
+    setTimeout(() => reconcileStripePayments().catch(e => console.error('[Worker] Initial reconcile error:', e.message)), 30000);
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);
