@@ -1525,44 +1525,47 @@ async function ensureUserMatchGenerationLogTable() {
     try {
         await db.run(`
             CREATE TABLE IF NOT EXISTS user_match_generation_log (
-                id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 user_type TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                last_generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
         await db.run(`
-            CREATE INDEX IF NOT EXISTS idx_umgl_user_time
-            ON user_match_generation_log (user_type, user_id, created_at DESC)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_match_gen_unique
+            ON user_match_generation_log (user_type, user_id)
         `);
     } catch (e) {
-        console.error("[matches] ensureUserMatchGenerationLogTable failed:", e.message);
+        console.error("[matches] ensureUserMatchGenerationLogTable failed:", e);
     }
 }
 
 async function getLastGenerationAt(userType, userId) {
     try {
         const row = await db.get(
-            `SELECT created_at FROM user_match_generation_log
+            `SELECT last_generated_at FROM user_match_generation_log
              WHERE user_type = ? AND user_id = ?
-             ORDER BY created_at DESC LIMIT 1`,
+             LIMIT 1`,
             userType, userId
         );
-        return row ? row.created_at : null;
+        return row ? row.last_generated_at : null;
     } catch (e) {
         if (String(e.message || "").includes("does not exist") || e.code === "42P01") {
             console.warn("[matches] user_match_generation_log missing; creating...");
             await ensureUserMatchGenerationLogTable();
             return null;
         }
-        throw e;
+        console.error("[matches] getLastGenerationAt error:", e);
+        return null; // fail open
     }
 }
 
 async function writeGenerationLog(userType, userId) {
     try {
         await db.run(
-            `INSERT INTO user_match_generation_log (user_type, user_id) VALUES (?, ?)`,
+            `INSERT INTO user_match_generation_log (user_type, user_id, last_generated_at)
+             VALUES (?, ?, NOW())
+             ON CONFLICT (user_type, user_id)
+             DO UPDATE SET last_generated_at = NOW()`,
             userType, userId
         );
     } catch (e) {
@@ -1570,15 +1573,18 @@ async function writeGenerationLog(userType, userId) {
             await ensureUserMatchGenerationLogTable();
             try {
                 await db.run(
-                    `INSERT INTO user_match_generation_log (user_type, user_id) VALUES (?, ?)`,
+                    `INSERT INTO user_match_generation_log (user_type, user_id, last_generated_at)
+                     VALUES (?, ?, NOW())
+                     ON CONFLICT (user_type, user_id)
+                     DO UPDATE SET last_generated_at = NOW()`,
                     userType, userId
                 );
             } catch (e2) {
-                console.error("[matches] writeGenerationLog retry failed:", e2.message);
+                console.error("[matches] writeGenerationLog retry failed:", e2);
             }
             return;
         }
-        console.error("[matches] writeGenerationLog failed:", e.message);
+        console.error("[matches] writeGenerationLog failed:", e);
     }
 }
 
