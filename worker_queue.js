@@ -732,6 +732,21 @@ if (require.main === module) {
     // Run once at startup after 60s delay
     setTimeout(() => expireOldMatches().catch(e => console.error('[Worker] Initial expire error:', e.message)), 60000);
 
+    // Match cleanup/retention (every 1 hour)
+    const { cleanupOldMatches } = require('./cleanup_old_matches');
+    const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
+
+    setInterval(async () => {
+        try {
+            await cleanupOldMatches();
+        } catch (e) {
+            console.error('[Worker] Cleanup error:', e.message);
+        }
+    }, CLEANUP_INTERVAL);
+
+    // Run once at startup after 90s delay
+    setTimeout(() => cleanupOldMatches().catch(e => console.error('[Worker] Initial cleanup error:', e.message)), 90000);
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);

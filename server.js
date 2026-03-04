@@ -43,6 +43,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_lazy_matching.js', { stdio: 'inherit' });
         execSync('node migrate_candidate_pool.js', { stdio: 'inherit' });
         execSync('node migrate_candidate_pool_gin.js', { stdio: 'inherit' });
+        execSync('node migrate_match_retention.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
