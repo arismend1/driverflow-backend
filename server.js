@@ -46,6 +46,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_match_retention.js', { stdio: 'inherit' });
         execSync('node migrate_otr_eligibility.js', { stdio: 'inherit' });
         execSync('node migrate_normalize_preferences.js', { stdio: 'inherit' });
+        execSync('node migrate_driver_leads.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -458,6 +459,12 @@ app.post('/login', async (req, res) => {
             const token = jwt.sign({ id: row.id, type: type === 'empresa' ? 'empresa' : 'driver' }, JWT_SECRET, { expiresIn: '24h' });
 
             await auditLog('login_success', row.id, table, {}, req);
+
+            // Auto-claim lead on driver login
+            if (type === 'driver') {
+                try { await claimLeadForDriver(row.id, row.contacto, null); } catch (ce) { console.error('[LeadClaim] login error:', ce.message); }
+            }
+
             res.json({ ok: true, token, type, id: row.id, name: row.nombre, search_status: row.search_status || 'ON' });
         } else {
             // Bad Password
@@ -503,6 +510,9 @@ app.post('/register', async (req, res) => {
             const result = await db.run(`INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,'active',?,false,?,?)`,
                 nombre, contacto, hash, extras.tipo_licencia || 'B', now, token, expires);
             newId = result.lastInsertRowid;
+
+            // Auto-claim lead if driver email matches
+            try { await claimLeadForDriver(newId, contacto, null); } catch (ce) { console.error('[LeadClaim] register error:', ce.message); }
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
                 req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
@@ -1522,6 +1532,145 @@ startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
 app.get('/api/diagnostics/version', (req, res) => {
     res.json({ version: '1.3.5-profile-crash-fix', status: 'deploy-verified' });
+});
+
+// ─── DRIVER LEADS ───────────────────────────────────────────────────────────
+
+// Helper: claim a lead when a driver registers/logs in with matching email or phone
+async function claimLeadForDriver(driverId, email, phone) {
+    const conditions = [];
+    const params = [];
+    if (email) { conditions.push('LOWER(email) = LOWER(?)'); params.push(email); }
+    if (phone) { conditions.push('phone = ?'); params.push(phone); }
+    if (conditions.length === 0) return;
+
+    const lead = await db.get(
+        `SELECT id, company_id FROM driver_leads
+         WHERE status IN ('NEW','INVITED')
+           AND (${conditions.join(' OR ')})
+         ORDER BY created_at DESC LIMIT 1`,
+        ...params
+    );
+    if (!lead) return;
+
+    await db.run(
+        `UPDATE driver_leads SET status='CLAIMED', claimed_driver_id=?, updated_at=NOW()
+         WHERE id=? AND status IN ('NEW','INVITED')`,
+        driverId, lead.id
+    );
+    console.log(`[LeadClaim] driver_id=${driverId} lead_id=${lead.id} company_id=${lead.company_id}`);
+}
+
+// POST /leads — create a lead (company only)
+app.post('/leads', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can create leads' });
+    const { name, phone, email, notes } = req.body;
+    if (!name && !email && !phone) return res.status(400).json({ error: 'At least name, email, or phone required' });
+
+    try {
+        const result = await db.run(
+            `INSERT INTO driver_leads (company_id, name, phone, email, notes)
+             VALUES (?, ?, ?, ?, ?)`,
+            req.user.id, name || '', phone || null, email ? email.toLowerCase().trim() : null, notes || null
+        );
+        console.log(`[Leads] Created lead id=${result.lastInsertRowid} for company_id=${req.user.id}`);
+        res.json({ ok: true, id: result.lastInsertRowid });
+    } catch (e) {
+        if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {
+            return res.status(409).json({ error: 'Lead with this email or phone already exists for your company' });
+        }
+        console.error('[Leads] Create error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /leads — list leads for company
+app.get('/leads', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies' });
+    const status = req.query.status || null;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+
+    try {
+        let query, params;
+        if (status) {
+            query = `SELECT id, name, phone, email, notes, status, claimed_driver_id, created_at, updated_at
+                     FROM driver_leads WHERE company_id = ? AND status = ?
+                     ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+            params = [req.user.id, status.toUpperCase(), limit, offset];
+        } else {
+            query = `SELECT id, name, phone, email, notes, status, claimed_driver_id, created_at, updated_at
+                     FROM driver_leads WHERE company_id = ?
+                     ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+            params = [req.user.id, limit, offset];
+        }
+        const rows = await db.all(query, ...params);
+        res.json(rows);
+    } catch (e) {
+        console.error('[Leads] List error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// POST /leads/import — CSV import (text/csv or JSON array)
+app.post('/leads/import', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies' });
+
+    try {
+        let records = [];
+
+        // Accept JSON array or CSV text
+        if (Array.isArray(req.body)) {
+            records = req.body;
+        } else if (typeof req.body === 'string' || (req.body && req.body.csv)) {
+            const csvText = typeof req.body === 'string' ? req.body : req.body.csv;
+            const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+            if (lines.length < 2) return res.status(400).json({ error: 'CSV must have header + at least 1 row' });
+
+            const headers = lines[0].toLowerCase().split(',').map(h => h.trim());
+            for (let i = 1; i < lines.length; i++) {
+                const vals = lines[i].split(',').map(v => v.trim());
+                const obj = {};
+                headers.forEach((h, idx) => { obj[h] = vals[idx] || ''; });
+                records.push(obj);
+            }
+        } else if (req.body && req.body.leads && Array.isArray(req.body.leads)) {
+            records = req.body.leads;
+        } else {
+            return res.status(400).json({ error: 'Send JSON array, {leads:[...]}, or {csv:"..."}' });
+        }
+
+        let created = 0, skipped = 0, errors = 0;
+        for (const rec of records) {
+            const name = (rec.name || '').trim();
+            const email = (rec.email || '').trim().toLowerCase() || null;
+            const phone = (rec.phone || '').trim() || null;
+            const notes = (rec.notes || '').trim() || null;
+
+            if (!name && !email && !phone) { skipped++; continue; }
+
+            try {
+                await db.run(
+                    `INSERT INTO driver_leads (company_id, name, phone, email, notes) VALUES (?, ?, ?, ?, ?)`,
+                    req.user.id, name, phone, email, notes
+                );
+                created++;
+            } catch (e) {
+                if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {
+                    skipped++;
+                } else {
+                    errors++;
+                    console.error('[Leads] Import row error:', e.message);
+                }
+            }
+        }
+
+        console.log(`[Leads] Import for company_id=${req.user.id}: created=${created} skipped=${skipped} errors=${errors}`);
+        res.json({ ok: true, created, skipped, errors, total: records.length });
+    } catch (e) {
+        console.error('[Leads] Import error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // ─── MATCHES HELPERS (defensive, crash-proof) ──────────────────────────────
