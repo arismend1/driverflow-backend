@@ -747,6 +747,27 @@ if (require.main === module) {
     // Run once at startup after 90s delay
     setTimeout(() => cleanupOldMatches().catch(e => console.error('[Worker] Initial cleanup error:', e.message)), 90000);
 
+    // Search expiration (every 10 minutes)
+    const SEARCH_EXPIRE_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+    async function expireSearches() {
+        try {
+            const r1 = await db.run(
+                `UPDATE drivers SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= NOW()`
+            );
+            const r2 = await db.run(
+                `UPDATE empresas SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= NOW()`
+            );
+            const d = (r1.rowCount || 0) + (r2.rowCount || 0);
+            console.log(`[Programador][SearchExpiration] Expiration check executed${d > 0 ? ` — expired ${d}` : ''}`);
+        } catch (e) {
+            console.error('[Programador][SearchExpiration] Error:', e.message);
+        }
+    }
+
+    setInterval(expireSearches, SEARCH_EXPIRE_INTERVAL);
+    setTimeout(expireSearches, 120000); // Run once at startup after 2 min
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);
