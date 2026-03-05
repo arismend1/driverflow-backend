@@ -47,6 +47,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_otr_eligibility.js', { stdio: 'inherit' });
         execSync('node migrate_normalize_preferences.js', { stdio: 'inherit' });
         execSync('node migrate_driver_leads.js', { stdio: 'inherit' });
+        execSync('node migrate_lead_invitations.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1796,6 +1797,40 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                     }
                 }
             }
+        }
+
+        // 2.5) Auto-invite matching leads
+        try {
+            const MAX_INVITE_COUNT = 5;
+            const leads = await db.all(
+                `SELECT id, name, email FROM driver_leads
+                 WHERE company_id = ? AND status IN ('NEW','INVITED')
+                   AND email IS NOT NULL AND email <> ''
+                   AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
+                   AND (invite_count IS NULL OR invite_count < ?)
+                 LIMIT 10`,
+                req.user.id, MAX_INVITE_COUNT
+            );
+
+            if (leads.length > 0) {
+                const companyRow = await db.get('SELECT nombre FROM empresas WHERE id = ?', req.user.id);
+                const companyName = companyRow ? companyRow.nombre : 'Una empresa';
+
+                for (const lead of leads) {
+                    await db.run(
+                        `UPDATE driver_leads SET invited_at = NOW(), invite_count = COALESCE(invite_count, 0) + 1, status = 'INVITED', updated_at = NOW() WHERE id = ?`,
+                        lead.id
+                    );
+                    await db.run(
+                        `INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?, ?)`,
+                        'lead_invite', 'lead_invitation_email', new Date().toISOString(), req.user.id,
+                        JSON.stringify({ lead_id: lead.id, company_id: req.user.id, company_name: companyName, email: lead.email, name: lead.name || 'Conductor' })
+                    );
+                }
+                console.log(`[Leads] Auto-invited ${leads.length} leads for company_id=${req.user.id}`);
+            }
+        } catch (invErr) {
+            console.error('[Leads] Auto-invite error:', invErr.message);
         }
 
         // 3) Return matches (existing query)

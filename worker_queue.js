@@ -75,7 +75,7 @@ async function bridgeOutbox() {
             let jobType = null;
             let payload = {};
 
-            if (ev.event_name === 'verification_email' || ev.event_name === 'recovery_email') {
+            if (ev.event_name === 'verification_email' || ev.event_name === 'recovery_email' || ev.event_name === 'lead_invitation_email') {
                 jobType = 'send_email';
                 payload = { ...meta, event_name: ev.event_name, email: meta.email };
             }
@@ -147,6 +147,11 @@ const handlers = {
             subject = "Restablecer Contraseña - DriverFlow";
             const name = payload.name || 'Usuario';
             body = `Hola ${name},\n\nSolicitaste recuperar tu contraseña.\n\nHaz clic aquí:\n${API_URL}/reset-password-web?token=${payload.token}\n\n(Deep Link: driverflow://reset-password?token=${payload.token})`;
+        } else if (payload.event_name === 'lead_invitation_email') {
+            const name = payload.name || 'Conductor';
+            const company = payload.company_name || 'Una empresa';
+            subject = 'Una empresa quiere trabajar contigo en DriverFlow';
+            body = `Hola ${name},\n\n${company} en DriverFlow quiere contactarte para oportunidades de trabajo.\n\nRegístrate aquí para ver la oportunidad:\n\nhttps://driverflow.app/register\n\n¡Te esperamos!\n— Equipo DriverFlow`;
         }
 
         if (dryRun) {
