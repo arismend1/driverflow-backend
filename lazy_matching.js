@@ -152,6 +152,7 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
+          AND (e.search_expires_at IS NULL OR e.search_expires_at > NOW())
           AND (cr.req_truck IS NULL OR cr.req_truck = false OR ? = 1)
           AND (
               NOT EXISTS (SELECT 1 FROM company_req_operation_types WHERE company_id = e.id)
@@ -204,6 +205,7 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
                d.willing_to_travel, d.available_from_date, d.home_time_weeks
         FROM drivers d
         WHERE d.search_status = 'ON'
+          AND (d.search_expires_at IS NULL OR d.search_expires_at > NOW())
           AND (? = 0 OR d.has_truck = true)
           AND (? = 0 OR d.willing_to_travel = true)
           AND (
@@ -259,6 +261,7 @@ async function generateMatchesForDriver(driverId) {
                operation_types, job_preferences, has_truck, payment_methods,
                work_relationships, availability
         FROM drivers WHERE id = ? AND search_status = 'ON'
+               AND (search_expires_at IS NULL OR search_expires_at > NOW())
     `, driverId);
 
     if (!driver) {
@@ -315,6 +318,7 @@ async function generateMatchesForCompany(companyId) {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.id = ? AND e.search_status = 'ON'
+          AND (e.search_expires_at IS NULL OR e.search_expires_at > NOW())
     `, companyId);
 
     if (!company) {

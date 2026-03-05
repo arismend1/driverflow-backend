@@ -73,6 +73,7 @@ async function runMatching() {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
+          AND (e.search_expires_at IS NULL OR e.search_expires_at > NOW())
     `);
 
     // 2. Fetch eligible drivers (search_status = ON)
@@ -82,6 +83,7 @@ async function runMatching() {
                work_relationships, availability, search_status
         FROM drivers
         WHERE search_status = 'ON'
+          AND (search_expires_at IS NULL OR search_expires_at > NOW())
     `);
 
     console.log(`Found ${companies.length} eligible companies and ${drivers.length} eligible drivers.`);
