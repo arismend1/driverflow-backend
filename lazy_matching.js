@@ -21,6 +21,10 @@ const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
 const CANDIDATE_POOL_EXPAND = parseInt(process.env.CANDIDATE_POOL_EXPAND) || 400;
 const MIN_SCORE = 0.2;
 
+// OTR eligibility config
+const OTR_POOL_REQUIRE_TRAVEL = (process.env.OTR_POOL_REQUIRE_TRAVEL || 'true') === 'true';
+const OTR_IMMEDIATE_DAYS = parseInt(process.env.OTR_IMMEDIATE_DAYS) || 7;
+
 const nowIso = () => new Date().toISOString();
 
 // ─── Utility ────────────────────────────────────────────────────────────────
@@ -81,10 +85,20 @@ function computeScore(co, dr) {
             === String(dr.availability).toLowerCase().trim() ? 1.0 : 0.5;
     }
 
-    const score = Math.min(Math.max(
-        (breakdown.operation * 0.40) + (breakdown.license * 0.25) +
-        (breakdown.experience * 0.20) + (breakdown.availability * 0.15)
-        , 0), 1);
+    let baseScore = (breakdown.operation * 0.40) + (breakdown.license * 0.25) +
+        (breakdown.experience * 0.20) + (breakdown.availability * 0.15);
+
+    // OTR bonuses (additive, capped at 1.0)
+    let bonus = 0;
+    if (dr.willing_to_travel === true) bonus += 0.05;
+    if (co.requires_immediate_start && dr.available_from_date) {
+        const availDate = new Date(dr.available_from_date);
+        const cutoff = new Date(Date.now() + OTR_IMMEDIATE_DAYS * 24 * 60 * 60 * 1000);
+        if (availDate <= cutoff) bonus += 0.05;
+    }
+
+    const score = Math.min(Math.max(baseScore + bonus, 0), 1);
+    breakdown.otr_bonus = bonus;
 
     return score >= MIN_SCORE ? { score, breakdown } : null;
 }
@@ -129,25 +143,21 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
     const drLics = toArray(driver.license_types).map(s => s.toLowerCase().trim()).filter(Boolean);
     const driverHasTruck = driver.has_truck ? 1 : 0;
 
-    // Build dynamic WHERE clauses for overlap filters
     let opFilter = '';
     let licFilter = '';
     let excludeFilter = '';
     const params = [driverHasTruck];
 
-    // Operation types overlap (SQL-level)
     if (drOps.length > 0) {
         opFilter = `AND (cr.req_operation_types IS NULL OR cr.req_operation_types = '' OR ${TEXT_TO_ARRAY('cr.req_operation_types')} && ?::text[])`;
         params.push(drOps);
     }
 
-    // License types overlap (SQL-level)
     if (drLics.length > 0) {
         licFilter = `AND (cr.req_license_types IS NULL OR cr.req_license_types = '' OR ${TEXT_TO_ARRAY('cr.req_license_types')} && ?::text[])`;
         params.push(drLics);
     }
 
-    // Exclude already-evaluated IDs
     if (excludeIds && excludeIds.length > 0) {
         excludeFilter = `AND e.id NOT IN (${excludeIds.map(() => '?').join(',')})`;
         params.push(...excludeIds);
@@ -159,7 +169,8 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
         SELECT e.id, e.nombre,
                cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
                cr.req_operation_types, cr.req_modalities, cr.req_truck,
-               cr.offered_payment_methods, cr.req_relationships, cr.availability
+               cr.offered_payment_methods, cr.req_relationships, cr.availability,
+               cr.requires_immediate_start
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
@@ -180,11 +191,13 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
     const reqOps = toArray(company.req_operation_types).map(s => s.toLowerCase().trim()).filter(Boolean);
     const reqLics = toArray(company.req_license_types).map(s => s.toLowerCase().trim()).filter(Boolean);
     const reqTruck = company.req_truck ? 1 : 0;
+    const requireTravel = OTR_POOL_REQUIRE_TRAVEL ? 1 : 0;
+    const requiresImmediate = company.requires_immediate_start ? 1 : 0;
 
     let opFilter = '';
     let licFilter = '';
     let excludeFilter = '';
-    const params = [reqTruck];
+    const params = [reqTruck, requireTravel, requiresImmediate, OTR_IMMEDIATE_DAYS];
 
     if (reqOps.length > 0) {
         opFilter = `AND (d.operation_types IS NULL OR d.operation_types = '' OR ${TEXT_TO_ARRAY('d.operation_types')} && ?::text[])`;
@@ -206,10 +219,17 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
     const query = `
         SELECT d.id, d.nombre, d.has_cdl, d.license_types, d.endorsements, d.experience_years,
                d.operation_types, d.job_preferences, d.has_truck, d.payment_methods,
-               d.work_relationships, d.availability
+               d.work_relationships, d.availability,
+               d.willing_to_travel, d.available_from_date, d.home_time_weeks
         FROM drivers d
         WHERE d.search_status = 'ON'
           AND (? = 0 OR d.has_truck = true)
+          AND (? = 0 OR d.willing_to_travel = true)
+          AND (
+              ? = 0
+              OR d.available_from_date IS NULL
+              OR d.available_from_date <= CURRENT_DATE + (? * INTERVAL '1 day')
+          )
           ${opFilter}
           ${licFilter}
           ${excludeFilter}
