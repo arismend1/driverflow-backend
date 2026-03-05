@@ -45,6 +45,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_candidate_pool_gin.js', { stdio: 'inherit' });
         execSync('node migrate_match_retention.js', { stdio: 'inherit' });
         execSync('node migrate_otr_eligibility.js', { stdio: 'inherit' });
+        execSync('node migrate_normalize_preferences.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
