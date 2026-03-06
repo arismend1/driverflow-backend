@@ -15,6 +15,7 @@ const { enforceCompanyCanOperate } = require('./access_control');
 const logger = require('./logger');
 const { getStripe } = require('./stripe_client');
 const db = require('./db_adapter'); // NEW Unified Adapter
+const { trackLeadFunnelEvent } = require('./analytics');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -51,6 +52,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_driver_leads.js', { stdio: 'inherit' });
         execSync('node migrate_lead_invitations.js', { stdio: 'inherit' });
         execSync('node migrate_lead_source.js', { stdio: 'inherit' });
+        execSync('node migrate_lead_funnel_events.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -350,6 +352,62 @@ app.get('/admin/metrics', async (req, res) => {
     }
 });
 
+// 5.3 Funnel Analytics (JSON / Admin)
+app.get('/admin/analytics/funnel', async (req, res) => {
+    const secret = req.headers['x-admin-secret'];
+    if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
+
+    try {
+        const days = parseInt(req.query.days);
+        const timeFilter = !isNaN(days) && days > 0 ? `WHERE created_at > datetime('now', '-${days} days')` : '';
+        const pgTimeFilter = !isNaN(days) && days > 0 ? `WHERE created_at > NOW() - INTERVAL '${days} days'` : '';
+
+        const filter = db.IS_POSTGRES ? pgTimeFilter : timeFilter;
+
+        const results = await db.all(`
+            SELECT event_type, COUNT(*) as count 
+            FROM lead_funnel_events 
+            ${filter}
+            GROUP BY event_type
+        `);
+
+        // Convert array to object
+        const counts = {
+            lead_created: 0,
+            lead_invited: 0,
+            driver_registered: 0,
+            lead_claimed: 0,
+            match_generated: 0
+        };
+
+        results.forEach(r => {
+            if (counts[r.event_type] !== undefined) {
+                counts[r.event_type] = parseInt(r.count);
+            }
+        });
+
+        const totals = {
+            leads_created: counts.lead_created,
+            leads_invited: counts.lead_invited,
+            drivers_registered: counts.driver_registered,
+            leads_claimed: counts.lead_claimed,
+            matches_generated: counts.match_generated
+        };
+
+        const conversion_rates = {
+            invite_rate: totals.leads_created > 0 ? totals.leads_invited / totals.leads_created : 0,
+            registration_rate: totals.leads_invited > 0 ? totals.drivers_registered / totals.leads_invited : 0,
+            claim_rate: totals.drivers_registered > 0 ? totals.leads_claimed / totals.drivers_registered : 0,
+            match_rate: totals.leads_claimed > 0 ? totals.matches_generated / totals.leads_claimed : 0
+        };
+
+        res.json({ ok: true, totals, conversion_rates });
+    } catch (e) {
+        console.error('Analytics Error:', e);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
 // Debug Endpoints (Production Diagnosis)
 app.get('/sys/debug/email-status', async (req, res) => {
     try {
@@ -517,6 +575,11 @@ app.post('/register', async (req, res) => {
 
             // Auto-claim lead if driver email matches
             try { await claimLeadForDriver(newId, contacto, null); } catch (ce) { console.error('[LeadClaim] register error:', ce.message); }
+
+            await trackLeadFunnelEvent('driver_registered', {
+                driver_id: newId,
+                metadata: { registration_method: "signup" }
+            });
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
                 req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
@@ -1112,6 +1175,7 @@ async function importLeadsFromRows(companyId, records) {
                      VALUES (?, ?, ?, ?, ?, 'NEW', 'csv_import', false) ON CONFLICT DO NOTHING`,
                     companyId, rec.name, rec.phone, rec.email, rec.notes
                 );
+                await trackLeadFunnelEvent('lead_created', { company_id: companyId, metadata: { source: "csv_import", is_synthetic: false } });
                 inserted++;
             } catch (e) {
                 skipped++;
@@ -1658,6 +1722,7 @@ async function claimLeadForDriver(driverId, email, phone) {
         driverId, lead.id
     );
     console.log(`[LeadClaim] driver_id=${driverId} lead_id=${lead.id} company_id=${lead.company_id}`);
+    await trackLeadFunnelEvent('lead_claimed', { lead_id: lead.id, driver_id: driverId, company_id: lead.company_id, metadata: { claim_method: "auto_email_match" } });
 }
 
 // POST /leads — create a lead (company only)
@@ -1673,6 +1738,7 @@ app.post('/leads', authenticateToken, async (req, res) => {
             req.user.id, name || '', phone || null, email ? email.toLowerCase().trim() : null, notes || null
         );
         console.log(`[Leads] Created lead id=${result.lastInsertRowid} for company_id=${req.user.id}`);
+        await trackLeadFunnelEvent('lead_created', { lead_id: result.lastInsertRowid, company_id: req.user.id, metadata: { source: "manual", is_synthetic: false } });
         res.json({ ok: true, id: result.lastInsertRowid });
     } catch (e) {
         if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {
@@ -1749,10 +1815,11 @@ app.post('/leads/import', authenticateToken, async (req, res) => {
             if (!name && !email && !phone) { skipped++; continue; }
 
             try {
-                await db.run(
+                const res = await db.run(
                     `INSERT INTO driver_leads (company_id, name, phone, email, notes) VALUES (?, ?, ?, ?, ?)`,
                     req.user.id, name, phone, email, notes
                 );
+                await trackLeadFunnelEvent('lead_created', { lead_id: res?.lastInsertRowid || null, company_id: req.user.id, metadata: { source: "manual_bulk", is_synthetic: false } });
                 created++;
             } catch (e) {
                 if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {

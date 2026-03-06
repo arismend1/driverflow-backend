@@ -805,6 +805,9 @@ if (require.main === module) {
                         lead.id
                     );
 
+                    const { trackLeadFunnelEvent } = require('./analytics');
+                    await trackLeadFunnelEvent('lead_invited', { lead_id: lead.id, company_id: lead.company_id, metadata: { source: "daily_worker" } });
+
                     // Fetch company name for email
                     let companyName = 'Una empresa';
                     if (lead.company_id) {

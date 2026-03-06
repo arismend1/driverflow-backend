@@ -296,7 +296,11 @@ async function generateMatchesForDriver(driverId) {
     let inserted = 0, updated = 0;
     for (const { candidate, score, breakdown } of top) {
         const result = await upsertMatch(candidate.id, driverId, score, breakdown, nowStr);
-        if (result === 'inserted') inserted++;
+        if (result === 'inserted') {
+            inserted++;
+            const { trackLeadFunnelEvent } = require('./analytics');
+            await trackLeadFunnelEvent('match_generated', { company_id: candidate.id, driver_id: driverId, metadata: { match_source: "lazy_matching" } });
+        }
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
@@ -353,7 +357,11 @@ async function generateMatchesForCompany(companyId) {
     let inserted = 0, updated = 0;
     for (const { candidate, score, breakdown } of top) {
         const result = await upsertMatch(companyId, candidate.id, score, breakdown, nowStr);
-        if (result === 'inserted') inserted++;
+        if (result === 'inserted') {
+            inserted++;
+            const { trackLeadFunnelEvent } = require('./analytics');
+            await trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: candidate.id, metadata: { match_source: "lazy_matching" } });
+        }
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
