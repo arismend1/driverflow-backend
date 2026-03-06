@@ -5,6 +5,8 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const multer = require('multer');
+const leadUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // --- LOCAL IMPORTS ---
 const { validateEnv } = require('./env_guard');
@@ -1066,76 +1068,94 @@ app.post('/admin/debug/jwt', (req, res) => {
 });
 
 // POST /admin/import-leads — Bulk CSV lead import (admin only)
-app.post('/admin/import-leads', async (req, res) => {
-    const adminParam = req.headers['x-admin-secret'];
-    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+// Supports: JSON body { company_id, csv } OR multipart/form-data { company_id, file }
 
-    const { company_id, csv } = req.body;
-    if (!company_id) return res.status(400).json({ error: 'Missing company_id' });
-    if (!csv || typeof csv !== 'string') return res.status(400).json({ error: 'Missing csv string in body' });
+function parseCsvText(csvText) {
+    const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) throw new Error('CSV must have header + at least 1 row');
 
-    try {
-        // Parse CSV
-        const lines = csv.split('\n').map(l => l.trim()).filter(Boolean);
-        if (lines.length < 2) return res.status(400).json({ error: 'CSV must have header + at least 1 row' });
+    const headers = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    const nameIdx = headers.indexOf('name');
+    const emailIdx = headers.indexOf('email');
+    const phoneIdx = headers.indexOf('phone');
+    const notesIdx = headers.indexOf('notes');
 
-        const headers = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-        const nameIdx = headers.indexOf('name');
-        const emailIdx = headers.indexOf('email');
-        const phoneIdx = headers.indexOf('phone');
-        const notesIdx = headers.indexOf('notes');
+    if (nameIdx === -1 && emailIdx === -1) throw new Error('CSV must have at least "name" or "email" column');
 
-        if (nameIdx === -1 && emailIdx === -1) {
-            return res.status(400).json({ error: 'CSV must have at least "name" or "email" column' });
-        }
+    const records = [];
+    for (let i = 1; i < lines.length; i++) {
+        const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+        const name = nameIdx >= 0 ? (vals[nameIdx] || '').trim() : '';
+        const email = emailIdx >= 0 ? (vals[emailIdx] || '').trim().toLowerCase() : null;
+        const phone = phoneIdx >= 0 ? (vals[phoneIdx] || '').trim() : null;
+        const notes = notesIdx >= 0 ? (vals[notesIdx] || '').trim() : null;
 
-        // Parse rows
-        const records = [];
-        for (let i = 1; i < lines.length; i++) {
-            // Handle quoted CSV values
-            const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-            const name = nameIdx >= 0 ? (vals[nameIdx] || '').trim() : '';
-            const email = emailIdx >= 0 ? (vals[emailIdx] || '').trim().toLowerCase() : null;
-            const phone = phoneIdx >= 0 ? (vals[phoneIdx] || '').trim() : null;
-            const notes = notesIdx >= 0 ? (vals[notesIdx] || '').trim() : null;
+        if (!name && !email && !phone) continue;
+        records.push({ name, email: email || null, phone: phone || null, notes: notes || null });
+    }
+    return records;
+}
 
-            if (!name && !email && !phone) continue; // skip empty rows
-            records.push({ name, email: email || null, phone: phone || null, notes: notes || null });
-        }
+async function importLeadsFromRows(companyId, records) {
+    const BATCH_SIZE = 100;
+    let inserted = 0, skipped = 0;
 
-        console.log(`[LeadImporter] Parsed ${records.length} records for company_id=${company_id}`);
+    for (let b = 0; b < records.length; b += BATCH_SIZE) {
+        const batch = records.slice(b, b + BATCH_SIZE);
+        console.log(`[LeadImporter] importing batch ${Math.floor(b / BATCH_SIZE) + 1} (${batch.length} rows)`);
 
-        // Batch insert (100 per batch)
-        const BATCH_SIZE = 100;
-        let inserted = 0;
-        let skipped = 0;
-
-        for (let b = 0; b < records.length; b += BATCH_SIZE) {
-            const batch = records.slice(b, b + BATCH_SIZE);
-            console.log(`[LeadImporter] importing batch ${Math.floor(b / BATCH_SIZE) + 1} (${batch.length} rows)`);
-
-            for (const rec of batch) {
-                try {
-                    await db.run(
-                        `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
-                         VALUES (?, ?, ?, ?, ?, 'NEW')
-                         ON CONFLICT DO NOTHING`,
-                        company_id, rec.name, rec.phone, rec.email, rec.notes
-                    );
-                    inserted++;
-                } catch (e) {
-                    if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {
-                        skipped++;
-                    } else {
-                        skipped++;
-                        console.error('[LeadImporter] Row error:', e.message);
-                    }
+        for (const rec of batch) {
+            try {
+                await db.run(
+                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
+                     VALUES (?, ?, ?, ?, ?, 'NEW') ON CONFLICT DO NOTHING`,
+                    companyId, rec.name, rec.phone, rec.email, rec.notes
+                );
+                inserted++;
+            } catch (e) {
+                skipped++;
+                if (!(e.code === '23505' || (e.message && e.message.includes('duplicate')))) {
+                    console.error('[LeadImporter] Row error:', e.message);
                 }
             }
         }
+    }
 
-        console.log(`[LeadImporter] Done: inserted=${inserted} skipped=${skipped} total=${records.length}`);
-        res.json({ ok: true, inserted, skipped, total: records.length });
+    console.log(`[LeadImporter] Done: inserted=${inserted} skipped=${skipped} total=${records.length}`);
+    return { inserted, skipped, total: records.length };
+}
+
+app.post('/admin/import-leads', leadUpload.single('file'), async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+
+    try {
+        let companyId, records, source;
+
+        if (req.file) {
+            // Multipart/form-data mode
+            source = 'multipart';
+            companyId = req.body.company_id;
+            if (!companyId) return res.status(400).json({ error: 'Missing company_id field' });
+
+            const csvText = req.file.buffer.toString('utf-8');
+            console.log(`[LeadImporter] Upload received: ${req.file.originalname} (${req.file.size} bytes)`);
+            records = parseCsvText(csvText);
+            console.log(`[LeadImporter] Parsed file rows=${records.length}`);
+        } else {
+            // JSON body mode (backward compatible)
+            source = 'json';
+            companyId = req.body.company_id;
+            const csv = req.body.csv;
+            if (!companyId) return res.status(400).json({ error: 'Missing company_id' });
+            if (!csv || typeof csv !== 'string') return res.status(400).json({ error: 'Missing csv string in body' });
+
+            records = parseCsvText(csv);
+            console.log(`[LeadImporter] Parsed ${records.length} records for company_id=${companyId}`);
+        }
+
+        const result = await importLeadsFromRows(companyId, records);
+        res.json({ ok: true, ...result, source });
     } catch (e) {
         console.error('[LeadImporter] Fatal error:', e);
         res.status(500).json({ error: 'Import failed', message: e.message });
