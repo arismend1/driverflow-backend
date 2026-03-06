@@ -773,6 +773,63 @@ if (require.main === module) {
     setInterval(expireSearches, SEARCH_EXPIRE_INTERVAL);
     setTimeout(expireSearches, 120000); // Run once at startup after 2 min
 
+    // Daily lead invitation (every 24 hours)
+    const DAILY_INVITE_INTERVAL = 24 * 60 * 60 * 1000;
+
+    async function runDailyLeadInvites() {
+        try {
+            console.log('[LeadInviteWorker] scanning leads');
+
+            const leads = await db.all(
+                `SELECT id, email, name, company_id FROM driver_leads
+                 WHERE email IS NOT NULL AND email <> ''
+                   AND status IN ('NEW','INVITED')
+                   AND (invite_count IS NULL OR invite_count < 5)
+                   AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
+                 LIMIT 50`
+            );
+
+            if (leads.length === 0) {
+                console.log('[LeadInviteWorker] no eligible leads found');
+                return;
+            }
+
+            console.log(`[LeadInviteWorker] inviting ${leads.length} leads`);
+            const now = new Date().toISOString();
+
+            for (const lead of leads) {
+                try {
+                    await db.run(
+                        `UPDATE driver_leads SET status='INVITED', invited_at=NOW(), invite_count=COALESCE(invite_count,0)+1, updated_at=NOW() WHERE id=?`,
+                        lead.id
+                    );
+
+                    // Fetch company name for email
+                    let companyName = 'Una empresa';
+                    if (lead.company_id) {
+                        const co = await db.get('SELECT nombre FROM empresas WHERE id=?', lead.company_id);
+                        if (co) companyName = co.nombre;
+                    }
+
+                    await db.run(
+                        `INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?,?,?,?,?)`,
+                        `daily_invite_${lead.id}`, 'lead_invitation_email', now, lead.company_id || 0,
+                        JSON.stringify({ lead_id: lead.id, company_id: lead.company_id, company_name: companyName, email: lead.email, name: lead.name || 'Conductor' })
+                    );
+                } catch (e) {
+                    console.error(`[LeadInviteWorker] Error inviting lead ${lead.id}:`, e.message);
+                }
+            }
+
+            console.log(`[LeadInviteWorker] done invited=${leads.length}`);
+        } catch (e) {
+            console.error('[LeadInviteWorker] Fatal error:', e.message);
+        }
+    }
+
+    setInterval(runDailyLeadInvites, DAILY_INVITE_INTERVAL);
+    setTimeout(runDailyLeadInvites, 180000); // Run once at startup after 3 min
+
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);
         process.exit(1);
