@@ -784,6 +784,7 @@ if (require.main === module) {
                 `SELECT id, email, name, company_id FROM driver_leads
                  WHERE email IS NOT NULL AND email <> ''
                    AND status IN ('NEW','INVITED')
+                   AND is_synthetic = false
                    AND (invite_count IS NULL OR invite_count < 5)
                    AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
                  LIMIT 50`

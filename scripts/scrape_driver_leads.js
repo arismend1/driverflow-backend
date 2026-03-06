@@ -82,6 +82,7 @@ async function scrapeCraigslist() {
                     email: emails[0] || null,
                     phone: phones[0] || null,
                     notes: `Lead scraped from Craigslist ${city} resume listing`,
+                    source: 'scraper', is_synthetic: false,
                 });
             });
 
@@ -130,6 +131,7 @@ async function scrapeIndeed() {
                     email: emails[0] || null,
                     phone: phones[0] || null,
                     notes: `Lead scraped from Indeed resume search`,
+                    source: 'scraper', is_synthetic: false,
                 });
             });
 
@@ -210,7 +212,7 @@ function generateFallbackLeads(count) {
         const area = pick(AREAS);
         const phone = `${area}${randInt(200, 999)}${randInt(1000, 9999)}`;
 
-        leads.push({ name: `${first} ${last}`, email, phone, notes: note });
+        leads.push({ name: `${first} ${last}`, email, phone, notes: note, source: 'scraper_fallback', is_synthetic: true });
     }
     return leads;
 }
@@ -236,9 +238,10 @@ async function insertLeads(leads) {
         for (const lead of batch) {
             try {
                 await db.run(
-                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
-                     VALUES (?, ?, ?, ?, ?, 'NEW') ON CONFLICT DO NOTHING`,
-                    COMPANY_ID, lead.name || '', lead.phone || null, lead.email || null, lead.notes || null
+                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status, source, is_synthetic)
+                     VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?) ON CONFLICT DO NOTHING`,
+                    COMPANY_ID, lead.name || '', lead.phone || null, lead.email || null, lead.notes || null,
+                    lead.source || 'scraper', lead.is_synthetic || false
                 );
                 inserted++;
             } catch (e) {

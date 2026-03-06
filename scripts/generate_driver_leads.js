@@ -130,8 +130,8 @@ function generateLead(usedEmails) {
         for (const lead of batch) {
             try {
                 await db.run(
-                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
-                     VALUES (?, ?, ?, ?, ?, 'NEW') ON CONFLICT DO NOTHING`,
+                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status, source, is_synthetic)
+                     VALUES (?, ?, ?, ?, ?, 'NEW', 'seed_generator', true) ON CONFLICT DO NOTHING`,
                     COMPANY_ID, lead.name, lead.phone, lead.email, lead.notes
                 );
                 inserted++;

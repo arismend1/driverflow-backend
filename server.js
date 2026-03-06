@@ -50,6 +50,7 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_normalize_preferences.js', { stdio: 'inherit' });
         execSync('node migrate_driver_leads.js', { stdio: 'inherit' });
         execSync('node migrate_lead_invitations.js', { stdio: 'inherit' });
+        execSync('node migrate_lead_source.js', { stdio: 'inherit' });
         console.log('--- Migration Done ---');
     } catch (err) {
         console.error('FATAL: Migration failed.');
@@ -1107,8 +1108,8 @@ async function importLeadsFromRows(companyId, records) {
         for (const rec of batch) {
             try {
                 await db.run(
-                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
-                     VALUES (?, ?, ?, ?, ?, 'NEW') ON CONFLICT DO NOTHING`,
+                    `INSERT INTO driver_leads (company_id, name, phone, email, notes, status, source, is_synthetic)
+                     VALUES (?, ?, ?, ?, ?, 'NEW', 'csv_import', false) ON CONFLICT DO NOTHING`,
                     companyId, rec.name, rec.phone, rec.email, rec.notes
                 );
                 inserted++;
@@ -1903,6 +1904,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 `SELECT id, name, email FROM driver_leads
                  WHERE company_id = ? AND status IN ('NEW','INVITED')
                    AND email IS NOT NULL AND email <> ''
+                   AND is_synthetic = false
                    AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
                    AND (invite_count IS NULL OR invite_count < ?)
                  LIMIT 10`,
