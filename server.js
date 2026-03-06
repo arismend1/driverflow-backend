@@ -1065,6 +1065,83 @@ app.post('/admin/debug/jwt', (req, res) => {
     });
 });
 
+// POST /admin/import-leads — Bulk CSV lead import (admin only)
+app.post('/admin/import-leads', async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+
+    const { company_id, csv } = req.body;
+    if (!company_id) return res.status(400).json({ error: 'Missing company_id' });
+    if (!csv || typeof csv !== 'string') return res.status(400).json({ error: 'Missing csv string in body' });
+
+    try {
+        // Parse CSV
+        const lines = csv.split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length < 2) return res.status(400).json({ error: 'CSV must have header + at least 1 row' });
+
+        const headers = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+        const nameIdx = headers.indexOf('name');
+        const emailIdx = headers.indexOf('email');
+        const phoneIdx = headers.indexOf('phone');
+        const notesIdx = headers.indexOf('notes');
+
+        if (nameIdx === -1 && emailIdx === -1) {
+            return res.status(400).json({ error: 'CSV must have at least "name" or "email" column' });
+        }
+
+        // Parse rows
+        const records = [];
+        for (let i = 1; i < lines.length; i++) {
+            // Handle quoted CSV values
+            const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+            const name = nameIdx >= 0 ? (vals[nameIdx] || '').trim() : '';
+            const email = emailIdx >= 0 ? (vals[emailIdx] || '').trim().toLowerCase() : null;
+            const phone = phoneIdx >= 0 ? (vals[phoneIdx] || '').trim() : null;
+            const notes = notesIdx >= 0 ? (vals[notesIdx] || '').trim() : null;
+
+            if (!name && !email && !phone) continue; // skip empty rows
+            records.push({ name, email: email || null, phone: phone || null, notes: notes || null });
+        }
+
+        console.log(`[LeadImporter] Parsed ${records.length} records for company_id=${company_id}`);
+
+        // Batch insert (100 per batch)
+        const BATCH_SIZE = 100;
+        let inserted = 0;
+        let skipped = 0;
+
+        for (let b = 0; b < records.length; b += BATCH_SIZE) {
+            const batch = records.slice(b, b + BATCH_SIZE);
+            console.log(`[LeadImporter] importing batch ${Math.floor(b / BATCH_SIZE) + 1} (${batch.length} rows)`);
+
+            for (const rec of batch) {
+                try {
+                    await db.run(
+                        `INSERT INTO driver_leads (company_id, name, phone, email, notes, status)
+                         VALUES (?, ?, ?, ?, ?, 'NEW')
+                         ON CONFLICT DO NOTHING`,
+                        company_id, rec.name, rec.phone, rec.email, rec.notes
+                    );
+                    inserted++;
+                } catch (e) {
+                    if (e.code === '23505' || (e.message && e.message.includes('duplicate'))) {
+                        skipped++;
+                    } else {
+                        skipped++;
+                        console.error('[LeadImporter] Row error:', e.message);
+                    }
+                }
+            }
+        }
+
+        console.log(`[LeadImporter] Done: inserted=${inserted} skipped=${skipped} total=${records.length}`);
+        res.json({ ok: true, inserted, skipped, total: records.length });
+    } catch (e) {
+        console.error('[LeadImporter] Fatal error:', e);
+        res.status(500).json({ error: 'Import failed', message: e.message });
+    }
+});
+
 // --- 7.2 BILLING (CLIENT DASHBOARD) ---
 app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
