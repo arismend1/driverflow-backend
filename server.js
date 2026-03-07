@@ -694,10 +694,10 @@ app.post('/register', async (req, res) => {
             // Auto-claim lead if driver email matches
             try { await claimLeadForDriver(newId, contacto, phone); } catch (ce) { console.error('[LeadClaim] register error:', ce.message); }
 
-            await trackLeadFunnelEvent('driver_registered', {
-                driver_id: newId,
-                metadata: { registration_method: "signup" }
-            });
+            // await trackLeadFunnelEvent('driver_registered', {
+            //     driver_id: newId,
+            //     metadata: { registration_method: "signup" }
+            // });
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
                 req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
