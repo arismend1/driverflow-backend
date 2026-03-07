@@ -103,20 +103,33 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             'SELECT id, status FROM potential_matches WHERE company_id = ? AND driver_id = ?',
             companyId, driverId
         );
-        if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) return 'skipped';
+        if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) {
+            console.log('[Funnel] skipped match_generated because match already existed');
+            return 'skipped';
+        }
 
         if (existing) {
+            console.log('[Funnel] skipped match_generated because match already existed');
             await db.run(
                 'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
                 score, JSON.stringify(breakdown), nowStr, existing.id
             );
             return 'updated';
         } else {
+            console.log('[Funnel] attempting match_generated');
             await db.run(
                 `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
                  VALUES (?, ?, ?, ?, 'NEW', ?)`,
                 companyId, driverId, score, JSON.stringify(breakdown), nowStr
             );
+
+            try {
+                const { trackLeadFunnelEvent } = require('./analytics');
+                await trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: driverId, metadata: { match_source: "lazy_matching" } });
+                console.log('[Funnel] match_generated inserted');
+            } catch (err) {
+                console.log('[Funnel] match_generated error: ' + err.message);
+            }
             return 'inserted';
         }
     } catch (e) {
@@ -296,11 +309,7 @@ async function generateMatchesForDriver(driverId) {
     let inserted = 0, updated = 0;
     for (const { candidate, score, breakdown } of top) {
         const result = await upsertMatch(candidate.id, driverId, score, breakdown, nowStr);
-        if (result === 'inserted') {
-            inserted++;
-            const { trackLeadFunnelEvent } = require('./analytics');
-            await trackLeadFunnelEvent('match_generated', { company_id: candidate.id, driver_id: driverId, metadata: { match_source: "lazy_matching" } });
-        }
+        if (result === 'inserted') inserted++;
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
@@ -357,11 +366,7 @@ async function generateMatchesForCompany(companyId) {
     let inserted = 0, updated = 0;
     for (const { candidate, score, breakdown } of top) {
         const result = await upsertMatch(companyId, candidate.id, score, breakdown, nowStr);
-        if (result === 'inserted') {
-            inserted++;
-            const { trackLeadFunnelEvent } = require('./analytics');
-            await trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: candidate.id, metadata: { match_source: "lazy_matching" } });
-        }
+        if (result === 'inserted') inserted++;
         if (result === 'updated' || result === 'conflict') updated++;
     }
 
