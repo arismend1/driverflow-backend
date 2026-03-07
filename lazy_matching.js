@@ -150,7 +150,7 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
     const driverHasTruck = driver.has_truck ? 1 : 0;
 
     let excludeFilter = '';
-    const params = [driverHasTruck, driver.id, driver.id, driver.id, driver.id];
+    const params = [driverHasTruck, driver.id, driver.id];
 
     if (excludeIds && excludeIds.length > 0) {
         excludeFilter = `AND e.id NOT IN (${excludeIds.map(() => '?').join(',')})`;
@@ -264,7 +264,7 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
               )
           )
           ${excludeFilter}
-        ORDER BY d.updated_at DESC NULLS LAST
+        ORDER BY d.created_at DESC NULLS LAST
         LIMIT ?
     `;
 
