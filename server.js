@@ -2011,13 +2011,13 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 pm.driver_share_consent_at,
                 pm.company_share_consent_at,
                 d.id            AS driver_id,
-                d.nombre        AS display_name,
-                d.contacto      AS driver_email,
-                d.experience_years,
-                d.license_types AS license_summ,
-                d.operation_types AS op_types,
-                d.payment_methods AS pay_methods,
-                d.availability
+                COALESCE(d.nombre, '') AS display_name,
+                COALESCE(d.contacto, '') AS driver_email,
+                COALESCE(d.experience_years, 0) AS experience_years,
+                COALESCE(d.license_types, '[]') AS license_summ,
+                COALESCE(d.operation_types, '[]') AS op_types,
+                COALESCE(d.payment_methods, '[]') AS pay_methods,
+                COALESCE(d.availability, '') AS availability
             FROM potential_matches pm
             JOIN drivers d ON d.id = pm.driver_id
             WHERE pm.company_id = ?
@@ -2106,10 +2106,14 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 pm.company_share_consent_at,
                 pm.company_id,
                 COALESCE(e.nombre, 'Company #' || CAST(pm.company_id AS TEXT)) AS display_name,
-                e.contacto      AS company_email,
-                cr.req_operation_types AS op_types,
-                cr.offered_payment_methods AS pay_methods,
-                cr.availability
+                COALESCE(e.contacto, '') AS company_email,
+                COALESCE(e.ciudad, '') AS city,
+                COALESCE(e.address_state, '') AS address_state,
+                COALESCE(e.contact_person, '') AS contact_person,
+                COALESCE(e.contact_phone, '') AS contact_phone,
+                COALESCE(cr.req_operation_types, '[]') AS op_types,
+                COALESCE(cr.offered_payment_methods, '[]') AS pay_methods,
+                COALESCE(cr.availability, '') AS availability
             FROM potential_matches pm
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
