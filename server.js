@@ -1924,6 +1924,24 @@ async function unlockUserAdvisoryLock(lockKey) {
     } catch (_) { }
 }
 
+async function getCompanyScopeIds(companyId) {
+    try {
+        const row = await db.get('SELECT contacto FROM empresas WHERE id = ?', companyId);
+        if (!row || !row.contacto) return [companyId];
+        const normalized = row.contacto.trim().toLowerCase();
+
+        const duplicates = await db.all('SELECT id FROM empresas WHERE LOWER(TRIM(contacto)) = ?', normalized);
+        if (duplicates && duplicates.length > 0) {
+            const scopeIds = duplicates.map(d => d.id);
+            console.log(`[CompanyScope] login_id=${companyId} -> normalized_contact="${normalized}" -> total_duplicates=${scopeIds.length} -> scope_ids=[${scopeIds.join(',')}]`);
+            return scopeIds;
+        }
+    } catch (e) {
+        console.error('[CompanyScope] error:', e.message);
+    }
+    return [companyId];
+}
+
 // ─── MATCHES READER ENDPOINTS ───────────────────────────────────────────────
 
 // GET /matches/candidates — Company sees matched drivers
@@ -1936,11 +1954,14 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
         const cooldownMin = Number(process.env.MATCH_COOLDOWN_MINUTES || 10);
         const cutoff = new Date(Date.now() - freshHours * 3600 * 1000).toISOString();
 
+        const scopeIds = await getCompanyScopeIds(req.user.id);
+        const scopeIn = scopeIds.map(() => '?').join(',');
+
         // 1) Count fresh active matches
         const recentRow = await db.get(
             `SELECT COUNT(*) AS c FROM potential_matches
-             WHERE company_id = ? AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
-            req.user.id, cutoff
+             WHERE company_id IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+            ...scopeIds, cutoff
         );
         const recentCount = recentRow ? parseInt(recentRow.c) : 0;
 
@@ -2020,10 +2041,10 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 COALESCE(d.availability, '') AS availability
             FROM potential_matches pm
             JOIN drivers d ON d.id = pm.driver_id
-            WHERE pm.company_id = ?
+            WHERE pm.company_id IN (${scopeIn})
               AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.created_at DESC
-        `, req.user.id);
+        `, ...scopeIds);
 
         const sanitized = rows.map(r => {
             if (r.status !== 'INFO_SHARED') {
@@ -2052,6 +2073,9 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
         const cutoff = new Date(Date.now() - freshHours * 3600 * 1000).toISOString();
 
         const filterColumn = userType === 'driver' ? 'driver_id' : 'company_id';
+        const scopeIds = userType === 'empresa' ? await getCompanyScopeIds(userId) : [userId];
+        const scopeIn = scopeIds.map(() => '?').join(',');
+
         if (userType !== 'driver' && userType !== 'empresa') {
             return res.status(403).json({ error: 'Forbidden' });
         }
@@ -2060,8 +2084,8 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
         // 1) Count fresh active matches
         const recentRow = await db.get(
             `SELECT COUNT(*) AS c FROM potential_matches
-             WHERE ${filterColumn} = ? AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
-            userId, cutoff
+             WHERE ${filterColumn} IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+            ...scopeIds, cutoff
         );
         const recentCount = recentRow ? parseInt(recentRow.c) : 0;
         console.log(`[matches/opportunities] 3. Count checked: recentActive=${recentCount} min=${minActive}`);
@@ -2123,10 +2147,10 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             FROM potential_matches pm
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
-            WHERE pm.${filterColumn} = ?
+            WHERE pm.${filterColumn} IN (${scopeIn})
               AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.match_score DESC, pm.created_at DESC
-        `, userId);
+        `, ...scopeIds);
 
         console.log(`[matches/opportunities] 6. AFTER final SQL query. Rows length: ${rows.length}`);
 
@@ -2184,8 +2208,11 @@ const updateMatchStatus = async (req, res, newStatus) => {
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         if (!match) return res.status(404).json({ error: 'Match not found' });
 
-        if (userType === 'empresa' && match.company_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
-        if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
+        if (userType === 'empresa') {
+            const scopeIds = await getCompanyScopeIds(userId);
+            if (!scopeIds.includes(match.company_id)) return res.status(403).json({ error: 'Unauthorized scope' });
+        }
+        if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized driver' });
 
         let updateSql = 'UPDATE potential_matches SET status = ?, updated_at = ?';
         let params = [newStatus, now];
