@@ -2258,6 +2258,40 @@ const finalizeShare = async (matchId) => {
     );
 };
 
+// ─── TICKET GENERATION HELPER ───────────────────────────────────────────────
+async function ensureTicketGenerated(matchId, companyId, driverId, now) {
+    const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+    let ticketId = existingTicket ? existingTicket.id : null;
+    const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
+
+    if (!ticketId) {
+        try {
+            const t = await db.run(
+                `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
+                 VALUES (?,?,?,?,?,'USD',?,'pending',?)
+                 RETURNING id`,
+                parseInt(matchId), companyId, driverId, amount, amount, now, `Match ID: ${matchId}`
+            );
+            ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
+        } catch (insertErr) {
+            if (insertErr.code === '23505' || (insertErr.message && (insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate')))) {
+                const race = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+                ticketId = race ? race.id : null;
+            } else {
+                throw insertErr;
+            }
+        }
+    }
+
+    if (ticketId) {
+        await db.run(
+            'UPDATE potential_matches SET ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
+            ticketId, amount, 'USD', now, matchId
+        );
+    }
+    return ticketId;
+}
+
 app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers' });
     const matchId = req.params.id;
@@ -2273,17 +2307,27 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         }
 
         await db.run(
-            'UPDATE potential_matches SET driver_share_consent_at = ?, updated_at = ? WHERE id = ?',
+            'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
             now, now, matchId
         );
 
         const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
-        if (updated.company_share_consent_at && updated.ticket_id) {
+        let finalStatus = updated.status;
+        let ticketId = updated.ticket_id || null;
+
+        if (updated.company_share_consent_at) {
+            ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
             await finalizeShare(matchId);
-            return res.json({ success: true, status: 'INFO_SHARED' });
+            finalStatus = 'INFO_SHARED';
+            console.log(`[Matches] Match ${matchId} TICKETING! Actor: Driver -> Both Consented. Status: ${match.status} -> ${finalStatus}. Ticket= ${ticketId}`);
+            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+        } else {
+            finalStatus = 'SHARE_PENDING_COMPANY';
+            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
+            console.log(`[Matches] Match ${matchId} Driver Consented. Awaiting Company. Status: ${match.status} -> ${finalStatus}`);
         }
 
-        res.json({ success: true, status: updated.status });
+        res.json({ success: true, status: finalStatus });
     } catch (e) {
         console.error('[Matches] driver confirm-share error:', e);
         res.status(500).json({ error: 'Server error' });
@@ -2296,67 +2340,40 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
     const now = new Date().toISOString();
 
     try {
-        const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND company_id = ?', matchId, req.user.id);
-        if (!match) return res.status(404).json({ error: 'Match not found' });
+        const scopeIds = await getCompanyScopeIds(req.user.id);
+        const scopeIn = scopeIds.map(() => '?').join(',');
+
+        const matches = await db.all(`SELECT * FROM potential_matches WHERE id = ? AND company_id IN (${scopeIn})`, matchId, ...scopeIds);
+        const match = matches.length > 0 ? matches[0] : null;
+        if (!match) return res.status(404).json({ error: 'Match not found in company scope' });
 
         const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
         if (!validCompanyStates.includes(match.status)) {
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
 
-        if (!match.driver_share_consent_at) {
-            return res.status(409).json({ error: 'Driver must consent first' });
-        }
-
-        // 1. Check if ticket already exists for this match (idempotent)
-        const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
-        if (existingTicket) {
-            // Idempotent: sync match record and return existing ticket
-            await db.run(
-                'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, updated_at = ? WHERE id = ?',
-                now, existingTicket.id, now, matchId
-            );
-            await finalizeShare(matchId);
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: existingTicket.id });
-        }
-
-        // 2. Create new ticket (match_id is NOT NULL + UNIQUE enforced by DB)
-        const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
-        let ticketId = null;
-
-        try {
-            const t = await db.run(
-                `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
-                 VALUES (?,?,?,?,?,'USD',?,'pending',?)
-                 RETURNING id`,
-                parseInt(matchId), match.company_id, match.driver_id, amount, amount, now, `Match ID: ${matchId}`
-            );
-            ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
-        } catch (insertErr) {
-            // Race condition safety: concurrent request already inserted
-            if (insertErr.code === '23505' || (insertErr.message && (insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate')))) {
-                const race = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
-                ticketId = race ? race.id : null;
-            } else {
-                throw insertErr;
-            }
-        }
-
-        if (!ticketId) {
-            console.error(`[Matches] Failed to create or find ticket for match ${matchId}`);
-            return res.status(500).json({ error: 'Ticket creation failed' });
-        }
-
-        // 3. Update match record
         await db.run(
-            'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
-            now, ticketId, amount, 'USD', now, matchId
+            'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
+            now, now, matchId
         );
 
-        await finalizeShare(matchId);
+        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        let finalStatus = updated.status;
+        let ticketId = updated.ticket_id || null;
 
-        console.log(`[Matches] Company confirmed share for match ${matchId}. Ticket ${ticketId}`);
-        res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+        if (updated.driver_share_consent_at) {
+            ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
+            await finalizeShare(matchId);
+            finalStatus = 'INFO_SHARED';
+            console.log(`[Matches] Match ${matchId} TICKETING! Actor: Company -> Both Consented. Status: ${match.status} -> ${finalStatus}. Ticket= ${ticketId}`);
+            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+        } else {
+            finalStatus = 'SHARE_PENDING_DRIVER';
+            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
+            console.log(`[Matches] Match ${matchId} Company Consented. Awaiting Driver. Status: ${match.status} -> ${finalStatus}`);
+        }
+
+        res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] company confirm-share error:', e);
         res.status(500).json({ error: 'Server error' });
