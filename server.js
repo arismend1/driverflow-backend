@@ -526,7 +526,7 @@ app.post('/login', async (req, res) => {
             }
 
             if (!row) {
-                // Policy: Try to resolve by ACTIVE + verified
+                // Policy: Try to resolve by ACTIVE + verified only if unique
                 const activeVerified = rows.filter(r =>
                     (r.account_state === 'ACTIVE' || r.estado === 'ACTIVO' || r.status === 'active') &&
                     (r.verified == 1 || r.verified == true || r.verified == 'true')
@@ -534,12 +534,12 @@ app.post('/login', async (req, res) => {
 
                 if (activeVerified.length === 1) {
                     row = activeVerified[0];
-                } else if (activeVerified.length > 1) {
+                } else if (!matchId && activeVerified.length > 1) {
                     console.error(`[CompanyLoginScope] AMBIGUITY_ERROR: Multiple active/verified accounts for "${contacto}".`);
                     return res.status(401).json({
-                        error: 'Ambiguous account detection',
+                        error: 'Account resolution failed',
                         code: 'LOGIN_DUPLICATE_ERROR',
-                        message: 'Múltiples cuentas activas encontradas. Use un enlace directo o contacte a soporte.'
+                        message: 'Múltiples cuentas encontradas. Inicie sesión desde el enlace del match.'
                     });
                 }
             }
@@ -549,7 +549,7 @@ app.post('/login', async (req, res) => {
                 return res.status(401).json({
                     error: 'Account resolution failed',
                     code: 'LOGIN_DUPLICATE_ERROR',
-                    message: 'No se pudo determinar la cuenta correcta entre duplicados.'
+                    message: 'No se pudo determinar la cuenta correcta.'
                 });
             }
 
@@ -1729,15 +1729,18 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
     const isEmpresa = req.user.type === 'empresa';
 
     try {
+        if (isDriver) {
+            console.log(`[TicketScope] actor=driver visible=false`);
+            return res.json([]); // Drivers don't see matching fee tickets
+        }
+
         let sql = `
             SELECT t.*, e.nombre as company_name, d.nombre as driver_name 
             FROM tickets t
             LEFT JOIN empresas e ON t.company_id = e.id
             LEFT JOIN drivers d ON t.driver_id = d.id
         `;
-        if (isDriver) {
-            sql += ` WHERE t.driver_id = ?`;
-        } else if (isEmpresa) {
+        if (isEmpresa) {
             sql += ` WHERE t.company_id = ?`;
         } else {
             return res.status(403).json({ error: 'Forbidden' });
@@ -1745,6 +1748,7 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
         sql += ` ORDER BY t.created_at DESC LIMIT 100`;
 
         const rows = await db.all(sql, req.user.id);
+        console.log(`[TicketScope] actor=company count=${rows.length} visible=true`);
         res.json(rows || []);
     } catch (e) {
         console.error('Error fetching tickets:', e.message);
