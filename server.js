@@ -1693,8 +1693,15 @@ app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Dep
 const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
+const STARTUP_TIME = new Date().toISOString();
+console.log(`[ConsentFlow] Production startup at: ${STARTUP_TIME}`);
+
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.6-prematch-consent-fix', status: 'deploy-verified' });
+    res.json({ version: '1.3.7-consent-fix-verified', status: 'deploy-verified', startup_at: STARTUP_TIME });
+});
+
+app.get('/api/diagnostics/uptime', (req, res) => {
+    res.json({ startup_at: STARTUP_TIME, now: new Date().toISOString() });
 });
 
 app.get('/api/diagnostics/match-verify', async (req, res) => {
