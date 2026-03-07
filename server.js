@@ -1704,6 +1704,32 @@ app.get('/api/diagnostics/uptime', (req, res) => {
     res.json({ startup_at: STARTUP_TIME, now: new Date().toISOString() });
 });
 
+app.get('/api/diagnostics/debug-duplicates', async (req, res) => {
+    try {
+        const sqlCompanies = `
+            SELECT id, nombre, contacto, created_at, account_state, verified 
+            FROM empresas 
+            WHERE contacto = 'luxuryservicesfl@gmail.com' 
+            ORDER BY id
+        `;
+        const sqlMatch = `
+            SELECT id, company_id, driver_id, status 
+            FROM potential_matches 
+            WHERE id = 136252
+        `;
+
+        const companies = await db.all(sqlCompanies);
+        const match = await db.get(sqlMatch);
+
+        res.json({
+            match_136252: match,
+            duplicate_companies: companies
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ─── DRIVER LEADS ───────────────────────────────────────────────────────────
 
 // Helper: claim a lead when a driver registers/logs in with matching email or phone
