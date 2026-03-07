@@ -426,6 +426,28 @@ app.post('/sys/debug/reset-jobs', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Temporary Diagnostic for Match Scope Fix
+app.get('/sys/debug/lux-check', async (req, res) => {
+    try {
+        const email = 'luxuryservicesfl@gmail.com';
+        const rows = await db.all(`SELECT id, nombre, contacto, created_at, account_state, verified FROM empresas WHERE LOWER(TRIM(contacto)) = LOWER(TRIM(?)) ORDER BY id ASC`, email);
+        const matchId = 136252;
+        const match = await db.get(`SELECT id, company_id, driver_id, status FROM potential_matches WHERE id = ?`, matchId);
+        res.json({
+            timestamp: nowIso(),
+            duplicate_companies: rows,
+            match_136252: match,
+            analysis: {
+                found_count: rows.length,
+                match_company_id: match ? match.company_id : null,
+                is_match_id_in_duplicates: match ? rows.some(r => r.id === match.company_id) : false
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 6. AUTHENTICATION ---
 
 // STRICT TOKEN SECRET
