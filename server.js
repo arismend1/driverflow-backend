@@ -726,7 +726,7 @@ app.post('/register', async (req, res) => {
             return res.status(409).json({ error: 'User already exists' });
         }
         console.error('Register Error', e);
-        res.status(500).json({ error: 'Server Error' });
+        res.status(500).json({ error: `Server Error: ${e.message}`, stack: e.stack });
     }
 });
 
