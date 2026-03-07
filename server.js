@@ -1697,7 +1697,7 @@ const STARTUP_TIME = new Date().toISOString();
 console.log(`[ConsentFlow] Production startup at: ${STARTUP_TIME}`);
 
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.7-consent-fix-verified', status: 'deploy-verified', startup_at: STARTUP_TIME });
+    res.json({ version: '1.3.8-consent-simulation', status: 'deploy-verified', startup_at: STARTUP_TIME });
 });
 
 app.get('/api/diagnostics/uptime', (req, res) => {
@@ -1728,6 +1728,40 @@ app.get('/api/diagnostics/match-verify', async (req, res) => {
         const rows = await db.all(sql);
         res.json(rows);
     } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/diagnostics/simulate-consent/:id', async (req, res) => {
+    const matchId = req.params.id;
+    const now = new Date().toISOString();
+    console.log(`[ConsentFlow] SIMULATION: Starting end-to-end for match ${matchId}`);
+    try {
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        // 1. Simulate Driver Consent
+        console.log(`[ConsentFlow] SIMULATION: Setting driver_share_consent_at`);
+        await db.run('UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?', now, now, matchId);
+
+        // 2. Simulate Company Consent
+        console.log(`[ConsentFlow] SIMULATION: Setting company_share_consent_at`);
+        await db.run('UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?', now, now, matchId);
+
+        // 3. Trigger Logic
+        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        let ticketId = updated.ticket_id;
+        if (updated.driver_share_consent_at && updated.company_share_consent_at) {
+            console.log(`[ConsentFlow] SIMULATION: Both consented. Generating ticket...`);
+            ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
+            await finalizeShare(matchId);
+            console.log(`[ConsentFlow] SIMULATION: Flow completed. status=INFO_SHARED ticket_id=${ticketId}`);
+        }
+
+        const result = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        res.json({ success: true, match: result, ticket_id: ticketId });
+    } catch (e) {
+        console.error('[ConsentFlow] SIMULATION ERROR:', e);
         res.status(500).json({ error: e.message });
     }
 });
