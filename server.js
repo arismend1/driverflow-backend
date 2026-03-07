@@ -505,7 +505,8 @@ app.post('/login', async (req, res) => {
 
     try {
         // Duplicate Resolution Policy (Surgical Fix)
-        const rows = await db.all(`SELECT * FROM ${table} WHERE LOWER(TRIM(contacto)) = LOWER(TRIM(?)) ORDER BY id ASC`, contacto);
+        const queryField = db.IS_POSTGRES ? 'email' : 'contacto';
+        const rows = await db.all(`SELECT * FROM ${table} WHERE LOWER(TRIM(${queryField})) = LOWER(TRIM(?)) ORDER BY id ASC`, contacto);
         let row = null;
 
         if (rows.length > 1 && type === 'empresa') {
@@ -582,14 +583,10 @@ app.post('/login', async (req, res) => {
             return res.status(403).json({ error: 'Cuenta bloqueada temporalmente' });
         }
 
-        // Verify Check (Loose check: 1, true, "1")
-        if (row.verified != 1 && row.verified != true && row.verified != 'true') {
-            // In phase 9 we might enforce this, but for now we might just warn or block.
-            // User said "Hacer el check de verificación compatible". 
-            // Logic: If we want to block unverified, we do it here. 
-            // Existing code didn't strictly block login, but let's assume we proceed.
-            // Wait, usually login is allowed but actions are restricted? 
-            // Let's stick to standard auth. If user needed blocking, they'd say.
+        // Mandatory Verification Check
+        if (row.verified == 0 || row.verified === false || row.verified === 'false' || row.verified === null) {
+            console.warn(`[Login] Fail: ${contacto} - UNVERIFIED`);
+            return res.status(403).json({ error: 'Debes confirmar tu correo antes de iniciar sesión' });
         }
 
         const match = await bcrypt.compare(password, row.password_hash);
@@ -604,7 +601,8 @@ app.post('/login', async (req, res) => {
 
             // Auto-claim lead on driver login
             if (type === 'driver') {
-                try { await claimLeadForDriver(row.id, row.contacto, null); } catch (ce) { console.error('[LeadClaim] login error:', ce.message); }
+                const driverEmail = db.IS_POSTGRES ? row.email : row.contacto;
+                try { await claimLeadForDriver(row.id, driverEmail, null); } catch (ce) { console.error('[LeadClaim] login error:', ce.message); }
             }
 
             res.json({ ok: true, token, type, id: row.id, name: row.nombre, search_status: row.search_status || 'ON' });
@@ -636,12 +634,43 @@ app.post('/register', async (req, res) => {
     if (!checkRateLimit(req.ip, 'register')) return res.status(429).json({ error: 'RATE_LIMITED' });
     const { type, nombre, password, ...extras } = req.body;
     const contacto = (req.body.contacto || '').toString().trim().toLowerCase();
+    const phone = (req.body.phone || req.body.telefono || extras.contact_phone || '').toString().trim();
 
     if (!['driver', 'empresa'].includes(type)) return res.status(400).json({ error: 'Bad type' });
-    if (!nombre || !contacto || !password) return res.status(400).json({ error: 'Missing fields' });
+    // Stronger validation: ensure phone is also provided
+    if (!nombre || !contacto || !password || !phone) {
+        return res.status(400).json({ error: 'Missing fields (nombre, contacto, password, and phone are required)' });
+    }
     if (!isStrongPassword(password)) return res.status(400).json({ error: 'Weak Password' });
 
     try {
+        // 1. Strict Uniqueness Check (Email OR Phone) across BOTH tables
+        // Note: Using a query that works for both engines by checking the adapter
+        let checkSql;
+        let checkParams;
+        if (db.IS_POSTGRES) {
+            checkSql = `
+                SELECT id, 'driver' as type FROM drivers WHERE email = ? OR phone = ?
+                UNION ALL
+                SELECT id, 'empresa' as type FROM empresas WHERE email = ? OR telefono = ?
+            `;
+            checkParams = [contacto, phone, contacto, phone];
+        } else {
+            checkSql = `
+                SELECT id, 'driver' as type FROM drivers WHERE contacto = ? OR phone = ?
+                UNION ALL
+                SELECT id, 'empresa' as type FROM empresas WHERE contacto = ? OR contact_phone = ?
+            `;
+            checkParams = [contacto, phone, contacto, phone];
+        }
+
+        const existing = await db.get(checkSql, ...checkParams);
+
+        if (existing) {
+            console.log(`[Register] Conflict found: ${contacto} / ${phone}. Existing ID: ${existing.id} (${existing.type})`);
+            return res.status(409).json({ error: 'EMAIL_OR_PHONE_ALREADY_REGISTERED' });
+        }
+
         const hash = await bcrypt.hash(password, 10);
         const token = crypto.randomBytes(32).toString('hex');
         const now = nowIso();
@@ -649,12 +678,21 @@ app.post('/register', async (req, res) => {
 
         let newId;
         if (type === 'driver') {
-            const result = await db.run(`INSERT INTO drivers (nombre, contacto, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,'active',?,false,?,?)`,
-                nombre, contacto, hash, extras.tipo_licencia || 'B', now, token, expires);
-            newId = result.lastInsertRowid;
+            // Drivers: Create UNVERIFIED (false/0)
+            if (db.IS_POSTGRES) {
+                // Postgres: email, phone, verify_token_hash, etc.
+                const result = await db.run(`INSERT INTO drivers (nombre, email, phone, password_hash, tipo_licencia, status, created_at, verified, verify_token_hash, verify_token_expires_at) VALUES (?,?,?,?,?,'active',?,false,?,?) RETURNING id`,
+                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires);
+                newId = result.rows ? result.rows[0].id : (result.id || result.lastInsertRowid);
+            } else {
+                // SQLite: contacto, phone, verification_token, etc.
+                const result = await db.run(`INSERT INTO drivers (nombre, contacto, phone, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,?,'active',?,0,?,?)`,
+                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires);
+                newId = result.lastInsertRowid;
+            }
 
             // Auto-claim lead if driver email matches
-            try { await claimLeadForDriver(newId, contacto, null); } catch (ce) { console.error('[LeadClaim] register error:', ce.message); }
+            try { await claimLeadForDriver(newId, contacto, phone); } catch (ce) { console.error('[LeadClaim] register error:', ce.message); }
 
             await trackLeadFunnelEvent('driver_registered', {
                 driver_id: newId,
@@ -664,17 +702,26 @@ app.post('/register', async (req, res) => {
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
                 req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         } else {
-            const result = await db.run(`INSERT INTO empresas (nombre, contacto, password_hash, legal_name, address_line1, city, ciudad, verified, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,false,?,?,?)`,
-                nombre, contacto, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
-            newId = result.lastInsertRowid;
+            // Empresas: Create UNVERIFIED (false/0)
+            if (db.IS_POSTGRES) {
+                // Postgres: email, contacto, telefono, verify_token_hash, etc.
+                const result = await db.run(`INSERT INTO empresas (nombre, email, contacto, telefono, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verify_token_hash, verify_token_expires_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,false,'ACTIVE',?,?,?) RETURNING id`,
+                    nombre, contacto, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
+                newId = result.rows ? result.rows[0].id : (result.id || result.lastInsertRowid);
+            } else {
+                // SQLite: contacto, contact_phone, verification_token, etc.
+                const result = await db.run(`INSERT INTO empresas (nombre, contacto, contact_phone, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,?,0,'ACTIVE',?,?,?)`,
+                    nombre, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
+                newId = result.lastInsertRowid;
+            }
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?,?,?,?,?)`,
                 req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
 
-        res.json({ ok: true, message: 'Registered. Please check your email to verify.' });
+        res.json({ ok: true, message: 'Registered successfully.' });
     } catch (e) {
-        // Unique constraint check
+        // Unique constraint check (Fallback if SQL above missed it somehow)
         if (e.message && (e.message.includes('unique') || e.message.includes('duplicate'))) {
             return res.status(409).json({ error: 'User already exists' });
         }
@@ -689,13 +736,15 @@ app.post('/resend-verification', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email required' });
 
     try {
-        let u = await db.get("SELECT id, nombre, status, verified, 'driver' as type FROM drivers WHERE contacto=?", email);
-        if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type, verified FROM empresas WHERE contacto=?", email);
+        const queryField = db.IS_POSTGRES ? 'email' : 'contacto';
+        let u = await db.get(`SELECT id, nombre, status, verified, 'driver' as type FROM drivers WHERE ${queryField}=?`, email);
+        if (!u) u = await db.get(`SELECT id, nombre, 'empresa' as type, verified FROM empresas WHERE ${queryField}=?`, email);
 
         if (!u) return res.status(404).json({ error: 'User not found' });
 
         // Loose check for verification
-        if (u.verified == 1 || u.verified == true || u.verified == 'true') {
+        const isVerified = u.verified == 1 || u.verified == true || u.verified == 'true';
+        if (isVerified) {
             return res.status(400).json({ error: 'Account already verified' });
         }
 
@@ -703,7 +752,11 @@ app.post('/resend-verification', async (req, res) => {
         const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString();
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
 
-        await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+        if (db.IS_POSTGRES) {
+            await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=? WHERE id=?`, token, expires, u.id);
+        } else {
+            await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+        }
 
         await db.run(`INSERT INTO events_outbox (event_name, created_at, driver_id, company_id, metadata) VALUES (?, ?, ?, ?, ?)`,
             'verification_email', nowIso(), u.type === 'driver' ? u.id : null, u.type === 'empresa' ? u.id : null, JSON.stringify({ token, email, name: u.nombre, user_type: u.type }));
@@ -715,24 +768,41 @@ app.post('/resend-verification', async (req, res) => {
     }
 });
 
-// VERIFY EMAIL (Browser Friendly)
+// VERIFY EMAIL
 app.all('/verify-email', async (req, res) => {
     const token = req.query.token || req.body.token;
     if (!token) return res.status(400).send('<h1>Error</h1><p>Token missing</p>');
 
     try {
-        let u = await db.get("SELECT id, 'driver' as type FROM drivers WHERE verification_token=?", token);
-        if (!u) u = await db.get("SELECT id, 'empresa' as type FROM empresas WHERE verification_token=?", token);
+        // Search in both tables with expiration check
+        const idCol = 'id';
+        const typeCol = "'driver' as type";
+        const expCol = db.IS_POSTGRES ? 'verify_token_expires_at' : 'verification_expires';
+        const tokenCol = db.IS_POSTGRES ? 'verify_token_hash' : 'verification_token';
 
-        if (!u) return res.status(404).send('<h1>Error</h1><p>Invalid or expired token.</p>');
+        let u = await db.get(`SELECT ${idCol}, ${typeCol}, ${expCol} as expires FROM drivers WHERE ${tokenCol}=?`, token);
+        if (!u) {
+            u = await db.get(`SELECT ${idCol}, 'empresa' as type, ${expCol} as expires FROM empresas WHERE ${tokenCol}=?`, token);
+        }
+
+        if (!u) {
+            console.warn(`[Verify] Token NOT_FOUND: ${token}`);
+            return res.status(404).send('<h1>Error</h1><p>Token invalido.</p>');
+        }
+
+        if (u.expires && new Date(u.expires) < new Date(nowEpochMs())) {
+            console.warn(`[Verify] Token EXPIRED: ${token} at ${u.expires}`);
+            return res.status(400).send('<h1>Error</h1><p>El token de verificacion ha expirado.</p>');
+        }
 
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
-        // Set verified=true (Postgres) or 1 (SQLite) - db adapter handles boolean mapping often, but using 'true' literal works in robust systems or 1.
-        // Let's use 1 which is safe for both usually, or TRUE if PG.
-        const val = db.IS_POSTGRES ? 'TRUE' : '1';
+        if (db.IS_POSTGRES) {
+            await db.run(`UPDATE ${table} SET verified=true, verify_token_hash=NULL, verify_token_expires_at=NULL WHERE id=?`, u.id);
+        } else {
+            await db.run(`UPDATE ${table} SET verified=1, verification_token=NULL, verification_expires=NULL WHERE id=?`, u.id);
+        }
 
-        await db.run(`UPDATE ${table} SET verified=${val}, verification_token=NULL WHERE id=?`, u.id);
-        res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion en la App.</p>');
+        res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.</p>');
     } catch (e) {
         console.error('Verify Error', e);
         res.status(500).send('<h1>Error</h1><p>Server Error</p>');
@@ -745,8 +815,9 @@ app.post('/forgot_password', async (req, res) => {
     const email = req.body.email || req.body.contacto;
 
     try {
-        let u = await db.get("SELECT id, nombre, 'driver' as type FROM drivers WHERE contacto=?", email);
-        if (!u) u = await db.get("SELECT id, nombre, 'empresa' as type FROM empresas WHERE contacto=?", email);
+        const queryField = db.IS_POSTGRES ? 'email' : 'contacto';
+        let u = await db.get(`SELECT id, nombre, 'driver' as type FROM drivers WHERE ${queryField}=?`, email);
+        if (!u) u = await db.get(`SELECT id, nombre, 'empresa' as type FROM empresas WHERE ${queryField}=?`, email);
 
         if (u) {
             const token = crypto.randomBytes(32).toString('hex');
@@ -774,8 +845,9 @@ app.post('/reset_password', async (req, res) => {
     if (!isStrongPassword(newPassword)) return res.status(400).json({ error: 'Weak Password' });
 
     try {
-        let u = await db.get("SELECT id, 'driver' as type FROM drivers WHERE reset_token=? AND reset_expires > ?", token, nowIso());
-        if (!u) u = await db.get("SELECT id, 'empresa' as type FROM empresas WHERE reset_token=? AND reset_expires > ?", token, nowIso());
+        const now = nowIso();
+        let u = await db.get("SELECT id, 'driver' as type FROM drivers WHERE reset_token=? AND reset_expires > ?", token, now);
+        if (!u) u = await db.get("SELECT id, 'empresa' as type FROM empresas WHERE reset_token=? AND reset_expires > ?", token, now);
 
         if (!u) return res.status(400).json({ error: 'Invalid or Expired Link' });
 

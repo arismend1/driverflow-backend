@@ -15,6 +15,7 @@ const initDb = () => {
             nombre TEXT NOT NULL,
             contacto TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
+            phone TEXT,
             tipo_licencia TEXT NOT NULL CHECK(tipo_licencia IN ('A', 'B', 'C')),
             estado TEXT NOT NULL DEFAULT 'DISPONIBLE' CHECK(estado IN ('DISPONIBLE', 'OCUPADO')),
             fecha_registro DATETIME DEFAULT (datetime('now'))
@@ -28,6 +29,7 @@ const initDb = () => {
             nombre TEXT NOT NULL,
             contacto TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
+            contact_phone TEXT,
             ciudad TEXT NOT NULL,
             estado TEXT NOT NULL DEFAULT 'ACTIVO',
             fecha_registro DATETIME DEFAULT (datetime('now'))
