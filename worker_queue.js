@@ -586,7 +586,7 @@ async function startQueueWorker() {
             logger.info(`[Scheduler] Targeting Week: ${week_start} to ${week_end}`);
 
             // Fetch all active companies
-            const companies = await db.all("SELECT id FROM companies WHERE status = 'active'");
+            const companies = await db.all("SELECT id FROM empresas WHERE account_state = 'ACTIVE'");
 
             for (const c of companies) {
                 await enqueueJob('generate_weekly_invoices', {
