@@ -526,20 +526,23 @@ app.post('/login', async (req, res) => {
             }
 
             if (!row) {
-                // Policy: Try to resolve by ACTIVE + verified only if unique
+                // Policy: Try to resolve by ACTIVE + verified
                 const activeVerified = rows.filter(r =>
                     (r.account_state === 'ACTIVE' || r.estado === 'ACTIVO' || r.status === 'active') &&
                     (r.verified == 1 || r.verified == true || r.verified == 'true')
                 );
 
+                console.log(`[CompanyLoginScope] filtered_active_verified=${activeVerified.length}`);
+
                 if (activeVerified.length === 1) {
                     row = activeVerified[0];
-                } else if (!matchId && activeVerified.length > 1) {
+                } else if (activeVerified.length > 1) {
                     console.error(`[CompanyLoginScope] AMBIGUITY_ERROR: Multiple active/verified accounts for "${contacto}".`);
                     return res.status(401).json({
                         error: 'Account resolution failed',
-                        code: 'LOGIN_DUPLICATE_ERROR',
-                        message: 'Múltiples cuentas encontradas. Inicie sesión desde el enlace del match.'
+                        code: 'AMBIGUOUS_ACCOUNT',
+                        message: 'Múltiples cuentas activas encontradas. Seleccione la correcta.',
+                        candidates: activeVerified.map(r => ({ id: r.id, nombre: r.nombre }))
                     });
                 }
             }
@@ -555,11 +558,16 @@ app.post('/login', async (req, res) => {
 
             console.log(`[CompanyLoginScope] chosen_company_id=${row.id}`);
             console.log(`[CompanyLoginScope] scope_mismatch=${(matchCompanyId && row.id !== matchCompanyId) ? 'true' : 'false'}`);
+        } else if (rows.length > 1 && type === 'driver') {
+            console.error(`[Login] AMBIGUITY_ERROR: Multiple accounts for driver "${contacto}".`);
+            return res.status(401).json({
+                error: 'Account resolution failed',
+                code: 'AMBIGUOUS_ACCOUNT',
+                message: 'Múltiples cuentas encontradas para conductor.',
+                candidates: rows.map(r => ({ id: r.id, nombre: r.nombre }))
+            });
         } else {
             row = rows.length > 0 ? rows[0] : null;
-            if (rows.length > 1 && type === 'driver') {
-                console.warn(`[Login] WARNING: ${rows.length} duplicate accounts for driver contacto="${contacto}". Using id=${row.id} (oldest).`);
-            }
         }
 
         if (!row) {
