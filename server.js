@@ -482,13 +482,63 @@ app.post('/login', async (req, res) => {
     const table = type === 'driver' ? 'drivers' : 'empresas';
 
     try {
-        // ORDER BY id ASC: when duplicate emails exist, always use the oldest (canonical) account.
-        // Without ORDER BY, Postgres returns non-deterministic rows which causes company_id mismatch.
-        const rows = await db.all(`SELECT * FROM ${table} WHERE LOWER(contacto) = LOWER(?) ORDER BY id ASC`, contacto);
-        if (rows.length > 1) {
-            console.warn(`[Login] WARNING: ${rows.length} duplicate accounts for contacto="${contacto}" in ${table}. Using id=${rows[0].id} (oldest).`);
+        // Duplicate Resolution Policy (Surgical Fix)
+        const rows = await db.all(`SELECT * FROM ${table} WHERE LOWER(TRIM(contacto)) = LOWER(TRIM(?)) ORDER BY id ASC`, contacto);
+        let row = null;
+
+        if (rows.length > 1 && type === 'empresa') {
+            const matchId = req.body.match_id || req.body.matchId;
+            let matchCompanyId = null;
+
+            console.log(`[CompanyLoginScope] contacto_normalizado=${contacto.toLowerCase().trim()}`);
+            console.log(`[CompanyLoginScope] duplicate_companies_found=${rows.length} [${rows.map(r => r.id).join(', ')}]`);
+
+            if (matchId) {
+                const matchData = await db.get(`SELECT company_id FROM potential_matches WHERE id = ?`, matchId);
+                matchCompanyId = matchData ? matchData.company_id : null;
+                console.log(`[CompanyLoginScope] match_company_id=${matchCompanyId || 'NOT_FOUND_FOR_ID_' + matchId}`);
+
+                if (matchCompanyId) {
+                    row = rows.find(r => r.id === matchCompanyId);
+                }
+            }
+
+            if (!row) {
+                // Policy: Try to resolve by ACTIVE + verified
+                const activeVerified = rows.filter(r =>
+                    (r.account_state === 'ACTIVE' || r.estado === 'ACTIVO' || r.status === 'active') &&
+                    (r.verified == 1 || r.verified == true || r.verified == 'true')
+                );
+
+                if (activeVerified.length === 1) {
+                    row = activeVerified[0];
+                } else if (activeVerified.length > 1) {
+                    console.error(`[CompanyLoginScope] AMBIGUITY_ERROR: Multiple active/verified accounts for "${contacto}".`);
+                    return res.status(401).json({
+                        error: 'Ambiguous account detection',
+                        code: 'LOGIN_DUPLICATE_ERROR',
+                        message: 'Múltiples cuentas activas encontradas. Use un enlace directo o contacte a soporte.'
+                    });
+                }
+            }
+
+            if (!row) {
+                console.error(`[CompanyLoginScope] RESOLUTION_FAILED: No unique active/verified account found for "${contacto}" among ${rows.length} duplicates.`);
+                return res.status(401).json({
+                    error: 'Account resolution failed',
+                    code: 'LOGIN_DUPLICATE_ERROR',
+                    message: 'No se pudo determinar la cuenta correcta entre duplicados.'
+                });
+            }
+
+            console.log(`[CompanyLoginScope] chosen_company_id=${row.id}`);
+            console.log(`[CompanyLoginScope] scope_mismatch=${(matchCompanyId && row.id !== matchCompanyId) ? 'true' : 'false'}`);
+        } else {
+            row = rows.length > 0 ? rows[0] : null;
+            if (rows.length > 1 && type === 'driver') {
+                console.warn(`[Login] WARNING: ${rows.length} duplicate accounts for driver contacto="${contacto}". Using id=${row.id} (oldest).`);
+            }
         }
-        const row = rows.length > 0 ? rows[0] : null;
 
         if (!row) {
             console.warn(`[Login] Fail: ${contacto} - NOT_FOUND`);
