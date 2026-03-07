@@ -2045,6 +2045,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
     const userType = req.user.type; // 'driver' or 'empresa'
 
     try {
+        console.log(`[matches/opportunities] 1. START: Retrieving for ${userType} #${userId}`);
         const freshHours = Number(process.env.MATCH_FRESH_HOURS || 24);
         const minActive = Number(process.env.MATCH_MIN_ACTIVE || 5);
         const cooldownMin = Number(process.env.MATCH_COOLDOWN_MINUTES || 10);
@@ -2055,6 +2056,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
+        console.log(`[matches/opportunities] 2. BEFORE reading driver/company active matches`);
         // 1) Count fresh active matches
         const recentRow = await db.get(
             `SELECT COUNT(*) AS c FROM potential_matches
@@ -2062,7 +2064,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             userId, cutoff
         );
         const recentCount = recentRow ? parseInt(recentRow.c) : 0;
-        console.log(`[matches/opportunities] user=${userType} id=${userId} recentActive=${recentCount} min=${minActive}`);
+        console.log(`[matches/opportunities] 3. Count checked: recentActive=${recentCount} min=${minActive}`);
 
         // 2) Generate if needed (freshness + cooldown + lock)
         if (recentCount < minActive) {
@@ -2070,21 +2072,23 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             const inCooldown = lastGen && (Date.now() - new Date(lastGen).getTime()) < cooldownMin * 60 * 1000;
 
             if (inCooldown) {
-                console.log(`[matches/opportunities] user=${userType} id=${userId} inCooldown=true, skipping generation`);
+                console.log(`[matches/opportunities] 4. Skipping generation due to cooldown`);
             } else {
                 const lockKey = (userType === 'driver' ? 100000 : 200000) + userId;
                 const locked = await tryUserAdvisoryLock(lockKey);
 
                 if (!locked) {
-                    console.log(`[matches/opportunities] user=${userType} id=${userId} lock=blocked`);
+                    console.log(`[matches/opportunities] 4. Skipping generation due to lock`);
                 } else {
                     try {
                         const { generateMatchesForDriver, generateMatchesForCompany } = require('./lazy_matching');
+                        console.log(`[matches/opportunities] 4a. BEFORE generateMatchesFor${userType === 'driver' ? 'Driver' : 'Company'}`);
                         if (userType === 'driver') {
                             await generateMatchesForDriver(userId);
                         } else {
                             await generateMatchesForCompany(userId);
                         }
+                        console.log(`[matches/opportunities] 4b. AFTER generateMatchesFor${userType === 'driver' ? 'Driver' : 'Company'}`);
                         await writeGenerationLog(userType, userId);
                     } finally {
                         await unlockUserAdvisoryLock(lockKey);
@@ -2093,11 +2097,13 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             }
         }
 
+        console.log(`[matches/opportunities] 5. BEFORE final SQL query`);
         // 3) Return matches (existing query)
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
                 pm.match_score,
+                pm.score_breakdown,
                 pm.status,
                 pm.created_at,
                 pm.driver_step1_accepted_at,
@@ -2122,17 +2128,47 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             ORDER BY pm.match_score DESC, pm.created_at DESC
         `, userId);
 
+        console.log(`[matches/opportunities] 6. AFTER final SQL query. Rows length: ${rows.length}`);
+
+        if (rows.length > 0) {
+            console.log(`[matches/opportunities] 7. First row sample fully raw BEFORE map:`, JSON.stringify(rows[0]));
+        }
+
         const sanitized = rows.map(r => {
-            if (r.status !== 'INFO_SHARED') {
-                return { ...r, company_email: null };
+            let opTypes = r.op_types;
+            if (typeof opTypes === 'string') {
+                try { opTypes = JSON.parse(opTypes); } catch (e) { }
             }
-            return r;
+
+            let payMethods = r.pay_methods;
+            if (typeof payMethods === 'string') {
+                try { payMethods = JSON.parse(payMethods); } catch (e) { }
+            }
+
+            let breakdown = r.score_breakdown;
+            if (typeof breakdown === 'string') {
+                try { breakdown = JSON.parse(breakdown); } catch (e) { }
+            }
+
+            const cleanRow = { ...r, op_types: opTypes, pay_methods: payMethods, score_breakdown: breakdown };
+
+            if (cleanRow.status !== 'INFO_SHARED') {
+                cleanRow.company_email = null;
+            }
+            return cleanRow;
         });
 
+        console.log(`[matches/opportunities] 8. BEFORE res.json`);
         res.json(sanitized);
     } catch (e) {
-        console.error('[matches/opportunities] fatal:', e);
-        res.status(500).json({ error: 'Server error' });
+        console.error('[matches/opportunities] FATAL ERROR CATCHED:', {
+            message: e.message,
+            stack: e.stack,
+            code: e.code,
+            detail: e.detail,
+            position: e.position
+        });
+        res.status(500).json({ error: 'Server error', details: e.message });
     }
 });
 
