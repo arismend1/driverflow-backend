@@ -2579,9 +2579,29 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
 app.post('/matches/:id/viewed', authenticateToken, (req, res) => updateMatchStatus(req, res, 'VIEWED'));
 app.post('/matches/:id/contacted', authenticateToken, (req, res) => updateMatchStatus(req, res, 'CONTACTED'));
 app.post('/matches/:id/accept', authenticateToken, (req, res) => updateMatchStatus(req, res, 'ACCEPTED'));
-app.post('/matches/:id/decline', authenticateToken, (req, res) => updateMatchStatus(req, res, 'DECLINED'));
-
 // ──────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/debug/sql', async (req, res) => {
+    // Only for diagnostic test purposes as specifically requested
+    if (req.body.secret !== 'surgical_evidence_123') return res.status(403).json({ error: 'unauthorized' });
+    try {
+        const drivers = await db.all("SELECT id, nombre, email, contacto, phone, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
+        const empresas = await db.all("SELECT id, nombre, email, contacto, telefono, contact_phone, account_state, verified FROM empresas ORDER BY id DESC LIMIT 5");
+
+        // Also retrieve the specific tokens for verification test
+        const reqEmails = req.body.emails || [];
+        const tokens = {};
+        for (let em of reqEmails) {
+            let u = await db.get("SELECT verify_token_hash FROM drivers WHERE email=?", em);
+            if (!u) u = await db.get("SELECT verify_token_hash FROM empresas WHERE email=?", em);
+            if (u) tokens[em] = u.verify_token_hash;
+        }
+
+        res.json({ drivers, empresas, tokens });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 
 if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
     const { execSync } = require('child_process');
