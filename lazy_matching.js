@@ -14,6 +14,7 @@
  */
 
 const db = require('./db_adapter');
+const { trackLeadFunnelEvent } = require('./analytics');
 
 const MATCH_MAX_GENERATE = parseInt(process.env.MATCH_MAX_GENERATE) || 20;
 const MATCH_MIN_ACTIVE = parseInt(process.env.MATCH_MIN_ACTIVE) || 5;
@@ -124,11 +125,13 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             );
 
             try {
-                const { trackLeadFunnelEvent } = require('./analytics');
-                await trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: driverId, metadata: { match_source: "lazy_matching" } });
-                console.log('[Funnel] match_generated inserted');
+                // Fire and forget, do not await to prevent blocking
+                trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: driverId, metadata: { match_source: "lazy_matching" } })
+                    .then(() => console.log('[Funnel] match_generated success'))
+                    .catch(err => console.log('[Funnel] match_generated error: ' + err.message));
+                console.log('[Funnel] match_generated start');
             } catch (err) {
-                console.log('[Funnel] match_generated error: ' + err.message);
+                console.log('[Funnel] match_generated synchronous error: ' + err.message);
             }
             return 'inserted';
         }
