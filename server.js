@@ -1697,6 +1697,34 @@ app.get('/api/diagnostics/version', (req, res) => {
     res.json({ version: '1.3.6-prematch-consent-fix', status: 'deploy-verified' });
 });
 
+app.get('/api/diagnostics/match-verify', async (req, res) => {
+    try {
+        const sql = `
+            SELECT
+              pm.id AS match_id,
+              pm.status,
+              pm.driver_id,
+              pm.company_id,
+              pm.driver_step1_accepted_at,
+              pm.company_step1_accepted_at,
+              pm.driver_share_consent_at,
+              pm.company_share_consent_at,
+              pm.info_shared_at,
+              pm.ticket_id
+            FROM potential_matches pm
+            LEFT JOIN drivers d ON d.id = pm.driver_id
+            LEFT JOIN empresas e ON e.id = pm.company_id
+            WHERE d.nombre LIKE '%Ramon%'
+              AND (e.nombre ILIKE '%Luxury%' OR e.contacto ILIKE '%luxury%')
+            ORDER BY pm.id DESC
+        `;
+        const rows = await db.all(sql);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ─── DRIVER LEADS ───────────────────────────────────────────────────────────
 
 // Helper: claim a lead when a driver registers/logs in with matching email or phone
