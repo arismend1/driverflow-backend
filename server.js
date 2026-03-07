@@ -1694,7 +1694,7 @@ const { startQueueWorker } = require('./worker_queue');
 startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
 app.get('/api/diagnostics/version', (req, res) => {
-    res.json({ version: '1.3.5-profile-crash-fix', status: 'deploy-verified' });
+    res.json({ version: '1.3.6-prematch-consent-fix', status: 'deploy-verified' });
 });
 
 // ─── DRIVER LEADS ───────────────────────────────────────────────────────────
@@ -2288,6 +2288,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
             'UPDATE potential_matches SET ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
             ticketId, amount, 'USD', now, matchId
         );
+        console.log(`[ConsentFlow] ticket generated ticket_id=${ticketId}`);
     }
     return ticketId;
 }
@@ -2301,6 +2302,8 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND driver_id = ?', matchId, req.user.id);
         if (!match) return res.status(404).json({ error: 'Match not found' });
 
+        console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=driver action=confirm_share`);
+
         const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
         if (!validDriverStates.includes(match.status)) {
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
@@ -2310,6 +2313,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
             now, now, matchId
         );
+        console.log(`[ConsentFlow] driver_share_consent_at set`);
 
         const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         let finalStatus = updated.status;
@@ -2319,12 +2323,12 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
             await finalizeShare(matchId);
             finalStatus = 'INFO_SHARED';
-            console.log(`[Matches] Match ${matchId} TICKETING! Actor: Driver -> Both Consented. Status: ${match.status} -> ${finalStatus}. Ticket= ${ticketId}`);
+            console.log(`[ConsentFlow] status changed to INFO_SHARED`);
             return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_COMPANY';
             await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
-            console.log(`[Matches] Match ${matchId} Driver Consented. Awaiting Company. Status: ${match.status} -> ${finalStatus}`);
+            console.log(`[ConsentFlow] status changed to SHARE_PENDING_COMPANY`);
         }
 
         res.json({ success: true, status: finalStatus });
@@ -2347,6 +2351,8 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
         const match = matches.length > 0 ? matches[0] : null;
         if (!match) return res.status(404).json({ error: 'Match not found in company scope' });
 
+        console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=company action=confirm_share`);
+
         const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
         if (!validCompanyStates.includes(match.status)) {
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
@@ -2356,6 +2362,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
             now, now, matchId
         );
+        console.log(`[ConsentFlow] company_share_consent_at set`);
 
         const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         let finalStatus = updated.status;
@@ -2365,12 +2372,12 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
             await finalizeShare(matchId);
             finalStatus = 'INFO_SHARED';
-            console.log(`[Matches] Match ${matchId} TICKETING! Actor: Company -> Both Consented. Status: ${match.status} -> ${finalStatus}. Ticket= ${ticketId}`);
+            console.log(`[ConsentFlow] status changed to INFO_SHARED`);
             return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_DRIVER';
             await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
-            console.log(`[Matches] Match ${matchId} Company Consented. Awaiting Driver. Status: ${match.status} -> ${finalStatus}`);
+            console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
         }
 
         res.json({ success: true, status: finalStatus, ticket_id: ticketId });
