@@ -2583,8 +2583,18 @@ app.post('/matches/:id/decline', authenticateToken, (req, res) => updateMatchSta
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
+    const { execSync } = require('child_process');
+    console.log("Running migrations on startup...");
+    try {
+        execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
+        execSync('node migrate_auth_indexes.js', { stdio: 'inherit' });
+    } catch (e) {
+        console.error("Auto-migration failed:", e.message);
+    }
+}
 
+app.listen(PORT, () => {
     console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
     console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
 });
