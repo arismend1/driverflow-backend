@@ -13,17 +13,27 @@ const db = require('./db_adapter');
 
 function toArray(val) {
     if (!val) return [];
+
+    // Si ya viene de Postgres como Array JSONB
     if (Array.isArray(val)) return val.map(x => String(x).trim().toLowerCase()).filter(Boolean);
+
     if (typeof val === 'string') {
         const s = val.trim();
+        // Si parece un array o dict JSON
         if (s.startsWith('[') || s.startsWith('{')) {
             try {
+                // Forzar arreglo si venía como set '{}'
                 const parsed = JSON.parse(s.replace(/^\{/, '[').replace(/\}$/, ']'));
                 if (Array.isArray(parsed)) return parsed.map(x => String(x).trim().toLowerCase()).filter(Boolean);
-            } catch (_) { /* fallback */ }
+            } catch (_) {
+                // Parsing falló (sintaxis inválida heredada). Caer directo a la separación por comas.
+            }
         }
+
+        // Fallback robusto CSV para la mugre de la tabla vieja
         return s.replace(/[\[\]{}\"]/g, '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
     }
+
     return [String(val).trim().toLowerCase()].filter(Boolean);
 }
 
@@ -122,8 +132,17 @@ function toArray(val) {
                 `SELECT id, ${col} FROM drivers WHERE ${col} IS NOT NULL AND ${col} <> ''`
             );
             let insertCount = 0;
+            let skipCount = 0;
             for (const row of rows) {
-                const values = toArray(row[col]);
+                let raw = row[col];
+                if (typeof raw === 'object' && raw !== null) {
+                    raw = JSON.stringify(raw);
+                }
+                const values = toArray(raw);
+                if (values.length === 0) {
+                    skipCount++;
+                }
+
                 for (const v of values) {
                     try {
                         await db.run(
@@ -134,7 +153,7 @@ function toArray(val) {
                     } catch (_) { /* ON CONFLICT fallback */ }
                 }
             }
-            console.log(`✅ Backfill ${table}: ${insertCount} rows from ${rows.length} drivers`);
+            console.log(`✅ Backfill ${table}: ${insertCount} values inserted, ${skipCount} skipped rows, from ${rows.length} total drivers`);
         } catch (e) {
             console.error(`❌ Backfill ${table}: ${e.message}`);
         }
@@ -156,6 +175,7 @@ function toArray(val) {
                 `SELECT company_id, ${col} FROM company_requirements WHERE ${col} IS NOT NULL`
             );
             let insertCount = 0;
+            let skipCount = 0;
             for (const row of rows) {
                 let raw = row[col];
                 // Handle JSONB (Postgres returns parsed object/array)
@@ -163,6 +183,10 @@ function toArray(val) {
                     raw = JSON.stringify(raw);
                 }
                 const values = toArray(raw);
+                if (values.length === 0) {
+                    skipCount++;
+                }
+
                 for (const v of values) {
                     try {
                         await db.run(
@@ -173,7 +197,7 @@ function toArray(val) {
                     } catch (_) { /* ON CONFLICT fallback */ }
                 }
             }
-            console.log(`✅ Backfill ${table}: ${insertCount} rows from ${rows.length} companies`);
+            console.log(`✅ Backfill ${table}: ${insertCount} values inserted, ${skipCount} skipped rows, from ${rows.length} total companies`);
         } catch (e) {
             console.error(`❌ Backfill ${table}: ${e.message}`);
         }

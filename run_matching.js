@@ -66,10 +66,16 @@ async function runMatching() {
     // 1. Fetch eligible companies (search_status = ON)
     // Uses the new English-column schema (company_requirements) for matching prefs.
     const companies = await db.all(`
-        SELECT e.id, e.nombre, e.contacto,
-               cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
-               cr.req_operation_types, cr.req_modalities, cr.req_truck,
-               cr.offered_payment_methods, cr.req_relationships, cr.availability
+        SELECT e.id, COALESCE(e.nombre, '') AS nombre, COALESCE(e.contacto, '') AS contacto,
+               COALESCE(cr.req_license_types, '[]') AS req_license_types, 
+               COALESCE(cr.req_endorsements, '[]') AS req_endorsements, 
+               COALESCE(cr.req_experience_years, 0) AS req_experience_years,
+               COALESCE(cr.req_operation_types, '[]') AS req_operation_types, 
+               COALESCE(cr.req_modalities, '[]') AS req_modalities, 
+               COALESCE(cr.req_truck, false) AS req_truck,
+               COALESCE(cr.offered_payment_methods, '[]') AS offered_payment_methods, 
+               COALESCE(cr.req_relationships, '[]') AS req_relationships, 
+               COALESCE(cr.availability, '') AS availability
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
@@ -78,9 +84,18 @@ async function runMatching() {
 
     // 2. Fetch eligible drivers (search_status = ON)
     const drivers = await db.all(`
-        SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
-               operation_types, job_preferences, has_truck, payment_methods,
-               work_relationships, availability, search_status
+        SELECT id, COALESCE(nombre, '') AS nombre, 
+               COALESCE(has_cdl, false) AS has_cdl, 
+               COALESCE(license_types, '[]') AS license_types, 
+               COALESCE(endorsements, '[]') AS endorsements, 
+               COALESCE(experience_years, 0) AS experience_years,
+               COALESCE(operation_types, '[]') AS operation_types, 
+               COALESCE(job_preferences, '[]') AS job_preferences, 
+               COALESCE(has_truck, false) AS has_truck, 
+               COALESCE(payment_methods, '[]') AS payment_methods,
+               COALESCE(work_relationships, '[]') AS work_relationships, 
+               COALESCE(availability, '') AS availability, 
+               search_status
         FROM drivers
         WHERE search_status = 'ON'
           AND (search_expires_at IS NULL OR search_expires_at > NOW())

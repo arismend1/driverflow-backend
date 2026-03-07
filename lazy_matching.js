@@ -161,10 +161,16 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
 
     const query = `
         SELECT e.id, e.nombre,
-               cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
-               cr.req_operation_types, cr.req_modalities, cr.req_truck,
-               cr.offered_payment_methods, cr.req_relationships, cr.availability,
-               cr.requires_immediate_start
+               COALESCE(cr.req_license_types, '[]') AS req_license_types,
+               COALESCE(cr.req_endorsements, '[]') AS req_endorsements,
+               COALESCE(cr.req_experience_years, 0) AS req_experience_years,
+               COALESCE(cr.req_operation_types, '[]') AS req_operation_types,
+               COALESCE(cr.req_modalities, '[]') AS req_modalities,
+               COALESCE(cr.req_truck, false) AS req_truck,
+               COALESCE(cr.offered_payment_methods, '[]') AS offered_payment_methods,
+               COALESCE(cr.req_relationships, '[]') AS req_relationships,
+               COALESCE(cr.availability, '') AS availability,
+               COALESCE(cr.requires_immediate_start, false) AS requires_immediate_start
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
@@ -189,7 +195,7 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
               )
           )
           ${excludeFilter}
-        ORDER BY e.updated_at DESC NULLS LAST
+        ORDER BY e.created_at DESC NULLS LAST
         LIMIT ?
     `;
 
@@ -215,10 +221,20 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
     params.push(limit);
 
     const query = `
-        SELECT d.id, d.nombre, d.has_cdl, d.license_types, d.endorsements, d.experience_years,
-               d.operation_types, d.job_preferences, d.has_truck, d.payment_methods,
-               d.work_relationships, d.availability,
-               d.willing_to_travel, d.available_from_date, d.home_time_weeks
+        SELECT d.id, COALESCE(d.nombre, '') AS nombre, 
+               COALESCE(d.has_cdl, false) AS has_cdl, 
+               COALESCE(d.license_types, '[]') AS license_types, 
+               COALESCE(d.endorsements, '[]') AS endorsements, 
+               COALESCE(d.experience_years, 0) AS experience_years,
+               COALESCE(d.operation_types, '[]') AS operation_types, 
+               COALESCE(d.job_preferences, '[]') AS job_preferences, 
+               COALESCE(d.has_truck, false) AS has_truck, 
+               COALESCE(d.payment_methods, '[]') AS payment_methods,
+               COALESCE(d.work_relationships, '[]') AS work_relationships, 
+               COALESCE(d.availability, '') AS availability,
+               COALESCE(d.willing_to_travel, false) AS willing_to_travel, 
+               d.available_from_date, 
+               COALESCE(d.home_time_weeks, 0) AS home_time_weeks
         FROM drivers d
         WHERE d.search_status = 'ON'
           AND (d.search_expires_at IS NULL OR d.search_expires_at > NOW())
