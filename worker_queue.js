@@ -127,56 +127,86 @@ async function bridgeOutbox() {
 const handlers = {
     async send_email(payload) {
         const dryRun = process.env.DRY_RUN === '1';
-        const apiKey = process.env.SENDGRID_API_KEY;
-        const fromEmail = process.env.FROM_EMAIL;
+        const apiKey = process.env.RESEND_API_KEY;
+        const fromEmail = process.env.EMAIL_FROM || "onboarding@resend.dev";
+        const fromName = FROM_NAME;
 
         if (!apiKey) {
             if (dryRun) { logger.info('DRY RUN MISSING KEY', payload); return; }
-            throw new Error('Missing SENDGRID_API_KEY');
+            throw new Error('Missing RESEND_API_KEY');
         }
 
+        const appBaseUrl = process.env.APP_BASE_URL || API_URL;
+
         let subject = "DriverFlow Notification";
-        let body = "Notification";
-        const fromName = FROM_NAME;
+        let textBody = "Notification";
+        let htmlBody = "<p>Notification</p>";
 
         if (payload.event_name === 'verification_email') {
-            subject = "Verifica tu cuenta - DriverFlow";
+            subject = "Confirma tu correo - DriverFlow";
             const name = payload.name || 'Usuario';
-            body = `Hola ${name},\n\nGracias por registrarte.\n\nActiva tu cuenta aquí:\n${API_URL}/verify-email?token=${payload.token}\n\nO usa el código: ${payload.token}\n(Deep Link: driverflow://verify-email?token=${payload.token})`;
+            const verifyLink = `${appBaseUrl}/verify-email?token=${payload.token}`;
+
+            textBody = `Hola ${name},\n\nGracias por registrarte.\n\nActiva tu cuenta aquí:\n${verifyLink}\n\nO usa el código: ${payload.token}\n(Deep Link: driverflow://verify-email?token=${payload.token})`;
+            htmlBody = `
+                <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+                    <h2>¡Bienvenido a DriverFlow, ${name}!</h2>
+                    <p>Gracias por registrarte. Para comenzar, por favor confirma tu dirección de correo electrónico.</p>
+                    <a href="${verifyLink}" style="display: inline-block; padding: 12px 24px; background-color: #007BFF; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0;">Confirmar Mi Correo</a>
+                    <p>O ingresa este código manualmente: <strong>${payload.token}</strong></p>
+                    <p style="font-size: 12px; color: #888;">Si no solicitaste esto, puedes ignorar este correo.</p>
+                </div>
+            `;
         } else if (payload.event_name === 'recovery_email') {
             subject = "Restablecer Contraseña - DriverFlow";
             const name = payload.name || 'Usuario';
-            body = `Hola ${name},\n\nSolicitaste recuperar tu contraseña.\n\nHaz clic aquí:\n${API_URL}/reset-password-web?token=${payload.token}\n\n(Deep Link: driverflow://reset-password?token=${payload.token})`;
+            const resetLink = `${appBaseUrl}/reset-password-web?token=${payload.token}`;
+
+            textBody = `Hola ${name},\n\nSolicitaste recuperar tu contraseña.\n\nHaz clic aquí:\n${resetLink}\n\n(Deep Link: driverflow://reset-password?token=${payload.token})`;
+            htmlBody = `
+                <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+                    <h2>Restablecer Contraseña</h2>
+                    <p>Hola ${name},</p>
+                    <p>Hemos recibido una solicitud para restablecer la contraseña de tu cuenta en DriverFlow.</p>
+                    <a href="${resetLink}" style="display: inline-block; padding: 12px 24px; background-color: #28a745; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0;">Restablecer Contraseña</a>
+                    <p style="font-size: 12px; color: #888;">Si no solicitaste esto, no es necesario realizar ninguna acción.</p>
+                </div>
+            `;
         } else if (payload.event_name === 'lead_invitation_email') {
             const name = payload.name || 'Conductor';
             const company = payload.company_name || 'Una empresa';
             subject = 'Una empresa quiere trabajar contigo en DriverFlow';
-            body = `Hola ${name},\n\n${company} en DriverFlow quiere contactarte para oportunidades de trabajo.\n\nRegístrate aquí para ver la oportunidad:\n\nhttps://driverflow.app/register\n\n¡Te esperamos!\n— Equipo DriverFlow`;
+
+            textBody = `Hola ${name},\n\n${company} en DriverFlow quiere contactarte para oportunidades de trabajo.\n\nRegístrate aquí para ver la oportunidad:\n\nhttps://driverflow.app/register\n\n¡Te esperamos!\n— Equipo DriverFlow`;
+            htmlBody = `
+                <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+                    <h2>¡Nueva oportunidad en DriverFlow!</h2>
+                    <p>Hola ${name},</p>
+                    <p>La empresa <strong>${company}</strong> está interesada en contactarte para nuevas oportunidades de trabajo.</p>
+                    <a href="https://driverflow.app/register" style="display: inline-block; padding: 12px 24px; background-color: #007BFF; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0;">Ver Oportunidad y Registrarse</a>
+                    <p style="font-size: 12px; color: #888;">¡Te esperamos!</p>
+                </div>
+            `;
         }
 
         if (dryRun) {
-            logger.info(`[DRY RUN] Sending Email to ${payload.email}: ${subject}`);
+            logger.info(`[DRY RUN] Sending Email via Resend to ${payload.email}: ${subject}`);
             return;
         }
 
-        const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                personalizations: [{ to: [{ email: payload.email }] }],
-                from: { email: fromEmail || "no-reply@driverflow.app", name: fromName },
-                subject,
-                content: [{ type: "text/plain", value: body }]
-            })
+        const { Resend } = require('resend');
+        const resend = new Resend(apiKey);
+
+        const { data, error } = await resend.emails.send({
+            from: `${fromName} <${fromEmail}>`,
+            to: [payload.email],
+            subject: subject,
+            text: textBody,
+            html: htmlBody,
         });
 
-        if (!res.ok) {
-            const errText = await res.text();
-            // remove suppression to see errors in DB
-            throw new Error(`SendGrid Error ${res.status}: ${errText}`);
+        if (error) {
+            throw new Error(`Resend Error: ${error.message || JSON.stringify(error)}`);
         }
     },
 
