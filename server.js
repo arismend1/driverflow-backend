@@ -2610,6 +2610,13 @@ app.post('/api/debug/sql', async (req, res) => {
         const drivers = await db.all("SELECT id, nombre, email, contacto, phone, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
         const empresas = await db.all("SELECT id, nombre, email, contacto, telefono, contact_phone, account_state, verified FROM empresas ORDER BY id DESC LIMIT 5");
 
+        let outbox = [];
+        let jobs = [];
+        if (req.body.get_queues) {
+            outbox = await db.all("SELECT id,event_name,company_id,driver_id,queue_status,metadata,created_at FROM events_outbox ORDER BY id DESC LIMIT 10;");
+            jobs = await db.all("SELECT id,job_type,status,attempts,last_error,run_at FROM jobs_queue ORDER BY id DESC LIMIT 10;");
+        }
+
         // Also retrieve the specific tokens for verification test
         const reqEmails = req.body.emails || [];
         const tokens = {};
@@ -2619,7 +2626,7 @@ app.post('/api/debug/sql', async (req, res) => {
             if (u) tokens[em] = u.verify_token_hash;
         }
 
-        res.json({ drivers, empresas, tokens });
+        res.json({ drivers, empresas, tokens, outbox, jobs });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
