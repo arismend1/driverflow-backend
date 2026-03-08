@@ -700,7 +700,7 @@ app.post('/register', async (req, res) => {
             // });
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
-                req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
+                null, 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         } else {
             // Empresas: Create UNVERIFIED (false/0)
             if (db.IS_POSTGRES) {
@@ -716,7 +716,7 @@ app.post('/register', async (req, res) => {
             }
 
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?,?,?,?,?)`,
-                req.requestId || 'system', 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
+                null, 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
 
         res.json({ ok: true, message: 'Registered successfully.' });
