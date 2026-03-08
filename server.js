@@ -2585,6 +2585,20 @@ app.post('/api/debug/sql', async (req, res) => {
     // Only for diagnostic test purposes as specifically requested
     if (req.body.secret !== 'surgical_evidence_123') return res.status(403).json({ error: 'unauthorized' });
     try {
+        if (req.body.run_migrations) {
+            console.log("Forcibly applying migrations from debug endpoint");
+            try { await db.run("ALTER TABLE drivers ADD COLUMN verify_token_hash TEXT"); } catch (e) { }
+            try { await db.run("ALTER TABLE drivers ADD COLUMN verify_token_expires_at TEXT"); } catch (e) { }
+            try { await db.run("ALTER TABLE empresas ADD COLUMN verify_token_hash TEXT"); } catch (e) { }
+            try { await db.run("ALTER TABLE empresas ADD COLUMN verify_token_expires_at TEXT"); } catch (e) { }
+
+            try { await db.run("CREATE UNIQUE INDEX idx_drivers_email ON drivers(email)"); } catch (e) { }
+            try { await db.run("CREATE UNIQUE INDEX idx_drivers_phone ON drivers(phone)"); } catch (e) { }
+            try { await db.run("CREATE UNIQUE INDEX idx_empresas_email ON empresas(email)"); } catch (e) { }
+            try { await db.run("CREATE UNIQUE INDEX idx_empresas_telefono ON empresas(telefono)"); } catch (e) { }
+            return res.json({ msg: "Migrations run" });
+        }
+
         const drivers = await db.all("SELECT id, nombre, email, contacto, phone, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
         const empresas = await db.all("SELECT id, nombre, email, contacto, telefono, contact_phone, account_state, verified FROM empresas ORDER BY id DESC LIMIT 5");
 
