@@ -2587,16 +2587,23 @@ app.post('/api/debug/sql', async (req, res) => {
     try {
         if (req.body.run_migrations) {
             console.log("Forcibly applying migrations from debug endpoint");
-            try { await db.run("ALTER TABLE drivers ADD COLUMN verify_token_hash TEXT"); } catch (e) { }
-            try { await db.run("ALTER TABLE drivers ADD COLUMN verify_token_expires_at TEXT"); } catch (e) { }
-            try { await db.run("ALTER TABLE empresas ADD COLUMN verify_token_hash TEXT"); } catch (e) { }
-            try { await db.run("ALTER TABLE empresas ADD COLUMN verify_token_expires_at TEXT"); } catch (e) { }
+            let errors = [];
+            const executeAndCatch = async (query) => {
+                try { await db.run(query); } catch (e) { errors.push(e.message); }
+            };
 
-            try { await db.run("CREATE UNIQUE INDEX idx_drivers_email ON drivers(email)"); } catch (e) { }
-            try { await db.run("CREATE UNIQUE INDEX idx_drivers_phone ON drivers(phone)"); } catch (e) { }
-            try { await db.run("CREATE UNIQUE INDEX idx_empresas_email ON empresas(email)"); } catch (e) { }
-            try { await db.run("CREATE UNIQUE INDEX idx_empresas_telefono ON empresas(telefono)"); } catch (e) { }
-            return res.json({ msg: "Migrations run" });
+            await executeAndCatch("ALTER TABLE drivers ADD COLUMN verify_token_hash TEXT");
+            await executeAndCatch("ALTER TABLE drivers ADD COLUMN verify_token_expires_at TEXT");
+            await executeAndCatch("ALTER TABLE empresas ADD COLUMN verify_token_hash TEXT");
+            await executeAndCatch("ALTER TABLE empresas ADD COLUMN verify_token_expires_at TEXT");
+
+            await executeAndCatch("CREATE UNIQUE INDEX idx_drivers_email ON drivers(email)");
+            await executeAndCatch("CREATE UNIQUE INDEX idx_drivers_phone ON drivers(phone)");
+            await executeAndCatch("CREATE UNIQUE INDEX idx_empresas_email ON empresas(email)");
+            await executeAndCatch("CREATE UNIQUE INDEX idx_empresas_telefono ON empresas(telefono)");
+
+            if (errors.length > 0) return res.status(500).json({ error: "Migration failures", details: errors });
+            return res.json({ msg: "Migrations run flawlessly" });
         }
 
         const drivers = await db.all("SELECT id, nombre, email, contacto, phone, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
