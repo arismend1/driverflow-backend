@@ -2115,11 +2115,12 @@ async function unlockUserAdvisoryLock(lockKey) {
 
 async function getCompanyScopeIds(companyId) {
     try {
-        const row = await db.get('SELECT contacto FROM empresas WHERE id = ?', companyId);
-        if (!row || !row.contacto) return [companyId];
-        const normalized = row.contacto.trim().toLowerCase();
+        const queryField = db.IS_POSTGRES ? 'email' : 'contacto';
+        const row = await db.get(`SELECT ${queryField} AS auth_email FROM empresas WHERE id = ?`, companyId);
+        if (!row || !row.auth_email) return [companyId];
+        const normalized = row.auth_email.trim().toLowerCase();
 
-        const duplicates = await db.all('SELECT id FROM empresas WHERE LOWER(TRIM(contacto)) = ?', normalized);
+        const duplicates = await db.all(`SELECT id FROM empresas WHERE LOWER(TRIM(${queryField})) = ?`, normalized);
         if (duplicates && duplicates.length > 0) {
             const scopeIds = duplicates.map(d => d.id);
             console.log(`[CompanyScope] login_id=${companyId} -> normalized_contact="${normalized}" -> total_duplicates=${scopeIds.length} -> scope_ids=[${scopeIds.join(',')}]`);
@@ -2222,7 +2223,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 pm.company_share_consent_at,
                 d.id            AS driver_id,
                 COALESCE(d.nombre, '') AS display_name,
-                COALESCE(d.contacto, '') AS driver_email,
+                ${db.IS_POSTGRES ? "COALESCE(d.email, '')" : "COALESCE(d.contacto, '')"} AS driver_email,
                 COALESCE(d.experience_years, 0) AS experience_years,
                 COALESCE(d.license_types, '[]') AS license_summ,
                 COALESCE(d.operation_types, '[]') AS op_types,
@@ -2325,7 +2326,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 pm.company_share_consent_at,
                 pm.company_id,
                 COALESCE(e.nombre, 'Company #' || CAST(pm.company_id AS TEXT)) AS display_name,
-                COALESCE(e.contacto, '') AS company_email,
+                ${db.IS_POSTGRES ? "COALESCE(e.email, e.contacto, '')" : "COALESCE(e.contacto, '')"} AS company_email,
                 COALESCE(e.ciudad, '') AS city,
                 COALESCE(e.address_state, '') AS address_state,
                 COALESCE(e.contact_person, '') AS contact_person,
