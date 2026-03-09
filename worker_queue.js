@@ -238,28 +238,28 @@ const handlers = {
 
             const usage = await db.get(`
                 SELECT count(*) as cnt, count(distinct driver_id) as drv 
-                FROM solicitudes 
-                WHERE empresa_id = ? AND fecha_creacion >= ? AND fecha_creacion < ?`,
+                FROM tickets 
+                WHERE company_id = ? AND created_at >= ? AND created_at < ? AND billing_status != 'void'`,
                 company_id, start, endPlusOne
             );
 
             const total = usage ? (usage.cnt || 0) : 0;
             const drivers = usage ? (usage.drv || 0) : 0;
 
-            // 2. Pricing Logic (Placeholder: $10 USD per request -> 1000 cents)
-            const PRICE_PER_REQ_CENTS = 1000;
-            const amount = total * PRICE_PER_REQ_CENTS;
+            // 2. Pricing Logic (150 USD per ticket -> 15000 cents)
+            const PRICE_PER_TICKET_CENTS = 15000;
+            const amount = total * PRICE_PER_TICKET_CENTS;
 
             // 3. Insert Invoice (Idempotent: Skip if exists)
             try {
-                await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, status, created_at) VALUES (?,?,?,?,?,?,'pending',?)`,
+                await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
                     company_id, week_start, week_end, total, drivers, amount, nowIso());
 
                 logger.info(`[Billing] Created New Invoice`);
 
                 // 4. Emit Event usage only on creation
                 await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                    'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount }));
+                    'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount, currency: 'USD' }));
 
             } catch (e) {
                 if (e.message.includes('UNIQUE') || e.message.includes('constraint')) {
