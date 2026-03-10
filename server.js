@@ -1626,7 +1626,7 @@ const updateCompanyRequirements = async (req, res) => {
         }
 
         // Set search status ON instantly
-        await db.run(`UPDATE empresas SET search_status = 'ON', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, companyId);
+        await db.run(`UPDATE empresas SET search_status = 'ON' WHERE id = ?`, companyId);
 
         res.json({ ok: true });
     } catch (e) {
