@@ -1819,6 +1819,40 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         console.log("[DRIVER_PROFILE][PUT] WITH PARAMS:", JSON.stringify(params));
 
         await db.run(sql, ...params);
+
+        // --- NEW: Insert into normalized bridge tables for lazy matching engine ---
+
+        // 1. Clear old bridge entries
+        await db.run('DELETE FROM driver_operation_types WHERE driver_id = ?', driverId);
+        await db.run('DELETE FROM driver_license_types WHERE driver_id = ?', driverId);
+        await db.run('DELETE FROM driver_endorsements WHERE driver_id = ?', driverId);
+        await db.run('DELETE FROM driver_payment_methods WHERE driver_id = ?', driverId);
+        await db.run('DELETE FROM driver_work_relationships WHERE driver_id = ?', driverId);
+        await db.run('DELETE FROM driver_job_preferences WHERE driver_id = ?', driverId);
+
+        // Helper for bridge inserts
+        const insertBridge = async (table, arr) => {
+            const arrSafe = Array.isArray(arr) ? arr : [];
+            for (const v of arrSafe) {
+                if (v && v.trim()) {
+                    await db.run(`INSERT INTO ${table} (driver_id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`, driverId, v.trim().toLowerCase());
+                }
+            }
+        };
+
+        // 2. Insert new bridge entries
+        await insertBridge('driver_operation_types', operation_types);
+        await insertBridge('driver_license_types', license_types);
+        await insertBridge('driver_endorsements', endorsements);
+        await insertBridge('driver_payment_methods', payment_methods);
+        await insertBridge('driver_work_relationships', work_relationships);
+        await insertBridge('driver_job_preferences', job_preferences);
+
+        console.log(`[DRIVER_PROFILE] Bridge tables updated`);
+
+        // Set search status ON instantly, don't use updated_at since it might be missing like in empresas
+        await db.run(`UPDATE drivers SET search_status = 'ON' WHERE id = ?`, driverId);
+
         res.json({ ok: true });
     } catch (e) {
         console.error("[DRIVER_PROFILE][PUT] ERROR", e);
