@@ -1551,6 +1551,7 @@ const updateCompanyRequirements = async (req, res) => {
     const p_offered_payment_methods = safeJson(offered_payment_methods);
     const p_req_relationships = safeJson(req_relationships);
 
+    console.log(`[COMPANY_REQUIREMENTS][PUT] RECEIVED PAYLOAD for company ${companyId}:`, Object.keys(req.body));
 
     try {
         const sql = db.IS_POSTGRES
@@ -1595,6 +1596,38 @@ const updateCompanyRequirements = async (req, res) => {
             await db.run('DELETE FROM company_requirements WHERE company_id = ?', companyId);
         }
         await db.run(sql, ...params);
+
+        // --- NEW: Insert into normalized bridge tables for lazy matching engine ---
+
+        // 1. Clear old bridge entries
+        await db.run('DELETE FROM company_req_operation_types WHERE company_id = ?', companyId);
+        await db.run('DELETE FROM company_req_license_types WHERE company_id = ?', companyId);
+
+        // 2. Insert new operation_types
+        const arrOpTypes = Array.isArray(req_operation_types) ? req_operation_types : [];
+        if (arrOpTypes.length > 0) {
+            console.log(`[COMPANY_REQUIREMENTS] INSERT operation_types: ${arrOpTypes.length}`);
+            for (const v of arrOpTypes) {
+                if (v && v.trim()) {
+                    await db.run(`INSERT INTO company_req_operation_types (company_id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`, companyId, v.trim().toLowerCase());
+                }
+            }
+        }
+
+        // 3. Insert new license_types
+        const arrLicTypes = Array.isArray(req_license_types) ? req_license_types : [];
+        if (arrLicTypes.length > 0) {
+            console.log(`[COMPANY_REQUIREMENTS] INSERT license_types: ${arrLicTypes.length}`);
+            for (const v of arrLicTypes) {
+                if (v && v.trim()) {
+                    await db.run(`INSERT INTO company_req_license_types (company_id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`, companyId, v.trim().toLowerCase());
+                }
+            }
+        }
+
+        // Set search status ON instantly
+        await db.run(`UPDATE empresas SET search_status = 'ON', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, companyId);
+
         res.json({ ok: true });
     } catch (e) {
         console.error('Error updating requirements:', e.message);
