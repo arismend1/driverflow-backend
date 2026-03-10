@@ -2566,6 +2566,28 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
 
+        // --- NEW EXCLUSIVITY CHECK (72 HOURS) ---
+        // Prevent driver from sharing info if they recently shared with ANY other company.
+        const EXCLUSIVE_HOURS = 72;
+        const cutoffTime = new Date(new Date().getTime() - (EXCLUSIVE_HOURS * 60 * 60 * 1000)).toISOString();
+
+        let existingConsentSql = `
+            SELECT COUNT(*) as count 
+            FROM potential_matches 
+            WHERE driver_id = ? 
+              AND status IN ('SHARE_PENDING_COMPANY', 'INFO_SHARED') 
+              AND driver_share_consent_at > ?
+        `;
+        const activeConsents = await db.get(existingConsentSql, req.user.id, cutoffTime);
+        if (activeConsents && activeConsents.count > 0) {
+            console.log(`[ConsentFlow] driver=${req.user.id} blocked by 72h exclusivity timer`);
+            return res.status(409).json({
+                error: `Exclusivity Lock`,
+                message: `Hace poco compartiste tu información con otra empresa. Por favor, espera a que concluyan las ${EXCLUSIVE_HOURS} horas de evaluación exclusiva antes de aceptar otra oferta.`
+            });
+        }
+        // --- END EXCLUSIVITY CHECK ---
+
         await db.run(
             'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
             now, now, matchId
