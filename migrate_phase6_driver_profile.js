@@ -58,7 +58,7 @@ console.log('--- [PHASE 6] Driver Profile Value Upgrade Migration ---');
         await safeAdd('drivers', 'weekly_miles', 'INTEGER');
         await safeAdd('drivers', 'longest_otr', 'TEXT');
         if (db.IS_POSTGRES) {
-            await safeAdd('drivers', 'trailer_experience', "JSONB DEFAULT '[]'");
+            await safeAdd('drivers', 'trailer_experience', "JSONB DEFAULT '[]'::jsonb");
         } else {
             await safeAdd('drivers', 'trailer_experience', 'TEXT');
         }
