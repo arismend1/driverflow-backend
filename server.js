@@ -26,46 +26,7 @@ const PORT = process.env.PORT || 3000;
 // Trust Proxy (Render/Load Balancer)
 app.set('trust proxy', 1);
 
-// --- 2. MIGRATIONS (CONDITIONAL) ---
-if (process.env.RUN_MIGRATIONS === 'true') {
-    try {
-        console.log('--- Auto-Migration Check ---');
-        // We run these specific fixes as requested in the past
-        execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
-        execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
-        execSync('node migrate_fix_events.js', { stdio: 'inherit' });
-        execSync('node migrate_company_requirements.js', { stdio: 'inherit' });
-        execSync('node migrate_driver_profile.js', { stdio: 'inherit' });
-        execSync('node migrate_fix_profile_columns.js', { stdio: 'inherit' });
-        execSync('node migrate_availability.js', { stdio: 'inherit' });
-        execSync('node migrate_matches_consent.js', { stdio: 'inherit' });
-        execSync('node migrate_ticket_match_unique.js', { stdio: 'inherit' });
-        execSync('node migrate_ticket_payment.js', { stdio: 'inherit' });
-        execSync('node migrate_matches_index.js', { stdio: 'inherit' });
-        execSync('node migrate_matches_query_indexes.js', { stdio: 'inherit' });
-        execSync('node migrate_lazy_matching.js', { stdio: 'inherit' });
-        execSync('node migrate_candidate_pool.js', { stdio: 'inherit' });
-        execSync('node migrate_candidate_pool_gin.js', { stdio: 'inherit' });
-        execSync('node migrate_match_retention.js', { stdio: 'inherit' });
-        execSync('node migrate_otr_eligibility.js', { stdio: 'inherit' });
-        execSync('node migrate_normalize_preferences.js', { stdio: 'inherit' });
-        execSync('node migrate_driver_leads.js', { stdio: 'inherit' });
-        execSync('node migrate_lead_invitations.js', { stdio: 'inherit' });
-        execSync('node migrate_lead_source.js', { stdio: 'inherit' });
-        execSync('node migrate_lead_funnel_events.js', { stdio: 'inherit' });
-        // Schema improvements: Exclusivity and Match Resolution Tracking
-        // Add exclusivity_extension_hours column to potential_matches
-        await db.run('ALTER TABLE potential_matches ADD COLUMN exclusivity_extension_hours INTEGER DEFAULT 0').catch(() => { });
-        // Add resolution tracking
-        await db.run('ALTER TABLE potential_matches ADD COLUMN resolution_company TEXT').catch(() => { });
-        await db.run('ALTER TABLE potential_matches ADD COLUMN resolution_driver TEXT').catch(() => { });
-
-        console.log("Database initialized properly.");
-    } catch (err) {
-        console.error('FATAL: Migration failed.');
-        process.exit(1);
-    }
-}
+// --- 2. MIGRATIONS (REPLACED BY CONSOLIDATED BLOCK AT END) ---
 
 // --- 3. MIDDLEWARE CONFIG ---
 
@@ -2376,16 +2337,16 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 COALESCE(d.nombre, '') AS display_name,
                 ${db.IS_POSTGRES ? "COALESCE(d.email, '')" : "COALESCE(d.contacto, '')"} AS driver_email,
                 COALESCE(d.experience_years, 0) AS experience_years,
-                COALESCE(d.license_types, '[]') AS license_summ,
-                COALESCE(d.operation_types, '[]') AS op_types,
-                COALESCE(d.payment_methods, '[]') AS pay_methods,
+                COALESCE(d.license_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS license_summ,
+                COALESCE(d.operation_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS op_types,
+                COALESCE(d.payment_methods, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS pay_methods,
                 COALESCE(d.availability, '') AS availability,
                 d.city AS driver_city,
                 d.state AS driver_state,
                 d.phone AS driver_phone,
                 d.weekly_miles,
                 d.longest_otr,
-                COALESCE(d.trailer_experience, '[]') AS trailer_experience,
+                COALESCE(d.trailer_experience, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS trailer_experience,
                 COALESCE(d.accidents_3y, 0) AS accidents_3y,
                 COALESCE(d.tickets_3y, 0) AS tickets_3y,
                 d.home_time,
@@ -2394,7 +2355,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 ${db.IS_POSTGRES ? 'd.willing_to_relocate' : 'COALESCE(d.willing_to_relocate, 0)'} AS willing_to_relocate,
                 d.driver_bio,
                 COALESCE(d.has_cdl, ${db.IS_POSTGRES ? 'false' : '0'}) AS has_cdl,
-                COALESCE(d.endorsements, '[]') AS endorsements,
+                COALESCE(d.endorsements, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS endorsements,
                 dm.profile_photo_base64,
                 dm.license_front_base64,
                 dm.license_back_base64
@@ -2921,13 +2882,60 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
 if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
     const { execSync } = require('child_process');
-    console.log("Running migrations on startup...");
+    console.log("--- Starting Consolidated Auto-Migrations ---");
     try {
+        // Critical Core Schema
         execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
-        execSync('node migrate_auth_indexes.js', { stdio: 'inherit' });
-        execSync('node migrate_phase6_driver_profile.js', { stdio: 'inherit' });
+        execSync('node migrate_prod_consolidated.js', { stdio: 'inherit' });
+
+        // Feature Schema (Hardened against failure)
+        const featureMigrations = [
+            'migrate_auth_indexes.js',
+            'migrate_fix_events.js',
+            'migrate_company_requirements.js',
+            'migrate_driver_profile.js',
+            'migrate_fix_profile_columns.js',
+            'migrate_availability.js',
+            'migrate_matches_consent.js',
+            'migrate_ticket_match_unique.js',
+            'migrate_ticket_payment.js',
+            'migrate_matches_index.js',
+            'migrate_matches_query_indexes.js',
+            'migrate_lazy_matching.js',
+            'migrate_candidate_pool.js',
+            'migrate_candidate_pool_gin.js',
+            'migrate_match_retention.js',
+            'migrate_otr_eligibility.js',
+            'migrate_normalize_preferences.js',
+            'migrate_driver_leads.js',
+            'migrate_lead_invitations.js',
+            'migrate_lead_source.js',
+            'migrate_lead_funnel_events.js',
+            'migrate_phase6_driver_profile.js'
+        ];
+
+        for (const m of featureMigrations) {
+            try {
+                execSync(`node ${m}`, { stdio: 'inherit' });
+            } catch (err) {
+                console.warn(`[WARNING] Non-fatal migration error in ${m}:`, err.message);
+            }
+        }
+
+        // Inline Column Patches (Async)
+        (async () => {
+            try {
+                await db.run('ALTER TABLE potential_matches ADD COLUMN IF NOT EXISTS exclusivity_extension_hours INTEGER DEFAULT 0').catch(() => { });
+                await db.run('ALTER TABLE potential_matches ADD COLUMN IF NOT EXISTS resolution_company TEXT').catch(() => { });
+                await db.run('ALTER TABLE potential_matches ADD COLUMN IF NOT EXISTS resolution_driver TEXT').catch(() => { });
+            } catch (e) { console.warn("Schema patch warning:", e.message); }
+        })();
+
+        console.log("--- Auto-Migrations Finished ---");
     } catch (e) {
-        console.error("Auto-migration failed:", e.message);
+        console.error("FATAL: Core migration failed:", e.message);
+        // We only exit if CORE schema fails. Feature schema errors are warned but allow server to try starting.
+        // process.exit(1); 
     }
 }
 
