@@ -2694,8 +2694,12 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         // Prevent driver from sharing info if they recently shared with ANY other company.
         const EXCLUSIVE_HOURS = 72;
 
+        const hoursElapsedSQL = db.IS_POSTGRES
+            ? "EXTRACT(EPOCH FROM (NOW() - driver_share_consent_at)) / 3600"
+            : "CAST(strftime('%s', 'now') - strftime('%s', driver_share_consent_at) AS INTEGER) / 3600";
+
         let existingConsentSql = `
-            SELECT id, CAST(strftime('%s', 'now') - strftime('%s', driver_share_consent_at) AS INTEGER) / 3600 as hours_elapsed, exclusivity_extension_hours
+            SELECT id, ${hoursElapsedSQL} as hours_elapsed, exclusivity_extension_hours
             FROM potential_matches 
             WHERE driver_id = ? 
               AND status IN ('SHARE_PENDING_COMPANY', 'INFO_SHARED') 
