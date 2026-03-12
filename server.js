@@ -53,7 +53,14 @@ if (process.env.RUN_MIGRATIONS === 'true') {
         execSync('node migrate_lead_invitations.js', { stdio: 'inherit' });
         execSync('node migrate_lead_source.js', { stdio: 'inherit' });
         execSync('node migrate_lead_funnel_events.js', { stdio: 'inherit' });
-        console.log('--- Migration Done ---');
+        // Schema improvements: Exclusivity and Match Resolution Tracking
+        // Add exclusivity_extension_hours column to potential_matches
+        await db.run('ALTER TABLE potential_matches ADD COLUMN exclusivity_extension_hours INTEGER DEFAULT 0').catch(() => { });
+        // Add resolution tracking
+        await db.run('ALTER TABLE potential_matches ADD COLUMN resolution_company TEXT').catch(() => { });
+        await db.run('ALTER TABLE potential_matches ADD COLUMN resolution_driver TEXT').catch(() => { });
+
+        console.log("Database initialized properly.");
     } catch (err) {
         console.error('FATAL: Migration failed.');
         process.exit(1);
@@ -1704,7 +1711,8 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
 
         const jsonFields = [
             'license_types', 'endorsements', 'operation_types',
-            'job_preferences', 'payment_methods', 'work_relationships'
+            'job_preferences', 'payment_methods', 'work_relationships',
+            'trailer_experience'
         ];
 
         const result = { ...row };
@@ -1729,6 +1737,19 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
                 result[field] = [];
             }
         });
+
+        // Phase 6: Attach driver media (photos)
+        try {
+            const media = await db.get("SELECT profile_photo_base64, license_front_base64, license_back_base64, photo_consent_at FROM driver_media WHERE driver_id = ?", req.user.id);
+            if (media) {
+                result.profile_photo_base64 = media.profile_photo_base64 || null;
+                result.license_front_base64 = media.license_front_base64 || null;
+                result.license_back_base64 = media.license_back_base64 || null;
+                result.photo_consent_at = media.photo_consent_at || null;
+            }
+        } catch (mediaErr) {
+            console.warn('[DRIVER_PROFILE] driver_media table may not exist yet:', mediaErr.message);
+        }
 
         res.json(result);
     } catch (e) {
@@ -1760,12 +1781,18 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
     const driverId = req.user.id;
     const body = req.body;
     const { token, password, ...safePayload } = body;
-    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD:", JSON.stringify(safePayload));
+    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD:", JSON.stringify(safePayload).slice(0, 500));
 
     const {
         has_cdl, license_types, endorsements, operation_types,
         experience_years, job_preferences,
-        has_truck, payment_methods, work_relationships, availability
+        has_truck, payment_methods, work_relationships, availability,
+        // Phase 6 new fields
+        city, state, weekly_miles, longest_otr, trailer_experience,
+        accidents_3y, tickets_3y, home_time, preferred_freight,
+        preferred_region, willing_to_relocate, driver_bio,
+        // Phase 6 media
+        profile_photo_base64, license_front_base64, license_back_base64, photo_consent_at
     } = body;
 
     try {
@@ -1776,19 +1803,29 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 has_cdl = ?, license_types = ?::jsonb, endorsements = ?::jsonb, operation_types = ?::jsonb,
                 experience_years = ?, job_preferences = ?::jsonb,
                 has_truck = ?, payment_methods = ?::jsonb, work_relationships = ?::jsonb, availability = ?,
+                city = ?, state = ?, weekly_miles = ?, longest_otr = ?,
+                trailer_experience = ?::jsonb, accidents_3y = ?, tickets_3y = ?,
+                home_time = ?, preferred_freight = ?, preferred_region = ?,
+                willing_to_relocate = ?, driver_bio = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
-                !!has_cdl, // Native boolean
+                !!has_cdl,
                 JSON.stringify(safeJson(license_types, [])),
                 JSON.stringify(safeJson(endorsements, [])),
                 JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
                 JSON.stringify(safeJson(job_preferences, [])),
-                !!has_truck, // Native boolean
+                !!has_truck,
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
-                availability || 'Inmediata',
+                availability || 'Immediate',
+                city || null, state || null,
+                weekly_miles || null, longest_otr || null,
+                JSON.stringify(safeJson(trailer_experience, [])),
+                accidents_3y || 0, tickets_3y || 0,
+                home_time || null, preferred_freight || null, preferred_region || null,
+                !!willing_to_relocate, driver_bio || null,
                 nowIso(),
                 driverId
             ];
@@ -1797,28 +1834,75 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 has_cdl = ?, license_types = ?, endorsements = ?, operation_types = ?,
                 experience_years = ?, job_preferences = ?,
                 has_truck = ?, payment_methods = ?, work_relationships = ?, availability = ?,
+                city = ?, state = ?, weekly_miles = ?, longest_otr = ?,
+                trailer_experience = ?, accidents_3y = ?, tickets_3y = ?,
+                home_time = ?, preferred_freight = ?, preferred_region = ?,
+                willing_to_relocate = ?, driver_bio = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
-                +!!has_cdl, // 1/0 for SQLite
+                +!!has_cdl,
                 JSON.stringify(safeJson(license_types, [])),
                 JSON.stringify(safeJson(endorsements, [])),
                 JSON.stringify(safeJson(operation_types, [])),
                 experience_years || 0,
                 JSON.stringify(safeJson(job_preferences, [])),
-                +!!has_truck, // 1/0 for SQLite
+                +!!has_truck,
                 JSON.stringify(safeJson(payment_methods, [])),
                 JSON.stringify(safeJson(work_relationships, [])),
-                availability || 'Inmediata',
+                availability || 'Immediate',
+                city || null, state || null,
+                weekly_miles || null, longest_otr || null,
+                JSON.stringify(safeJson(trailer_experience, [])),
+                accidents_3y || 0, tickets_3y || 0,
+                home_time || null, preferred_freight || null, preferred_region || null,
+                +!!willing_to_relocate, driver_bio || null,
                 nowIso(),
                 driverId
             ];
         }
 
         console.log("[DRIVER_PROFILE][PUT] EXECUTING SQL:", sql);
-        console.log("[DRIVER_PROFILE][PUT] WITH PARAMS:", JSON.stringify(params));
+        console.log("[DRIVER_PROFILE][PUT] WITH PARAMS (count):", params.length);
 
         await db.run(sql, ...params);
+
+        // --- Phase 6: Upsert driver_media for photos ---
+        if (profile_photo_base64 || license_front_base64 || license_back_base64) {
+            try {
+                const existingMedia = await db.get('SELECT driver_id FROM driver_media WHERE driver_id = ?', driverId);
+                if (existingMedia) {
+                    const mediaSql = `UPDATE driver_media SET 
+                        profile_photo_base64 = COALESCE(?, profile_photo_base64),
+                        license_front_base64 = COALESCE(?, license_front_base64),
+                        license_back_base64 = COALESCE(?, license_back_base64),
+                        photo_consent_at = COALESCE(?, photo_consent_at),
+                        updated_at = ?
+                        WHERE driver_id = ?`;
+                    await db.run(mediaSql,
+                        profile_photo_base64 || null,
+                        license_front_base64 || null,
+                        license_back_base64 || null,
+                        photo_consent_at || null,
+                        nowIso(),
+                        driverId
+                    );
+                } else {
+                    await db.run(
+                        `INSERT INTO driver_media (driver_id, profile_photo_base64, license_front_base64, license_back_base64, photo_consent_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        driverId,
+                        profile_photo_base64 || null,
+                        license_front_base64 || null,
+                        license_back_base64 || null,
+                        photo_consent_at || null,
+                        nowIso(), nowIso()
+                    );
+                }
+                console.log('[DRIVER_PROFILE] Media saved for driver', driverId);
+            } catch (mediaErr) {
+                console.warn('[DRIVER_PROFILE] driver_media save failed (table may not exist):', mediaErr.message);
+            }
+        }
 
         // --- NEW: Insert into normalized bridge tables for lazy matching engine ---
 
@@ -2277,7 +2361,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             console.error('[Leads] Auto-invite error:', invErr.message);
         }
 
-        // 3) Return matches (existing query)
+        // 3) Return matches (existing query + Phase 6 expanded profile)
         const rows = await db.all(`
             SELECT
                 pm.id           AS match_id,
@@ -2295,9 +2379,28 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 COALESCE(d.license_types, '[]') AS license_summ,
                 COALESCE(d.operation_types, '[]') AS op_types,
                 COALESCE(d.payment_methods, '[]') AS pay_methods,
-                COALESCE(d.availability, '') AS availability
+                COALESCE(d.availability, '') AS availability,
+                d.city AS driver_city,
+                d.state AS driver_state,
+                d.phone AS driver_phone,
+                d.weekly_miles,
+                d.longest_otr,
+                COALESCE(d.trailer_experience, '[]') AS trailer_experience,
+                COALESCE(d.accidents_3y, 0) AS accidents_3y,
+                COALESCE(d.tickets_3y, 0) AS tickets_3y,
+                d.home_time,
+                d.preferred_freight,
+                d.preferred_region,
+                ${db.IS_POSTGRES ? 'd.willing_to_relocate' : 'COALESCE(d.willing_to_relocate, 0)'} AS willing_to_relocate,
+                d.driver_bio,
+                COALESCE(d.has_cdl, ${db.IS_POSTGRES ? 'false' : '0'}) AS has_cdl,
+                COALESCE(d.endorsements, '[]') AS endorsements,
+                dm.profile_photo_base64,
+                dm.license_front_base64,
+                dm.license_back_base64
             FROM potential_matches pm
             JOIN drivers d ON d.id = pm.driver_id
+            LEFT JOIN driver_media dm ON dm.driver_id = d.id
             WHERE pm.company_id IN (${scopeIn})
               AND pm.status NOT IN ('DECLINED','EXPIRED')
             ORDER BY pm.created_at DESC
@@ -2305,7 +2408,28 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
 
         const sanitized = rows.map(r => {
             if (r.status !== 'INFO_SHARED') {
-                return { ...r, driver_email: null };
+                // Hide all contact + expanded profile info for non-shared matches
+                return {
+                    ...r,
+                    driver_email: null,
+                    driver_phone: null,
+                    driver_city: null,
+                    driver_state: null,
+                    weekly_miles: null,
+                    longest_otr: null,
+                    trailer_experience: '[]',
+                    accidents_3y: null,
+                    tickets_3y: null,
+                    home_time: null,
+                    preferred_freight: null,
+                    preferred_region: null,
+                    willing_to_relocate: null,
+                    driver_bio: null,
+                    endorsements: '[]',
+                    profile_photo_base64: null,
+                    license_front_base64: null,
+                    license_back_base64: null
+                };
             }
             return r;
         });
@@ -2569,21 +2693,27 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         // --- NEW EXCLUSIVITY CHECK (72 HOURS) ---
         // Prevent driver from sharing info if they recently shared with ANY other company.
         const EXCLUSIVE_HOURS = 72;
-        const cutoffTime = new Date(new Date().getTime() - (EXCLUSIVE_HOURS * 60 * 60 * 1000)).toISOString();
 
         let existingConsentSql = `
-            SELECT COUNT(*) as count 
+            SELECT id, CAST(strftime('%s', 'now') - strftime('%s', driver_share_consent_at) AS INTEGER) / 3600 as hours_elapsed, exclusivity_extension_hours
             FROM potential_matches 
             WHERE driver_id = ? 
               AND status IN ('SHARE_PENDING_COMPANY', 'INFO_SHARED') 
-              AND driver_share_consent_at > ?
         `;
-        const activeConsents = await db.get(existingConsentSql, req.user.id, cutoffTime);
-        if (activeConsents && activeConsents.count > 0) {
-            console.log(`[ConsentFlow] driver=${req.user.id} blocked by 72h exclusivity timer`);
+        const activeConsents = await db.all(existingConsentSql, req.user.id);
+
+        // Manual filter to account for extensions dynamically
+        const lockedConsents = activeConsents.filter(c => {
+            const extension = c.exclusivity_extension_hours || 0;
+            const limit = EXCLUSIVE_HOURS + extension;
+            return c.hours_elapsed < limit;
+        });
+
+        if (lockedConsents && lockedConsents.length > 0) {
+            console.log(`[ConsentFlow] driver=${req.user.id} blocked by exclusivity timer`);
             return res.status(409).json({
-                error: `Exclusivity Lock`,
-                message: `Hace poco compartiste tu información con otra empresa. Por favor, espera a que concluyan las ${EXCLUSIVE_HOURS} horas de evaluación exclusiva antes de aceptar otra oferta.`
+                error: `Error`,
+                message: `You recently shared your information with another company. Please wait until the ${EXCLUSIVE_HOURS}-hour exclusive evaluation period ends before accepting another offer.`
             });
         }
         // --- END EXCLUSIVITY CHECK ---
@@ -2721,12 +2851,77 @@ app.post('/api/debug/sql', async (req, res) => {
     }
 });
 
+// Match Resolution Endpoint
+app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
+    try {
+        const matchId = req.params.id;
+        const { resolution } = req.body; // HIRED, IN_PROCESS, REJECTED
+        const validResolutions = ['HIRED', 'IN_PROCESS', 'REJECTED'];
+
+        if (!validResolutions.includes(resolution)) {
+            return res.status(400).json({ error: 'Invalid resolution status' });
+        }
+
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        if (!match) return res.status(404).json({ error: 'Match not found' });
+
+        // Ensure user belongs to this match
+        if (req.user.type === 'empresa' && match.empresa_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+        if (req.user.type === 'driver' && match.driver_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+        const now = new Date().toISOString();
+        const roleColumn = req.user.type === 'empresa' ? 'resolution_company' : 'resolution_driver';
+
+        if (resolution === 'IN_PROCESS') {
+            const currentExt = match.exclusivity_extension_hours || 0;
+            const newExt = currentExt + 72;
+            const maxExt = 504; // 21 days
+
+            if (newExt > maxExt) {
+                return res.status(400).json({ error: 'MaxExtensionReached', message: 'El tiempo máximo de prueba ha expirado. Debe decidir si lo contrata o no.' });
+            }
+
+            await db.run(
+                `UPDATE potential_matches SET exclusivity_extension_hours = ?, ${roleColumn} = ?, updated_at = ? WHERE id = ?`,
+                [newExt, resolution, now, matchId]
+            );
+            return res.json({ success: true, message: 'Extensión de 72 horas aplicada.', status: 'INFO_SHARED' });
+        }
+
+        if (resolution === 'REJECTED') {
+            await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, [resolution, now, matchId]);
+            return res.json({ success: true, message: 'Match cerrado. Ya puede buscar otras opciones.', status: 'CLOSED' });
+        }
+
+        if (resolution === 'HIRED') {
+            await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, [resolution, now, matchId]);
+
+            // Turn off driver's search status
+            await db.run(`UPDATE drivers SET search_status = 'OFF' WHERE id = ?`, [match.driver_id]);
+
+            // Change all other pending matches for this driver to 'HIRED_ELSEWHERE'
+            await db.run(`
+                UPDATE potential_matches 
+                SET status = 'HIRED_ELSEWHERE', updated_at = ? 
+                WHERE driver_id = ? AND id != ? AND status NOT IN ('CLOSED', 'REJECTED', 'HIRED', 'HIRED_ELSEWHERE')
+            `, [now, match.driver_id, matchId]);
+
+            return res.json({ success: true, message: '¡Felicidades por la contratación!', status: 'HIRED' });
+        }
+
+    } catch (e) {
+        console.error('Match Resolve Error:', e);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
 if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
     const { execSync } = require('child_process');
     console.log("Running migrations on startup...");
     try {
         execSync('node migrate_auth_fix.js', { stdio: 'inherit' });
         execSync('node migrate_auth_indexes.js', { stdio: 'inherit' });
+        execSync('node migrate_phase6_driver_profile.js', { stdio: 'inherit' });
     } catch (e) {
         console.error("Auto-migration failed:", e.message);
     }
