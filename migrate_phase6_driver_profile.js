@@ -57,7 +57,11 @@ console.log('--- [PHASE 6] Driver Profile Value Upgrade Migration ---');
         // Experience
         await safeAdd('drivers', 'weekly_miles', 'INTEGER');
         await safeAdd('drivers', 'longest_otr', 'TEXT');
-        await safeAdd('drivers', 'trailer_experience', db.IS_POSTGRES ? 'JSONB DEFAULT \'[]\'::jsonb' : 'TEXT');
+        if (db.IS_POSTGRES) {
+            await safeAdd('drivers', 'trailer_experience', "JSONB DEFAULT '[]'");
+        } else {
+            await safeAdd('drivers', 'trailer_experience', 'TEXT');
+        }
 
         // Safety
         await safeAdd('drivers', 'accidents_3y', 'INTEGER DEFAULT 0');
@@ -67,7 +71,11 @@ console.log('--- [PHASE 6] Driver Profile Value Upgrade Migration ---');
         await safeAdd('drivers', 'home_time', 'TEXT');
         await safeAdd('drivers', 'preferred_freight', 'TEXT');
         await safeAdd('drivers', 'preferred_region', 'TEXT');
-        await safeAdd('drivers', 'willing_to_relocate', db.IS_POSTGRES ? 'BOOLEAN DEFAULT FALSE' : 'INTEGER DEFAULT 0');
+        if (db.IS_POSTGRES) {
+            await safeAdd('drivers', 'willing_to_relocate', 'BOOLEAN DEFAULT FALSE');
+        } else {
+            await safeAdd('drivers', 'willing_to_relocate', 'INTEGER DEFAULT 0');
+        }
 
         // Bio
         await safeAdd('drivers', 'driver_bio', 'TEXT');
