@@ -2894,11 +2894,22 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
         }
 
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
-        if (!match) return res.status(404).json({ error: 'Match not found' });
+        if (!match) {
+            console.log(`[RESOLVE_MATCH][404] Match ${matchId} not found`);
+            return res.status(404).json({ error: 'Match not found' });
+        }
+
+        console.log(`[RESOLVE_MATCH][AUTH_CHECK] match_id: ${matchId}, actor_id: ${req.user.id}, actor_type: ${req.user.type}, match.company_id: ${match.company_id}, match.driver_id: ${match.driver_id}`);
 
         // Ensure user belongs to this match
-        if (req.user.type === 'empresa' && match.empresa_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-        if (req.user.type === 'driver' && match.driver_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+        if (req.user.type === 'empresa' && match.company_id !== req.user.id) {
+            console.log(`[RESOLVE_MATCH][403] Forbidden: Company ID mismatch. Match company: ${match.company_id}, Token company: ${req.user.id}`);
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (req.user.type === 'driver' && match.driver_id !== req.user.id) {
+            console.log(`[RESOLVE_MATCH][403] Forbidden: Driver ID mismatch. Match driver: ${match.driver_id}, Token driver: ${req.user.id}`);
+            return res.status(403).json({ error: 'Forbidden' });
+        }
 
         const now = new Date().toISOString();
         const roleColumn = req.user.type === 'empresa' ? 'resolution_company' : 'resolution_driver';
