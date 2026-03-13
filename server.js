@@ -2988,7 +2988,8 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
             'migrate_lead_invitations.js',
             'migrate_lead_source.js',
             'migrate_lead_funnel_events.js',
-            'migrate_phase6_driver_profile.js'
+            'migrate_phase6_driver_profile.js',
+            'migrate_phase6_production_fix.js'
         ];
 
         for (const m of featureMigrations) {
