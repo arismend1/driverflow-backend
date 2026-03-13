@@ -2925,28 +2925,28 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
             await db.run(
                 `UPDATE potential_matches SET exclusivity_extension_hours = ?, ${roleColumn} = ?, updated_at = ? WHERE id = ?`,
-                [newExt, resolution, now, matchId]
+                newExt, resolution, now, matchId
             );
             return res.json({ success: true, message: 'Extensión de 72 horas aplicada.', status: 'INFO_SHARED' });
         }
 
         if (resolution === 'REJECTED') {
-            await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, [resolution, now, matchId]);
+            await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
             return res.json({ success: true, message: 'Match cerrado. Ya puede buscar otras opciones.', status: 'CLOSED' });
         }
 
         if (resolution === 'HIRED') {
-            await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, [resolution, now, matchId]);
+            await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
 
             // Turn off driver's search status
-            await db.run(`UPDATE drivers SET search_status = 'OFF' WHERE id = ?`, [match.driver_id]);
+            await db.run(`UPDATE drivers SET search_status = 'OFF' WHERE id = ?`, match.driver_id);
 
             // Change all other pending matches for this driver to 'HIRED_ELSEWHERE'
             await db.run(`
                 UPDATE potential_matches 
                 SET status = 'HIRED_ELSEWHERE', updated_at = ? 
                 WHERE driver_id = ? AND id != ? AND status NOT IN ('CLOSED', 'REJECTED', 'HIRED', 'HIRED_ELSEWHERE')
-            `, [now, match.driver_id, matchId]);
+            `, now, match.driver_id, matchId);
 
             return res.json({ success: true, message: '¡Felicidades por la contratación!', status: 'HIRED' });
         }
