@@ -93,6 +93,12 @@ function computeScore(co, dr) {
     const score = Math.min(Math.max(baseScore + bonus, 0), 1);
     breakdown.otr_bonus = bonus;
 
+    // Phase 6: Interview Travel compatibility
+    if (co.requires_travel_interview && !dr.willing_travel_interview) {
+        // Significantly reduce score or prevent match
+        return null; // Prevent match as it's a hard requirement for the company
+    }
+
     return score >= MIN_SCORE ? { score, breakdown } : null;
 }
 
@@ -170,7 +176,8 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
                COALESCE(cr.offered_payment_methods, '[]') AS offered_payment_methods,
                COALESCE(cr.req_relationships, '[]') AS req_relationships,
                COALESCE(cr.availability, '') AS availability,
-               COALESCE(cr.requires_immediate_start, false) AS requires_immediate_start
+               COALESCE(cr.requires_immediate_start, false) AS requires_immediate_start,
+               COALESCE(cr.requires_travel_interview, false) AS requires_travel_interview
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
@@ -233,6 +240,7 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
                COALESCE(d.work_relationships, '[]') AS work_relationships, 
                COALESCE(d.availability, '') AS availability,
                COALESCE(d.willing_to_travel, false) AS willing_to_travel, 
+               COALESCE(d.willing_travel_interview, false) AS willing_travel_interview,
                d.available_from_date, 
                COALESCE(d.home_time_weeks, 0) AS home_time_weeks
         FROM drivers d
@@ -291,7 +299,7 @@ async function generateMatchesForDriver(driverId) {
     const driver = await db.get(`
         SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
                operation_types, job_preferences, has_truck, payment_methods,
-               work_relationships, availability
+               work_relationships, availability, willing_travel_interview
         FROM drivers WHERE id = ? AND search_status = 'ON'
                AND (search_expires_at IS NULL OR search_expires_at > NOW())
     `, driverId);
@@ -346,7 +354,7 @@ async function generateMatchesForCompany(companyId) {
                cr.req_license_types, cr.req_endorsements, cr.req_experience_years,
                cr.req_operation_types, cr.req_modalities, cr.req_truck,
                cr.offered_payment_methods, cr.req_relationships, cr.availability,
-               cr.requires_immediate_start
+               cr.requires_immediate_start, cr.requires_travel_interview
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.id = ? AND e.search_status = 'ON'

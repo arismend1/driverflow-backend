@@ -221,7 +221,8 @@ app.post('/webhooks/payment', legacyWebhook);
 
 
 // --- 5. APP CONFIG & PUBLIC ROUTES ---
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 // Health Check
 app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));
@@ -1459,8 +1460,6 @@ const getCompanyRequirements = async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can access' });
 
     try {
-        const row = await db.get("SELECT * FROM company_requirements WHERE company_id = ?", req.user.id);
-
         const defaults = {
             req_cdl: true,
             req_license_types: [],
@@ -1471,8 +1470,23 @@ const getCompanyRequirements = async (req, res) => {
             offered_payment_methods: [],
             req_relationships: [],
             availability: 'Inmediata',
-            req_experience_years: 0
+            req_experience_years: 0,
+            pay_per_mile_min: null,
+            pay_per_mile_max: null,
+            company_logo: null,
+            company_bio: null,
+            requires_travel_interview: false,
+            home_time: 'Flexible',
+            offered_freight_types: ''
         };
+
+        const row = await db.get(`
+            SELECT cr.*, COALESCE(cr.requires_travel_interview, 0) AS requires_travel_interview, e.company_logo, e.company_bio 
+            FROM empresas e
+            LEFT JOIN company_requirements cr ON e.id = cr.company_id 
+            WHERE e.id = ?`, req.user.id);
+
+        console.log(`[COMPANY_PROFILE][LOAD] returning company profile for company ${req.user.id} - found: ${!!row}`);
 
         if (!row) return res.json(defaults);
 
@@ -1507,7 +1521,9 @@ const updateCompanyRequirements = async (req, res) => {
     const {
         req_cdl, req_license_types, req_endorsements, req_operation_types,
         req_modalities, req_truck, offered_payment_methods, req_relationships,
-        availability, req_experience_years
+        availability, req_experience_years,
+        pay_per_mile_min, pay_per_mile_max, company_logo, company_bio, requires_travel_interview,
+        home_time, offered_freight_types
     } = req.body;
 
     const safeJson = (val) => Array.isArray(val) ? JSON.stringify(val) : (typeof val === 'string' ? val : JSON.stringify(val || []));
@@ -1519,6 +1535,7 @@ const updateCompanyRequirements = async (req, res) => {
     const p_offered_payment_methods = safeJson(offered_payment_methods);
     const p_req_relationships = safeJson(req_relationships);
 
+    console.log(`[COMPANY_PROFILE][SAVE] updating fields for company ${companyId}`);
     console.log(`[COMPANY_REQUIREMENTS][PUT] RECEIVED PAYLOAD for company ${companyId}:`, Object.keys(req.body));
 
     try {
@@ -1526,8 +1543,10 @@ const updateCompanyRequirements = async (req, res) => {
             ? `INSERT INTO company_requirements (
                 company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
                 req_modalities, req_truck, offered_payment_methods, req_relationships, 
-                availability, req_experience_years, updated_at
-              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+                availability, req_experience_years, 
+                pay_per_mile_min, pay_per_mile_max, requires_travel_interview, 
+                home_time, offered_freight_types, updated_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP)
               ON CONFLICT (company_id) DO UPDATE SET
                 req_cdl=EXCLUDED.req_cdl,
                 req_license_types=EXCLUDED.req_license_types,
@@ -1539,12 +1558,19 @@ const updateCompanyRequirements = async (req, res) => {
                 req_relationships=EXCLUDED.req_relationships,
                 availability=EXCLUDED.availability,
                 req_experience_years=EXCLUDED.req_experience_years,
+                pay_per_mile_min=EXCLUDED.pay_per_mile_min,
+                pay_per_mile_max=EXCLUDED.pay_per_mile_max,
+                requires_travel_interview=EXCLUDED.requires_travel_interview,
+                home_time=EXCLUDED.home_time,
+                offered_freight_types=EXCLUDED.offered_freight_types,
                 updated_at=CURRENT_TIMESTAMP`
             : `INSERT INTO company_requirements (
                 company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
                 req_modalities, req_truck, offered_payment_methods, req_relationships, 
-                availability, req_experience_years, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
+                availability, req_experience_years, 
+                pay_per_mile_min, pay_per_mile_max, requires_travel_interview, 
+                home_time, offered_freight_types, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
 
         const params = [
             companyId,
@@ -1557,13 +1583,36 @@ const updateCompanyRequirements = async (req, res) => {
             JSON.stringify(offered_payment_methods || []),
             JSON.stringify(req_relationships || []),
             availability || 'Inmediata',
-            req_experience_years || 0
+            req_experience_years || 0,
+            pay_per_mile_min || null,
+            pay_per_mile_max || null,
+            (requires_travel_interview ?? false) ? 1 : 0,
+            home_time || null,
+            offered_freight_types || null
         ];
 
         if (!db.IS_POSTGRES) {
             await db.run('DELETE FROM company_requirements WHERE company_id = ?', companyId);
         }
         await db.run(sql, ...params);
+
+        // Update company logo and bio in empresas table
+        if (company_logo !== undefined || company_bio !== undefined) {
+            let empSql = 'UPDATE empresas SET ';
+            let empParams = [];
+            if (company_logo !== undefined) {
+                empSql += 'company_logo = ?, ';
+                empParams.push(company_logo);
+            }
+            if (company_bio !== undefined) {
+                empSql += 'company_bio = ?, ';
+                empParams.push(company_bio);
+            }
+            empSql = empSql.slice(0, -2); // remove last comma
+            empSql += ' WHERE id = ?';
+            empParams.push(companyId);
+            await db.run(empSql, ...empParams);
+        }
 
         // --- NEW: Insert into normalized bridge tables for lazy matching engine ---
 
@@ -1667,7 +1716,7 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can access' });
 
     try {
-        const row = await db.get("SELECT * FROM drivers WHERE id = ?", req.user.id);
+        const row = await db.get("SELECT *, COALESCE(willing_travel_interview, false) AS willing_travel_interview FROM drivers WHERE id = ?", req.user.id);
         if (!row) return res.status(404).json({ error: 'Driver not found' });
 
         const jsonFields = [
@@ -1751,7 +1800,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         // Phase 6 new fields
         city, state, weekly_miles, longest_otr, trailer_experience,
         accidents_3y, tickets_3y, home_time, preferred_freight,
-        preferred_region, willing_to_relocate, driver_bio,
+        preferred_region, willing_to_relocate, driver_bio, willing_travel_interview,
         // Phase 6 media
         profile_photo_base64, license_front_base64, license_back_base64, photo_consent_at
     } = body;
@@ -1767,7 +1816,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 city = ?, state = ?, weekly_miles = ?, longest_otr = ?,
                 trailer_experience = ?::jsonb, accidents_3y = ?, tickets_3y = ?,
                 home_time = ?, preferred_freight = ?, preferred_region = ?,
-                willing_to_relocate = ?, driver_bio = ?,
+                willing_to_relocate = ?, driver_bio = ?, willing_travel_interview = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
@@ -1786,7 +1835,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 JSON.stringify(safeJson(trailer_experience, [])),
                 accidents_3y || 0, tickets_3y || 0,
                 home_time || null, preferred_freight || null, preferred_region || null,
-                !!willing_to_relocate, driver_bio || null,
+                !!willing_to_relocate, driver_bio || null, !!willing_travel_interview,
                 nowIso(),
                 driverId
             ];
@@ -1798,7 +1847,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 city = ?, state = ?, weekly_miles = ?, longest_otr = ?,
                 trailer_experience = ?, accidents_3y = ?, tickets_3y = ?,
                 home_time = ?, preferred_freight = ?, preferred_region = ?,
-                willing_to_relocate = ?, driver_bio = ?,
+                willing_to_relocate = ?, driver_bio = ?, willing_travel_interview = ?,
                 updated_at = ?
                 WHERE id = ?`;
             params = [
@@ -1817,7 +1866,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
                 JSON.stringify(safeJson(trailer_experience, [])),
                 accidents_3y || 0, tickets_3y || 0,
                 home_time || null, preferred_freight || null, preferred_region || null,
-                +!!willing_to_relocate, driver_bio || null,
+                +!!willing_to_relocate, driver_bio || null, +!!willing_travel_interview,
                 nowIso(),
                 driverId
             ];
@@ -2485,7 +2534,16 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 COALESCE(e.contact_phone, '') AS contact_phone,
                 COALESCE(cr.req_operation_types, '[]') AS op_types,
                 COALESCE(cr.offered_payment_methods, '[]') AS pay_methods,
-                COALESCE(cr.availability, '') AS availability
+                COALESCE(cr.availability, '') AS availability,
+                COALESCE(cr.pay_per_mile_min, 0) AS pay_per_mile_min,
+                COALESCE(cr.pay_per_mile_max, 0) AS pay_per_mile_max,
+                COALESCE(cr.requires_travel_interview, 0) AS requires_travel_interview,
+                COALESCE(cr.home_time, '') AS home_time,
+                COALESCE(cr.offered_freight_types, '') AS offered_freight_types,
+                COALESCE(cr.req_modalities, '[]') AS modalities,
+                COALESCE(cr.req_endorsements, '[]') AS endorsements,
+                e.company_logo,
+                e.company_bio
             FROM potential_matches pm
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
@@ -2520,6 +2578,10 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
 
             if (cleanRow.status !== 'INFO_SHARED') {
                 cleanRow.company_email = null;
+                cleanRow.city = 'Location Hidden';
+                cleanRow.address_state = 'TBD';
+                cleanRow.contact_person = null;
+                cleanRow.contact_phone = null;
             }
             return cleanRow;
         });
@@ -2821,6 +2883,10 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
     try {
         const matchId = req.params.id;
         const { resolution } = req.body; // HIRED, IN_PROCESS, REJECTED
+
+        console.log(`[RESOLVE_MATCH] received resolution request for match ${matchId}`);
+        console.log(`[RESOLVE_MATCH] resolution value = ${resolution}`);
+
         const validResolutions = ['HIRED', 'IN_PROCESS', 'REJECTED'];
 
         if (!validResolutions.includes(resolution)) {
