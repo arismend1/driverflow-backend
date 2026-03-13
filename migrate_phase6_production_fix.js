@@ -10,6 +10,7 @@ async function migrate() {
 
     const companyReqTable = 'company_requirements';
     const empresasTable = 'empresas';
+    const driversTable = 'drivers';
 
     try {
         if (db.IS_POSTGRES) {
@@ -25,6 +26,9 @@ async function migrate() {
                 -- empresas updates
                 ALTER TABLE ${empresasTable} ADD COLUMN IF NOT EXISTS company_logo TEXT;
                 ALTER TABLE ${empresasTable} ADD COLUMN IF NOT EXISTS company_bio TEXT;
+
+                -- drivers updates
+                ALTER TABLE ${driversTable} ADD COLUMN IF NOT EXISTS willing_travel_interview BOOLEAN DEFAULT FALSE;
             `);
         } else {
             console.log('[MIGRATION] Applying SQLite additive changes (fallback)...');
@@ -49,6 +53,8 @@ async function migrate() {
 
             await addColumn(empresasTable, 'company_logo', 'TEXT');
             await addColumn(empresasTable, 'company_bio', 'TEXT');
+
+            await addColumn(driversTable, 'willing_travel_interview', 'BOOLEAN DEFAULT 0');
         }
 
         console.log('[MIGRATION] Phase 6 production schema hotfix completed successfully.');
