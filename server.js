@@ -1481,7 +1481,9 @@ const getCompanyRequirements = async (req, res) => {
         };
 
         const row = await db.get(`
-            SELECT cr.*, COALESCE(cr.requires_travel_interview, 0) AS requires_travel_interview, e.company_logo, e.company_bio 
+            SELECT cr.*, 
+                   COALESCE(cr.requires_travel_interview, ${db.IS_POSTGRES ? 'FALSE' : '0'}) AS requires_travel_interview, 
+                   e.company_logo, e.company_bio 
             FROM empresas e
             LEFT JOIN company_requirements cr ON e.id = cr.company_id 
             WHERE e.id = ?`, req.user.id);
@@ -2537,7 +2539,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                 COALESCE(cr.availability, '') AS availability,
                 COALESCE(cr.pay_per_mile_min, 0) AS pay_per_mile_min,
                 COALESCE(cr.pay_per_mile_max, 0) AS pay_per_mile_max,
-                COALESCE(cr.requires_travel_interview, 0) AS requires_travel_interview,
+                COALESCE(cr.requires_travel_interview, ${db.IS_POSTGRES ? 'FALSE' : '0'}) AS requires_travel_interview,
                 COALESCE(cr.home_time, '') AS home_time,
                 COALESCE(cr.offered_freight_types, '') AS offered_freight_types,
                 COALESCE(cr.req_modalities, '[]') AS modalities,
