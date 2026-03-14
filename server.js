@@ -2732,9 +2732,10 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             SELECT id, ${hoursElapsedSQL} as hours_elapsed, exclusivity_extension_hours
             FROM potential_matches 
             WHERE driver_id = ? 
+              AND id <> ?
               AND status IN ('SHARE_PENDING_COMPANY', 'INFO_SHARED') 
         `;
-        const activeConsents = await db.all(existingConsentSql, req.user.id);
+        const activeConsents = await db.all(existingConsentSql, req.user.id, matchId);
 
         // Manual filter to account for extensions dynamically
         const lockedConsents = activeConsents.filter(c => {
@@ -2806,11 +2807,44 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
 
+        // --- NEW EXCLUSIVITY CHECK ---
+        // Block if driver is already "locked" by another company in any exclusivity-reserved state
+        const conflict = await db.get(`
+            SELECT id FROM potential_matches 
+            WHERE driver_id = ? AND id <> ? 
+              AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')
+        `, match.driver_id, matchId);
+        
+        if (conflict) {
+            console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already locked by match=${conflict.id}`);
+            return res.status(409).json({ 
+                error: 'Conflict',
+                message: 'This driver is currently in exclusivity or review with another company.' 
+            });
+        }
+
         await db.run(
             'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
             now, now, matchId
         );
         console.log(`[ConsentFlow] company_share_consent_at set`);
+
+        // --- NEW EXCLUSIVITY CHECK ---
+        // Block if driver is already in exclusivity with another company
+        if (match.status !== 'INFO_SHARED') {
+            const conflict = await db.get(`
+                SELECT id FROM potential_matches 
+                WHERE driver_id = ? AND id <> ? AND status = 'INFO_SHARED'
+            `, match.driver_id, matchId);
+            
+            if (conflict) {
+                console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already exclusive with match=${conflict.id}`);
+                return res.status(409).json({ 
+                    error: 'Conflict',
+                    message: 'This driver is currently exclusive with another company.' 
+                });
+            }
+        }
 
         const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         let finalStatus = updated.status;
