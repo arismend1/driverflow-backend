@@ -2313,7 +2313,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
         // 1) Count fresh active matches
         const recentRow = await db.get(
             `SELECT COUNT(*) AS c FROM potential_matches
-             WHERE company_id IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+             WHERE company_id IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED','HIRED','HIRED_ELSEWHERE','CLOSED') AND created_at >= ?`,
             ...scopeIds, cutoff
         );
         const recentCount = recentRow ? parseInt(recentRow.c) : 0;
@@ -2414,7 +2414,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             JOIN drivers d ON d.id = pm.driver_id
             LEFT JOIN driver_media dm ON dm.driver_id = d.id
             WHERE pm.company_id IN (${scopeIn})
-              AND pm.status NOT IN ('DECLINED','EXPIRED')
+              AND pm.status NOT IN ('DECLINED','EXPIRED','HIRED','HIRED_ELSEWHERE','CLOSED')
             ORDER BY pm.created_at DESC
         `, ...scopeIds);
 
@@ -2477,7 +2477,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
         // 1) Count fresh active matches
         const recentRow = await db.get(
             `SELECT COUNT(*) AS c FROM potential_matches
-             WHERE ${filterColumn} IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED') AND created_at >= ?`,
+             WHERE ${filterColumn} IN (${scopeIn}) AND status NOT IN ('DECLINED','EXPIRED','HIRED','HIRED_ELSEWHERE','CLOSED') AND created_at >= ?`,
             ...scopeIds, cutoff
         );
         const recentCount = recentRow ? parseInt(recentRow.c) : 0;
@@ -2550,7 +2550,7 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
             LEFT JOIN empresas e ON e.id = pm.company_id
             LEFT JOIN company_requirements cr ON cr.company_id = pm.company_id
             WHERE pm.${filterColumn} IN (${scopeIn})
-              AND pm.status NOT IN ('DECLINED','EXPIRED')
+              AND pm.status NOT IN ('DECLINED','EXPIRED','HIRED','HIRED_ELSEWHERE','CLOSED')
             ORDER BY pm.match_score DESC, pm.created_at DESC
         `, ...scopeIds);
 
