@@ -2658,19 +2658,19 @@ const updateMatchStatus = async (req, res, newStatus) => {
 
 const finalizeShare = async (matchId) => {
     const now = new Date().toISOString();
-    const match = await db.get('SELECT driver_id FROM potential_matches WHERE id = ?', matchId);
+    const match = await db.get('SELECT driver_id FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
     if (!match) return;
 
     // 1. Mark winning match as shared
     await db.run(
         "UPDATE potential_matches SET status = 'INFO_SHARED', info_shared_at = ?, updated_at = ? WHERE id = ?",
-        now, now, matchId
+        now, now, parseInt(matchId, 10)
     );
 
     // 2. Proactively close competing handshakes (Neutral terminal state: CLOSED)
     await db.run(
         "UPDATE potential_matches SET status = 'CLOSED', updated_at = ? WHERE driver_id = ? AND id <> ? AND status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')",
-        now, match.driver_id, matchId
+        now, match.driver_id, parseInt(matchId, 10)
     );
 };
 
@@ -2715,7 +2715,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
     const now = new Date().toISOString();
 
     try {
-        const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND driver_id = ?', matchId, req.user.id);
+        const match = await db.get('SELECT * FROM potential_matches WHERE id = ? AND driver_id = ?', parseInt(matchId, 10), parseInt(req.user.id, 10));
         if (!match) return res.status(404).json({ error: 'Match not found' });
 
         console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=driver action=confirm_share`);
@@ -2745,7 +2745,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
               AND id <> ?
               AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER') 
         `;
-        const activeConsents = await db.all(existingConsentSql, req.user.id, matchId);
+        const activeConsents = await db.all(existingConsentSql, parseInt(req.user.id, 10), parseInt(matchId, 10));
 
         // Manual filter to account for extensions dynamically
         const lockedConsents = activeConsents.filter(c => {
@@ -2765,11 +2765,11 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
 
         await db.run(
             'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
-            now, now, matchId
+            now, now, parseInt(matchId, 10)
         );
         console.log(`[ConsentFlow] driver_share_consent_at set`);
 
-        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
         let finalStatus = updated.status;
         let ticketId = updated.ticket_id || null;
 
@@ -2781,7 +2781,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_COMPANY';
-            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
+            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
             console.log(`[ConsentFlow] status changed to SHARE_PENDING_COMPANY`);
         }
 
@@ -2823,7 +2823,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             SELECT id FROM potential_matches 
             WHERE driver_id = ? AND id <> ? 
               AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')
-        `, match.driver_id, matchId);
+        `, parseInt(match.driver_id, 10), parseInt(matchId, 10));
         
         if (conflict) {
             console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already locked by match=${conflict.id}`);
@@ -2835,7 +2835,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
 
         await db.run(
             'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
-            now, now, matchId
+            now, now, parseInt(matchId, 10)
         );
         console.log(`[ConsentFlow] company_share_consent_at set`);
 
@@ -2845,7 +2845,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             const conflict = await db.get(`
                 SELECT id FROM potential_matches 
                 WHERE driver_id = ? AND id <> ? AND status = 'INFO_SHARED'
-            `, match.driver_id, matchId);
+            `, parseInt(match.driver_id, 10), parseInt(matchId, 10));
             
             if (conflict) {
                 console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already exclusive with match=${conflict.id}`);
@@ -2856,7 +2856,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             }
         }
 
-        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
+        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
         let finalStatus = updated.status;
         let ticketId = updated.ticket_id || null;
 
@@ -2868,7 +2868,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_DRIVER';
-            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, matchId);
+            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
             console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
         }
 
