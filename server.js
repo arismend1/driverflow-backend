@@ -2658,9 +2658,19 @@ const updateMatchStatus = async (req, res, newStatus) => {
 
 const finalizeShare = async (matchId) => {
     const now = new Date().toISOString();
+    const match = await db.get('SELECT driver_id FROM potential_matches WHERE id = ?', matchId);
+    if (!match) return;
+
+    // 1. Mark winning match as shared
     await db.run(
         "UPDATE potential_matches SET status = 'INFO_SHARED', info_shared_at = ?, updated_at = ? WHERE id = ?",
         now, now, matchId
+    );
+
+    // 2. Proactively close competing handshakes (Neutral terminal state: CLOSED)
+    await db.run(
+        "UPDATE potential_matches SET status = 'CLOSED', updated_at = ? WHERE driver_id = ? AND id <> ? AND status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')",
+        now, match.driver_id, matchId
     );
 };
 
@@ -2733,7 +2743,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             FROM potential_matches 
             WHERE driver_id = ? 
               AND id <> ?
-              AND status IN ('SHARE_PENDING_COMPANY', 'INFO_SHARED') 
+              AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER') 
         `;
         const activeConsents = await db.all(existingConsentSql, req.user.id, matchId);
 
