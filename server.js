@@ -2710,7 +2710,12 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
 
         console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=driver action=confirm_share`);
 
-        const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
+        // Idempotency guard: If already shared, just return current state
+        if (match.status === 'INFO_SHARED') {
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        }
+
+        const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
         if (!validDriverStates.includes(match.status)) {
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
@@ -2791,7 +2796,12 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
 
         console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=company action=confirm_share`);
 
-        const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY', 'INFO_SHARED'];
+        // Idempotency guard: If already shared, just return current state
+        if (match.status === 'INFO_SHARED') {
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        }
+
+        const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
         if (!validCompanyStates.includes(match.status)) {
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
@@ -2991,7 +3001,8 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
             'migrate_lead_source.js',
             'migrate_lead_funnel_events.js',
             'migrate_phase6_driver_profile.js',
-            'migrate_phase6_production_fix.js'
+            'migrate_phase6_production_fix.js',
+            'migrate_fix_duplicate_tickets.js'
         ];
 
         for (const m of featureMigrations) {
