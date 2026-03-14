@@ -2735,7 +2735,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         const EXCLUSIVE_HOURS = 72;
 
         const hoursElapsedSQL = db.IS_POSTGRES
-            ? "EXTRACT(EPOCH FROM (NOW() - driver_share_consent_at)) / 3600"
+            ? "EXTRACT(EPOCH FROM (NOW() - driver_share_consent_at::timestamp)) / 3600"
             : "CAST(strftime('%s', 'now') - strftime('%s', driver_share_consent_at) AS INTEGER) / 3600";
 
         let existingConsentSql = `
