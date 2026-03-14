@@ -107,16 +107,58 @@ function computeScore(co, dr) {
 async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
     try {
         const existing = await db.get(
-            'SELECT id, status FROM potential_matches WHERE company_id = ? AND driver_id = ?',
+            'SELECT id, status, resolution_company, resolution_driver, ticket_id FROM potential_matches WHERE company_id = ? AND driver_id = ?',
             companyId, driverId
         );
+
         if (existing && ['DECLINED', 'EXPIRED'].includes(existing.status)) {
-            console.log('[Funnel] skipped match_generated because match already existed');
+            console.log('[Funnel] skipped because match is terminal (DECLINED/EXPIRED)');
+            return 'skipped';
+        }
+
+        // 1. Safety Rule: Do not revive if there was a manual rejection or if a historical ticket already exists
+        if (existing && (
+            (existing.status === 'CLOSED' && (existing.resolution_company || existing.resolution_driver)) ||
+            existing.ticket_id != null
+        )) {
+            console.log('[Funnel] skipped because match was manually rejected or has ticket history');
             return 'skipped';
         }
 
         if (existing) {
-            console.log('[Funnel] skipped match_generated because match already existed');
+            const isProactivelyClosed = (existing.status === 'CLOSED');
+            const wasHiredElsewhere = (existing.status === 'HIRED_ELSEWHERE');
+
+            if (isProactivelyClosed || wasHiredElsewhere) {
+                // 2. Driver Availability Rule: search_status must be ON
+                const driver = await db.get('SELECT search_status FROM drivers WHERE id = ?', driverId);
+
+                if (driver && driver.search_status === 'ON') {
+                    // 3. Freedom Check Rule: Do not interfere with active processes
+                    const freedomCheck = await db.get(`
+                        SELECT id FROM potential_matches 
+                        WHERE driver_id = ? AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
+                        LIMIT 1
+                    `, driverId);
+
+                    if (!freedomCheck) {
+                        console.log(`[Funnel] reviving match ${existing.id} to NEW`);
+                        await db.run(
+                            `UPDATE potential_matches 
+                             SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
+                                 driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
+                                 driver_share_consent_at = NULL, company_share_consent_at = NULL,
+                                 info_shared_at = NULL, resolution_company = NULL, resolution_driver = NULL,
+                                 exclusivity_extension_hours = 0
+                             WHERE id = ?`,
+                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                        );
+                        return 'inserted';
+                    }
+                }
+            }
+
+            console.log('[Funnel] updating score for existing match');
             await db.run(
                 'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
                 score, JSON.stringify(breakdown), nowStr, existing.id
