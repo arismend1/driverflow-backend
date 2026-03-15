@@ -142,9 +142,19 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
 
                 if (driver && driver.search_status === 'ON') {
                     // 3. Freedom Check Rule: Do not interfere with active processes
+                    // Exclusivity window: 72 hours base + dynamic extensions
+                    const EXCLUSIVE_HOURS = 72;
+                    const hoursElapsedSQL = db.IS_POSTGRES
+                        ? "EXTRACT(EPOCH FROM (NOW() - info_shared_at::timestamp)) / 3600"
+                        : "CAST(strftime('%s', 'now') - strftime('%s', info_shared_at) AS INTEGER) / 3600";
+
                     const freedomCheck = await db.get(`
                         SELECT id FROM potential_matches 
-                        WHERE driver_id = ? AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
+                        WHERE driver_id = ? 
+                          AND (
+                            status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
+                            OR (status = 'INFO_SHARED' AND (${hoursElapsedSQL} < (${EXCLUSIVE_HOURS} + COALESCE(exclusivity_extension_hours, 0))))
+                          )
                         LIMIT 1
                     `, driverId);
 
