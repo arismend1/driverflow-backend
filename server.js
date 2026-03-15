@@ -2427,10 +2427,15 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
         `, ...scopeIds);
 
         const sanitized = rows.map(r => {
-            if (r.status !== 'INFO_SHARED') {
+            if (r.status !== 'INFO_SHARED' && r.status !== 'HIRED') {
+                const dId = String(r.driver_id || r.id);
+                const shortId = dId.slice(-4).toUpperCase();
+
                 // Hide all contact + expanded profile info for non-shared matches
                 return {
                     ...r,
+                    display_name: `Driver #${shortId}`,
+                    driver_name: null, // Hard block redundant real name
                     driver_email: null,
                     driver_phone: null,
                     driver_city: null,
@@ -2586,7 +2591,13 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
 
             const cleanRow = { ...r, op_types: opTypes, pay_methods: payMethods, score_breakdown: breakdown };
 
-            if (cleanRow.status !== 'INFO_SHARED') {
+            if (cleanRow.status !== 'INFO_SHARED' && cleanRow.status !== 'HIRED') {
+                const cId = String(cleanRow.company_id || cleanRow.id);
+                const shortId = cId.slice(-4).toUpperCase();
+                
+                cleanRow.display_name = `Company #${shortId}`;
+                cleanRow.company_name = null; // Hard block redundant real name
+                
                 cleanRow.company_email = null;
                 cleanRow.city = 'Location Hidden';
                 cleanRow.address_state = 'TBD';
