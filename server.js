@@ -674,13 +674,13 @@ app.post('/register', async (req, res) => {
             // Empresas: Create UNVERIFIED (false/0)
             if (db.IS_POSTGRES) {
                 // Postgres: email, contacto, telefono, verify_token_hash, etc.
-                const result = await db.run(`INSERT INTO empresas (nombre, email, contacto, telefono, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verify_token_hash, verify_token_expires_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,false,'ACTIVE',?,?,?) RETURNING id`,
-                    nombre, contacto, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
+                const result = await db.run(`INSERT INTO empresas (nombre, email, contacto, telefono, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verify_token_hash, verify_token_expires_at, created_at, contact_person, contact_phone) VALUES (?,?,?,?,?,?,?,?,?,false,'ACTIVE',?,?,?,?,?) RETURNING id`,
+                    nombre, contacto, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '', extras.contact_phone || phone);
                 newId = result.rows ? result.rows[0].id : (result.id || result.lastInsertRowid);
             } else {
                 // SQLite: contacto, contact_phone, verification_token, etc.
-                const result = await db.run(`INSERT INTO empresas (nombre, contacto, contact_phone, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verification_token, verification_expires, created_at) VALUES (?,?,?,?,?,?,?,?,0,'ACTIVE',?,?,?)`,
-                    nombre, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now);
+                const result = await db.run(`INSERT INTO empresas (nombre, contacto, contact_phone, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verification_token, verification_expires, created_at, contact_person) VALUES (?,?,?,?,?,?,?,?,0,'ACTIVE',?,?,?,?)`,
+                    nombre, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '');
                 newId = result.lastInsertRowid;
             }
 
@@ -1525,7 +1525,7 @@ const updateCompanyRequirements = async (req, res) => {
         req_modalities, req_truck, offered_payment_methods, req_relationships,
         availability, req_experience_years,
         pay_per_mile_min, pay_per_mile_max, company_logo, company_bio, requires_travel_interview,
-        home_time, offered_freight_types
+        home_time, offered_freight_types, contact_person, contact_phone
     } = req.body;
 
     const safeJson = (val) => Array.isArray(val) ? JSON.stringify(val) : (typeof val === 'string' ? val : JSON.stringify(val || []));
@@ -1598,8 +1598,8 @@ const updateCompanyRequirements = async (req, res) => {
         }
         await db.run(sql, ...params);
 
-        // Update company logo and bio in empresas table
-        if (company_logo !== undefined || company_bio !== undefined) {
+        // Update company fields in empresas table
+        if (company_logo !== undefined || company_bio !== undefined || contact_person !== undefined || contact_phone !== undefined) {
             let empSql = 'UPDATE empresas SET ';
             let empParams = [];
             if (company_logo !== undefined) {
@@ -1609,6 +1609,14 @@ const updateCompanyRequirements = async (req, res) => {
             if (company_bio !== undefined) {
                 empSql += 'company_bio = ?, ';
                 empParams.push(company_bio);
+            }
+            if (contact_person !== undefined) {
+                empSql += 'contact_person = ?, ';
+                empParams.push(contact_person);
+            }
+            if (contact_phone !== undefined) {
+                empSql += 'contact_phone = ?, ';
+                empParams.push(contact_phone);
             }
             empSql = empSql.slice(0, -2); // remove last comma
             empSql += ' WHERE id = ?';
