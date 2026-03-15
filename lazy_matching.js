@@ -108,7 +108,7 @@ function computeScore(co, dr) {
 async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
     try {
         const existing = await db.get(
-            'SELECT id, status, resolution_company, resolution_driver, ticket_id FROM potential_matches WHERE company_id = ? AND driver_id = ?',
+            'SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at FROM potential_matches WHERE company_id = ? AND driver_id = ?',
             companyId, driverId
         );
 
@@ -117,12 +117,14 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             return 'skipped';
         }
 
-        // 1. Safety Rule: Do not revive if there was a manual rejection or if a historical ticket already exists
+        // 1. Safety Rule: Do not revive if there was a manual rejection, if a historical ticket already exists, 
+        // or if the pair already reached INFO_SHARED (permanent block for audit/billing integrity).
         if (existing && (
             (existing.status === 'CLOSED' && (existing.resolution_company || existing.resolution_driver)) ||
-            existing.ticket_id != null
+            existing.ticket_id != null ||
+            existing.info_shared_at != null
         )) {
-            console.log('[Funnel] skipped because match was manually rejected or has ticket history');
+            console.log('[Funnel] skipped because match was manually rejected, has ticket history, or reached INFO_SHARED');
             return 'skipped';
         }
 
@@ -163,7 +165,7 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
                                  SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
                                      driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
                                      driver_share_consent_at = NULL, company_share_consent_at = NULL,
-                                     info_shared_at = NULL, resolution_company = NULL, resolution_driver = NULL,
+                                     resolution_company = NULL, resolution_driver = NULL,
                                      exclusivity_extension_hours = 0
                                  WHERE id = ?`,
                                 score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
