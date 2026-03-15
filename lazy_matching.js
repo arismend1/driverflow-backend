@@ -18,6 +18,7 @@ const { trackLeadFunnelEvent } = require('./analytics');
 
 const MATCH_MAX_GENERATE = parseInt(process.env.MATCH_MAX_GENERATE) || 20;
 const MATCH_MIN_ACTIVE = parseInt(process.env.MATCH_MIN_ACTIVE) || 5;
+const MATCH_FRESH_HOURS = parseInt(process.env.MATCH_FRESH_HOURS) || 24;
 const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
 const CANDIDATE_POOL_EXPAND = parseInt(process.env.CANDIDATE_POOL_EXPAND) || 400;
 const MIN_SCORE = 0.2;
@@ -129,7 +130,11 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             const isProactivelyClosed = (existing.status === 'CLOSED');
             const wasHiredElsewhere = (existing.status === 'HIRED_ELSEWHERE');
 
-            if (isProactivelyClosed || wasHiredElsewhere) {
+            // BugFix: Also identify matches in an active state but older than the visibility window
+            const isStaleActive = ['NEW', 'VIEWED', 'CONTACTED', 'ACCEPTED'].includes(existing.status) &&
+                (new Date() - new Date(existing.created_at) > MATCH_FRESH_HOURS * 3600 * 1000);
+
+            if (isProactivelyClosed || wasHiredElsewhere || isStaleActive) {
                 // 2. Driver Availability Rule: search_status must be ON
                 const driver = await db.get('SELECT search_status FROM drivers WHERE id = ?', driverId);
 
@@ -142,18 +147,29 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
                     `, driverId);
 
                     if (!freedomCheck) {
-                        console.log(`[Funnel] reviving match ${existing.id} to NEW`);
-                        await db.run(
-                            `UPDATE potential_matches 
-                             SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
-                                 driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
-                                 driver_share_consent_at = NULL, company_share_consent_at = NULL,
-                                 info_shared_at = NULL, resolution_company = NULL, resolution_driver = NULL,
-                                 exclusivity_extension_hours = 0
-                             WHERE id = ?`,
-                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
-                        );
-                        return 'inserted';
+                        if (isStaleActive) {
+                            console.log(`[Funnel] refreshing stale active match ${existing.id}`);
+                            await db.run(
+                                `UPDATE potential_matches 
+                                 SET match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?
+                                 WHERE id = ?`,
+                                score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                            );
+                            return 'updated';
+                        } else {
+                            console.log(`[Funnel] reviving match ${existing.id} to NEW`);
+                            await db.run(
+                                `UPDATE potential_matches 
+                                 SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
+                                     driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
+                                     driver_share_consent_at = NULL, company_share_consent_at = NULL,
+                                     info_shared_at = NULL, resolution_company = NULL, resolution_driver = NULL,
+                                     exclusivity_extension_hours = 0
+                                 WHERE id = ?`,
+                                score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                            );
+                            return 'inserted';
+                        }
                     }
                 }
             }
