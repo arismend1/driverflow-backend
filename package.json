@@ -12,7 +12,8 @@
     "migrate": "node migrate_auth_fix.js",
     "test": "node --test \"tests/**/*.test.js\"",
     "test:match": "node --test tests/match_confirmed.test.js",
-    "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\""
+    "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\"",
+    "start:optionb": "node opcionb/http_server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
