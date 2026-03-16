@@ -1357,10 +1357,10 @@ app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
         const offset = parseInt(req.query.offset) || 0;
 
         const rows = await db.all(`
-            SELECT id, week_start, week_end, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
+            SELECT id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method 
             FROM invoices 
             WHERE company_id=? 
-            ORDER BY week_start DESC 
+            ORDER BY issue_date DESC 
             LIMIT ? OFFSET ?
         `, req.user.id, limit, offset);
         res.json(rows || []);
@@ -1374,7 +1374,7 @@ app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
     try {
         const inv = await db.get(`
-            SELECT id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
+            SELECT id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method 
             FROM invoices 
             WHERE id=? AND company_id=?
         `, req.params.id, req.user.id);
@@ -1425,10 +1425,10 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
                 price_data: {
                     currency: (invoice.currency || 'usd').toLowerCase(),
                     product_data: {
-                        name: `Weekly Invoice (${invoice.week_start} - ${invoice.week_end})`,
+                        name: `Weekly Invoice (${invoice.billing_week})`,
                         description: `Usage for Company #${invoice.company_id}`
                     },
-                    unit_amount: invoice.amount_cents
+                    unit_amount: invoice.total_cents
                 },
                 quantity: 1
             }],
