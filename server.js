@@ -1990,9 +1990,10 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
             FROM tickets t
             LEFT JOIN empresas e ON t.company_id = e.id
             LEFT JOIN drivers d ON t.driver_id = d.id
+            JOIN potential_matches pm ON t.match_id = pm.id
         `;
         if (isEmpresa) {
-            sql += ` WHERE t.company_id = ?`;
+            sql += ` WHERE t.company_id = ? AND pm.status = 'HIRED'`;
         } else {
             return res.status(403).json({ error: 'Forbidden' });
         }
