@@ -250,16 +250,41 @@ const handlers = {
             const PRICE_PER_TICKET_CENTS = 15000;
             const amount = total * PRICE_PER_TICKET_CENTS;
 
-            // 3. Insert Invoice (Idempotent: Skip if exists)
+            // 3. Insert Invoice (Idempotent by uniqueness constraints, though we should ideally use ON CONFLICT)
             try {
-                await db.run(`INSERT INTO invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
-                    company_id, week_start, week_end, total, drivers, amount, nowIso());
+                const billing_week = `${week_start} to ${week_end}`;
+                
+                // Calculate due date (7 days from now)
+                const issueDate = new Date();
+                const dueDate = new Date(issueDate);
+                dueDate.setDate(dueDate.getDate() + 7);
+                
+                await db.run(
+                    `INSERT INTO invoices (
+                        company_id, 
+                        billing_week, 
+                        issue_date, 
+                        due_date, 
+                        subtotal_cents, 
+                        total_cents, 
+                        currency, 
+                        status, 
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?)`,
+                    company_id, 
+                    billing_week, 
+                    issueDate.toISOString(), 
+                    dueDate.toISOString(), 
+                    amount, 
+                    amount, 
+                    nowIso()
+                );
 
                 logger.info(`[Billing] Created New Invoice`);
 
                 // 4. Emit Event usage only on creation
                 await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                    'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ week_start, week_end, total, amount, currency: 'USD' }));
+                    'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ billing_week, total_requests: total, amount, currency: 'USD' }));
 
             } catch (e) {
                 if (e.message.includes('UNIQUE') || e.message.includes('constraint')) {
