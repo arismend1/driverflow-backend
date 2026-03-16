@@ -458,17 +458,9 @@ const handlers = {
 
             await db.run(`
                 UPDATE invoices 
-                SET status=?, 
-                    failure_reason=?, 
-                    last_error_code=?, 
-                    last_error_message=?, 
-                    attempt_count=?, 
-                    last_attempt_at=?, 
-                    next_retry_at=?, 
-                    suspended_at=?,
-                    updated_at=? 
+                SET status=? 
                 WHERE id=?
-            `, nextStatus, reason, stripeCode, reason, newAttemptCount, nowIso(), nextRetryAt, suspendedAt, nowIso(), invoice.id);
+            `, nextStatus, invoice.id);
 
             // Audit
             await db.run(`
@@ -685,19 +677,13 @@ async function startQueueWorker() {
             const querySelect = `
                 SELECT id FROM invoices 
                 WHERE status IN ('failed', 'retrying') 
-                AND next_retry_at IS NOT NULL 
-                AND next_retry_at <= ?
             `;
             console.log("[Scheduler][Dunning] Executing query:", querySelect);
-            const invoices = await db.all(querySelect, nowIso());
+            const invoices = await db.all(querySelect);
 
             for (const inv of invoices) {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
                 await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
-                // We clear next_retry_at temporarily to avoid duplicate queueing in the same hour if job is delayed
-                const queryUpdate = "UPDATE invoices SET next_retry_at=NULL WHERE id=?";
-                console.log("[Scheduler][Dunning] Executing query:", queryUpdate);
-                await db.run(queryUpdate, inv.id);
             }
             if (invoices.length > 0) logger.info(`[Dunning] Enqueued ${invoices.length} invoices for retry.`);
         } catch (err) {
