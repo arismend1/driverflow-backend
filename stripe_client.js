@@ -27,8 +27,9 @@ function getStripe() {
                         const pairs = [];
                         for (const key in obj) {
                             const val = obj[key];
+                            if (val === undefined || val === null) continue;
                             const newKey = prefix ? `${prefix}[${key}]` : key;
-                            if (val && typeof val === 'object') {
+                            if (typeof val === 'object') {
                                 pairs.push(...toForm(val, newKey));
                             } else {
                                 pairs.push(`${encodeURIComponent(newKey)}=${encodeURIComponent(val)}`);
