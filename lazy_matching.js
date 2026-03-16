@@ -136,52 +136,55 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             const isStaleActive = ['NEW', 'VIEWED', 'CONTACTED', 'ACCEPTED'].includes(existing.status) &&
                 (new Date() - new Date(existing.created_at) > MATCH_FRESH_HOURS * 3600 * 1000);
 
+            // 2. Freedom Check Rule: Do not interfere with active processes
+            // Exclusivity window: 72 hours base + dynamic extensions
+            const EXCLUSIVE_HOURS = 72;
+            const hoursElapsedSQL = db.IS_POSTGRES
+                ? "EXTRACT(EPOCH FROM (NOW() - info_shared_at::timestamp)) / 3600"
+                : "CAST(strftime('%s', 'now') - strftime('%s', info_shared_at) AS INTEGER) / 3600";
+
+            const freedomCheck = await db.get(`
+                SELECT id FROM potential_matches 
+                WHERE driver_id = ? 
+                  AND (
+                    status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
+                    OR (status = 'INFO_SHARED' AND (${hoursElapsedSQL} < (${EXCLUSIVE_HOURS} + COALESCE(exclusivity_extension_hours, 0))))
+                  )
+                LIMIT 1
+            `, driverId);
+
             if (isProactivelyClosed || wasHiredElsewhere || isStaleActive) {
-                // 2. Driver Availability Rule: search_status must be ON
+                if (freedomCheck) {
+                    console.log(`[Funnel] match revival skipped: driver #${driverId} is busy`);
+                    return 'skipped';
+                }
+
+                // 3. Driver Availability Rule: search_status must be ON
                 const driver = await db.get('SELECT search_status FROM drivers WHERE id = ?', driverId);
 
                 if (driver && driver.search_status === 'ON') {
-                    // 3. Freedom Check Rule: Do not interfere with active processes
-                    // Exclusivity window: 72 hours base + dynamic extensions
-                    const EXCLUSIVE_HOURS = 72;
-                    const hoursElapsedSQL = db.IS_POSTGRES
-                        ? "EXTRACT(EPOCH FROM (NOW() - info_shared_at::timestamp)) / 3600"
-                        : "CAST(strftime('%s', 'now') - strftime('%s', info_shared_at) AS INTEGER) / 3600";
-
-                    const freedomCheck = await db.get(`
-                        SELECT id FROM potential_matches 
-                        WHERE driver_id = ? 
-                          AND (
-                            status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
-                            OR (status = 'INFO_SHARED' AND (${hoursElapsedSQL} < (${EXCLUSIVE_HOURS} + COALESCE(exclusivity_extension_hours, 0))))
-                          )
-                        LIMIT 1
-                    `, driverId);
-
-                    if (!freedomCheck) {
-                        if (isStaleActive) {
-                            console.log(`[Funnel] refreshing stale active match ${existing.id}`);
-                            await db.run(
-                                `UPDATE potential_matches 
-                                 SET match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?
-                                 WHERE id = ?`,
-                                score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
-                            );
-                            return 'updated';
-                        } else {
-                            console.log(`[Funnel] reviving match ${existing.id} to NEW`);
-                            await db.run(
-                                `UPDATE potential_matches 
-                                 SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
-                                     driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
-                                     driver_share_consent_at = NULL, company_share_consent_at = NULL,
-                                     resolution_company = NULL, resolution_driver = NULL,
-                                     exclusivity_extension_hours = 0
-                                 WHERE id = ?`,
-                                score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
-                            );
-                            return 'inserted';
-                        }
+                    if (isStaleActive) {
+                        console.log(`[Funnel] refreshing stale active match ${existing.id}`);
+                        await db.run(
+                            `UPDATE potential_matches 
+                             SET match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?
+                             WHERE id = ?`,
+                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                        );
+                        return 'updated';
+                    } else {
+                        console.log(`[Funnel] reviving match ${existing.id} to NEW`);
+                        await db.run(
+                            `UPDATE potential_matches 
+                             SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
+                                 driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
+                                 driver_share_consent_at = NULL, company_share_consent_at = NULL,
+                                 resolution_company = NULL, resolution_driver = NULL,
+                                 exclusivity_extension_hours = 0
+                             WHERE id = ?`,
+                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                        );
+                        return 'inserted';
                     }
                 }
             }
@@ -193,6 +196,27 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             );
             return 'updated';
         } else {
+            // New match insertion path also requires Freedom Check
+            const EXCLUSIVE_HOURS = 72;
+            const hoursElapsedSQL = db.IS_POSTGRES
+                ? "EXTRACT(EPOCH FROM (NOW() - info_shared_at::timestamp)) / 3600"
+                : "CAST(strftime('%s', 'now') - strftime('%s', info_shared_at) AS INTEGER) / 3600";
+
+            const freedomCheck = await db.get(`
+                SELECT id FROM potential_matches 
+                WHERE driver_id = ? 
+                  AND (
+                    status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER', 'HIRED')
+                    OR (status = 'INFO_SHARED' AND (${hoursElapsedSQL} < (${EXCLUSIVE_HOURS} + COALESCE(exclusivity_extension_hours, 0))))
+                  )
+                LIMIT 1
+            `, driverId);
+
+            if (freedomCheck) {
+                console.log(`[Funnel] match insertion skipped: driver #${driverId} is busy`);
+                return 'skipped';
+            }
+
             console.log('[Funnel] attempting match_generated');
             await db.run(
                 `INSERT INTO potential_matches (company_id, driver_id, match_score, score_breakdown, status, created_at)
