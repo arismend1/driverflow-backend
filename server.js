@@ -1443,8 +1443,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
         }, { idempotencyKey });
 
         // Save reference for tracking
-        await db.run("UPDATE invoices SET stripe_checkout_session_id=?, updated_at=? WHERE id=?",
-            session.id, nowIso(), invoice.id);
+        await db.run("UPDATE invoices SET updated_at=? WHERE id=?", nowIso(), invoice.id);
 
         res.json({ ok: true, url: session.url, session_id: session.id });
 
