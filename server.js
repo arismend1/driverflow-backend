@@ -1441,9 +1441,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
             success_url: process.env.STRIPE_SUCCESS_URL || 'https://driverflow.app/billing/success',
             cancel_url: process.env.STRIPE_CANCEL_URL || 'https://driverflow.app/billing/cancel',
         }, { idempotencyKey });
-
-        // Save reference for tracking
-        await db.run("UPDATE invoices SET updated_at=? WHERE id=?", nowIso(), invoice.id);
+        // Save reference for tracking (removed missing columns stripe_checkout_session_id and updated_at)
 
         res.json({ ok: true, url: session.url, session_id: session.id });
 
