@@ -160,7 +160,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             if (invoiceId) {
                 // Direct Reconciliation (Worker Originated)
                 await db.run(`
-                    UPDATE weekly_invoices 
+                    UPDATE invoices 
                     SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
                     WHERE id=$6 AND status != 'charged'
                 `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
@@ -169,7 +169,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             } else {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
                 await db.run(`
-                    UPDATE weekly_invoices 
+                    UPDATE invoices 
                     SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
                     WHERE stripe_payment_intent_id=$5 AND status != 'charged'
                 `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
@@ -1069,7 +1069,7 @@ app.get('/admin/invoices', async (req, res) => {
     try {
         const rows = await db.all(`
             SELECT w.*, c.nombre as company_name 
-            FROM weekly_invoices w 
+            FROM invoices w 
             LEFT JOIN empresas c ON w.company_id = c.id 
             ORDER BY w.week_start DESC 
             LIMIT 100
@@ -1161,7 +1161,7 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
     const invoiceId = req.params.id;
 
     try {
-        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        const invoice = await db.get("SELECT * FROM invoices WHERE id = ?", invoiceId);
         if (!invoice) return res.status(404).json({ error: 'Not Found' });
 
         if (['charged', 'charging', 'suspended'].includes(invoice.status)) {
@@ -1169,7 +1169,7 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
         }
 
         // Set to retrying and reset next_retry_at to now for immediate pickup by Dunning loop or direct queue
-        await db.run("UPDATE weekly_invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await db.run("UPDATE invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
 
         const { enqueueJob } = require('./worker_queue');
         await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
@@ -1192,12 +1192,12 @@ app.post('/admin/invoices/:id/suspend', async (req, res) => {
     const invoiceId = req.params.id;
 
     try {
-        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        const invoice = await db.get("SELECT * FROM invoices WHERE id = ?", invoiceId);
         if (!invoice) return res.status(404).json({ error: 'Not Found' });
 
         if (invoice.status === 'charged') return res.status(400).json({ error: 'Cannot suspend a charged invoice' });
 
-        await db.run("UPDATE weekly_invoices SET status='suspended', suspended_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await db.run("UPDATE invoices SET status='suspended', suspended_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
         await auditLog('invoice_suspended_manual', 'admin', invoiceId, {}, req);
 
         res.json({ ok: true, message: 'Invoice suspended manually' });
@@ -1215,13 +1215,13 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
     const invoiceId = req.params.id;
 
     try {
-        const invoice = await db.get("SELECT * FROM weekly_invoices WHERE id = ?", invoiceId);
+        const invoice = await db.get("SELECT * FROM invoices WHERE id = ?", invoiceId);
         if (!invoice) return res.status(404).json({ error: 'Not Found' });
 
         if (invoice.status !== 'suspended') return res.status(400).json({ error: `Invoice is not suspended (Status: ${invoice.status})` });
 
         // Set to failed/retrying with next_retry_at to NOW() so Dunning loop can pick it up
-        await db.run("UPDATE weekly_invoices SET status='retrying', suspended_at=NULL, next_retry_at=?, attempt_count=0, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await db.run("UPDATE invoices SET status='retrying', suspended_at=NULL, next_retry_at=?, attempt_count=0, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
 
         // Also enqueue it immediately just in case
         const { enqueueJob } = require('./worker_queue');
@@ -1358,7 +1358,7 @@ app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
 
         const rows = await db.all(`
             SELECT id, week_start, week_end, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
-            FROM weekly_invoices 
+            FROM invoices 
             WHERE company_id=? 
             ORDER BY week_start DESC 
             LIMIT ? OFFSET ?
@@ -1375,7 +1375,7 @@ app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
     try {
         const inv = await db.get(`
             SELECT id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at, updated_at, stripe_payment_intent_id, receipt_url 
-            FROM weekly_invoices 
+            FROM invoices 
             WHERE id=? AND company_id=?
         `, req.params.id, req.user.id);
 
@@ -1395,7 +1395,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
     try {
         const invoice = await db.get(`
             SELECT w.*, c.stripe_customer_id 
-            FROM weekly_invoices w 
+            FROM invoices w 
             JOIN empresas c ON w.company_id = c.id 
             WHERE w.id=? AND w.company_id=?
         `, invId, req.user.id);
@@ -1443,7 +1443,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
         }, { idempotencyKey });
 
         // Save reference for tracking
-        await db.run("UPDATE weekly_invoices SET stripe_checkout_session_id=?, updated_at=? WHERE id=?",
+        await db.run("UPDATE invoices SET stripe_checkout_session_id=?, updated_at=? WHERE id=?",
             session.id, nowIso(), invoice.id);
 
         res.json({ ok: true, url: session.url, session_id: session.id });

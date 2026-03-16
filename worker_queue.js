@@ -252,7 +252,7 @@ const handlers = {
 
             // 3. Insert Invoice (Idempotent: Skip if exists)
             try {
-                await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
+                await db.run(`INSERT INTO invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
                     company_id, week_start, week_end, total, drivers, amount, nowIso());
 
                 logger.info(`[Billing] Created New Invoice`);
@@ -290,9 +290,9 @@ const handlers = {
         // Support payload flexibility if rescheduled
         let invoice;
         if (invoice_id) {
-            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.id = ?", invoice_id);
+            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.id = ?", invoice_id);
         } else if (payload.company_id && payload.week_start) {
-            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM weekly_invoices w JOIN companies c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?", payload.company_id, payload.week_start);
+            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?", payload.company_id, payload.week_start);
         }
 
         if (!invoice) {
@@ -312,14 +312,14 @@ const handlers = {
         // Lock the row to prevent race conditions during retry/processing
         // Using basic optimistic update 
         const lockRes = await db.run(`
-            UPDATE weekly_invoices 
+            UPDATE invoices 
             SET status='charging', updated_at=? 
             WHERE id=? AND status IN ('pending', 'retrying', 'failed')
         `, nowIso(), invoice.id);
 
         // Verification mechanism compatible with sqlite/pg adapter abstraction. 
         // We fetch again to confirm if we locked it (in generic adapters where CHANGES isn't universally surfaced)
-        const lockedInvoice = await db.get("SELECT status FROM weekly_invoices WHERE id=?", invoice.id);
+        const lockedInvoice = await db.get("SELECT status FROM invoices WHERE id=?", invoice.id);
         if (!lockedInvoice || lockedInvoice.status !== 'charging') {
             logger.warn(`${logPrefix} Failed to lock invoice for charging. Race condition avoided.`);
             return;
@@ -329,13 +329,13 @@ const handlers = {
         if (!invoice.stripe_customer_id) {
             const err = "Missing stripe_customer_id";
             logger.error(`${logPrefix} ${err}`);
-            await db.run("UPDATE weekly_invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", err, nowIso(), invoice.id);
+            await db.run("UPDATE invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", err, nowIso(), invoice.id);
             return;
         }
 
         if (invoice.amount_cents <= 0) {
             logger.info(`${logPrefix} Auto-closing $0 invoice`);
-            await db.run("UPDATE weekly_invoices SET status='charged', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
+            await db.run("UPDATE invoices SET status='charged', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
             return;
         }
 
@@ -378,7 +378,7 @@ const handlers = {
             // Save PI ID immediately if new to allow robust inverse reconciliation in Webhook
             if (!invoice.stripe_payment_intent_id && paymentIntent.id) {
                 await db.run(
-                    "UPDATE weekly_invoices SET stripe_payment_intent_id=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND stripe_payment_intent_id IS NULL",
+                    "UPDATE invoices SET stripe_payment_intent_id=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND stripe_payment_intent_id IS NULL",
                     paymentIntent.id, invoice.id
                 );
                 invoice.stripe_payment_intent_id = paymentIntent.id;
@@ -398,7 +398,7 @@ const handlers = {
             // Capture PI ID from error if available
             if (e.raw && e.raw.payment_intent) {
                 const piId = e.raw.payment_intent.id;
-                await db.run("UPDATE weekly_invoices SET stripe_payment_intent_id=? WHERE id=?", piId, invoice.id);
+                await db.run("UPDATE invoices SET stripe_payment_intent_id=? WHERE id=?", piId, invoice.id);
             }
             const reason = e.message || 'Unknown Stripe Error';
             let isDecline = false;
@@ -432,7 +432,7 @@ const handlers = {
             }
 
             await db.run(`
-                UPDATE weekly_invoices 
+                UPDATE invoices 
                 SET status=?, 
                     failure_reason=?, 
                     last_error_code=?, 
@@ -476,7 +476,7 @@ const handlers = {
             }
 
             await db.run(`
-                UPDATE weekly_invoices 
+                UPDATE invoices 
                 SET status='charged', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, 
                     stripe_charge_id=COALESCE(stripe_charge_id, ?), receipt_url=COALESCE(receipt_url, ?), updated_at=? 
                 WHERE id=?
@@ -638,7 +638,7 @@ async function startQueueWorker() {
     cron.schedule('0 14 * * 1', async () => {
         logger.info('[Scheduler] Starting Automatic Billing Execution...');
         try {
-            const invoices = await db.all("SELECT id FROM weekly_invoices WHERE status IN ('pending', 'failed') AND amount_cents > 0");
+            const invoices = await db.all("SELECT id FROM invoices WHERE status IN ('pending', 'failed') AND amount_cents > 0");
             for (const inv of invoices) {
                 await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
             }
@@ -658,7 +658,7 @@ async function startQueueWorker() {
             // Reintentar 'retrying' o 'failed' (si se forzó) que ya hayan pasado la barrera de tiempo.
             // SQLite/PG compatible timestamp string compare
             const querySelect = `
-                SELECT id FROM weekly_invoices 
+                SELECT id FROM invoices 
                 WHERE status IN ('failed', 'retrying') 
                 AND next_retry_at IS NOT NULL 
                 AND next_retry_at <= ?
@@ -670,7 +670,7 @@ async function startQueueWorker() {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
                 await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
                 // We clear next_retry_at temporarily to avoid duplicate queueing in the same hour if job is delayed
-                const queryUpdate = "UPDATE weekly_invoices SET next_retry_at=NULL WHERE id=?";
+                const queryUpdate = "UPDATE invoices SET next_retry_at=NULL WHERE id=?";
                 console.log("[Scheduler][Dunning] Executing query:", queryUpdate);
                 await db.run(queryUpdate, inv.id);
             }
