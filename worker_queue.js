@@ -239,7 +239,7 @@ const handlers = {
             const usage = await db.get(`
                 SELECT count(*) as cnt, count(distinct driver_id) as drv 
                 FROM tickets 
-                WHERE company_id = ? AND created_at >= ? AND created_at < ? AND billing_status != 'void'`,
+                WHERE company_id = ? AND created_at >= ? AND created_at < ? AND billing_status = 'billable'`,
                 company_id, start, endPlusOne
             );
 

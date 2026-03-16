@@ -2704,7 +2704,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
         try {
             const t = await db.run(
                 `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
-                 VALUES (?,?,?,?,?,'USD',?,'pending',?)
+                 VALUES (?,?,?,?,?,'USD',?,'hold',?)
                  RETURNING id`,
                 parseInt(matchId), companyId, driverId, amount, amount, now, `Match ID: ${matchId}`
             );
@@ -3008,11 +3008,14 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
         if (resolution === 'REJECTED') {
             await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE match_id = ? AND billing_status != 'billable'`, matchId);
             return res.json({ success: true, message: 'Match cerrado. Ya puede buscar otras opciones.', status: 'CLOSED' });
         }
 
         if (resolution === 'HIRED') {
             await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'billable' WHERE match_id = ?`, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE driver_id = (SELECT driver_id FROM potential_matches WHERE id = ?) AND match_id != ?`, matchId, matchId);
 
             // Turn off driver's search status
             await db.run(`UPDATE drivers SET search_status = 'OFF' WHERE id = ?`, match.driver_id);
