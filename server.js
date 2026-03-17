@@ -1425,7 +1425,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
         if (!stripe) return res.status(503).json({ error: 'Stripe Unavailable' });
 
         // Idempotency: avoid creating too many sessions for the same attempt
-        const idempotencyKey = `inv_checkout_${invoice.id}_${invoice.status}_${req.user.id}`;
+        const idempotencyKey = `inv_checkout_${invoice.id}_${Date.now()}`;
 
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
