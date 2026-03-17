@@ -251,22 +251,7 @@ app.use(express.urlencoded({ limit: '15mb', extended: true }));
 app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// --- 5.1 PUSH NOTIFICATIONS ---
-app.post('/api/push/register', authenticateToken, async (req, res) => {
-    const { token, platform } = req.body;
-    if (!token) return res.status(400).json({ error: 'Missing token' });
-    try {
-        await db.run(
-            `INSERT INTO push_tokens (user_id, token, platform) VALUES ($1, $2, $3) 
-             ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
-            req.user.id, token, platform || 'android'
-        );
-        res.json({ ok: true });
-    } catch (e) {
-        console.error('[PUSH_REGISTER_FAIL]', e.message);
-        res.status(500).json({ error: 'Failed to register token' });
-    }
-});
+
 
 app.get('/healthz', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.get('/readyz', async (req, res) => {
@@ -487,6 +472,23 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+// --- 5.1 PUSH NOTIFICATIONS ---
+app.post('/api/push/register', authenticateToken, async (req, res) => {
+    const { token, platform } = req.body;
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    try {
+        await db.run(
+            `INSERT INTO push_tokens (user_id, token, platform) VALUES ($1, $2, $3) 
+             ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
+            req.user.id, token, platform || 'android'
+        );
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('[PUSH_REGISTER_FAIL]', e.message);
+        res.status(500).json({ error: 'Failed to register token' });
+    }
+});
 
 function isStrongPassword(p) {
     if (!p || p.length < 8) return false;
