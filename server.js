@@ -130,9 +130,14 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         } catch (err) {
             // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
             if (err.code === '23505' || err.message.includes('UNIQUE')) {
-                return res.json({ received: true });
+                const existing = await db.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=$1`, event.id);
+                if (existing && existing.status === 'processed') {
+                    return res.json({ received: true });
+                }
+                // If pending/failed from a previous crash, fall through and retry processing
+            } else {
+                throw err;
             }
-            throw err;
         }
 
         // 3. Invoice Payment Interception
