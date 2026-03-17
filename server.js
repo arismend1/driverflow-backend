@@ -16,6 +16,7 @@ const logger = require('./logger');
 const { getStripe } = require('./stripe_client');
 const db = require('./db_adapter'); // NEW Unified Adapter
 const { trackLeadFunnelEvent } = require('./analytics');
+const { sendPush } = require('./notifications_service');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -214,6 +215,13 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     WHERE id=$2 AND status != 'charged'
                 `, nowIso(), invoiceId);
                 console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
+                
+                // --- HOOK: Push Notification ---
+                try {
+                    await sendPush(session.metadata.company_id, "Payment Received", "Payment received successfully");
+                } catch (pushErr) {
+                    console.error("[Stripe Webhook] Push fail:", pushErr.message);
+                }
             }
         }
 
@@ -242,6 +250,24 @@ app.use(express.urlencoded({ limit: '15mb', extended: true }));
 // Health Check
 app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// --- 5.1 PUSH NOTIFICATIONS ---
+app.post('/api/push/register', authenticateToken, async (req, res) => {
+    const { token, platform } = req.body;
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    try {
+        await db.run(
+            `INSERT INTO push_tokens (user_id, token, platform) VALUES ($1, $2, $3) 
+             ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
+            req.user.id, token, platform || 'android'
+        );
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('[PUSH_REGISTER_FAIL]', e.message);
+        res.status(500).json({ error: 'Failed to register token' });
+    }
+});
+
 app.get('/healthz', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.get('/readyz', async (req, res) => {
     let dbOk = false;
@@ -3038,6 +3064,13 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
                 SET status = 'HIRED_ELSEWHERE', updated_at = ? 
                 WHERE driver_id = ? AND id != ? AND status NOT IN ('CLOSED', 'REJECTED', 'HIRED', 'HIRED_ELSEWHERE')
             `, now, match.driver_id, matchId);
+
+            // --- HOOK: Push Notification ---
+            try {
+                await sendPush(match.company_id, "Driver Hired", "You have hired a new driver");
+            } catch (pushErr) {
+                console.error("[RESOLVE_MATCH] Push fail:", pushErr.message);
+            }
 
             return res.json({ success: true, message: '¡Felicidades por la contratación!', status: 'HIRED' });
         }

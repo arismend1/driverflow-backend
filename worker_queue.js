@@ -286,6 +286,13 @@ const handlers = {
                 await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
                     'weekly_invoice_generated', nowIso(), company_id, JSON.stringify({ billing_week, total_requests: total, amount, currency: 'USD' }));
 
+                // --- HOOK: Push Notification ---
+                try {
+                    const { sendPush } = require('./notifications_service');
+                    await sendPush(company_id, "New Invoice", "You have a new invoice ready to pay");
+                } catch (pushErr) {
+                    logger.error(`[Billing] Push fail for Co:${company_id}: ${pushErr.message}`);
+                }
             } catch (e) {
                 if (e.message.includes('UNIQUE') || e.message.includes('constraint')) {
                     logger.warn(`[Billing] Skipped existing invoice for Co:${company_id} Week:${week_start}`);
