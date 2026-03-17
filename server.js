@@ -110,7 +110,8 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
     try {
         if (!stripe || !endpointSecret) throw new Error('Config Missing');
         event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-        if (process.env.NODE_ENV === 'production' && !event.livemode) {
+        const isTestKey = process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.startsWith('sk_test_');
+        if (process.env.NODE_ENV === 'production' && !event.livemode && !isTestKey) {
             console.warn('[Stripe] Test event ignored in PROD');
             return res.status(400).send('Livemode mismatch');
         }
