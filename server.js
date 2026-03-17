@@ -199,6 +199,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     );
                     console.log(`[Stripe Webhook] ✅ Ticket #${ticketId} marked PAID (PI: ${piId}, amount: ${session.amount_total})`);
                 }
+            } else if (session.metadata?.type === 'weekly_invoice' && session.metadata?.invoice_id) {
+                const invoiceId = session.metadata.invoice_id;
+                const piId = session.payment_intent || null;
+                await db.run(`
+                    UPDATE invoices 
+                    SET status='charged', stripe_payment_intent_id=$1, paid_at=$2, updated_at=$3 
+                    WHERE id=$4 AND status != 'charged'
+                `, piId, nowIso(), nowIso(), invoiceId);
+                console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
             }
         }
 
@@ -1438,8 +1447,8 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
                 company_id: req.user.id,
                 type: 'weekly_invoice'
             },
-            success_url: process.env.STRIPE_SUCCESS_URL || 'https://driverflow.app/billing/success',
-            cancel_url: process.env.STRIPE_CANCEL_URL || 'https://driverflow.app/billing/cancel',
+            success_url: 'https://driverflow.app',
+            cancel_url: 'https://driverflow.app',
         }, { idempotencyKey });
         // Save reference for tracking (removed missing columns stripe_checkout_session_id and updated_at)
 
