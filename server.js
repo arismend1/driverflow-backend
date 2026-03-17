@@ -210,9 +210,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                 const piId = session.payment_intent || null;
                 await db.run(`
                     UPDATE invoices 
-                    SET status='charged', stripe_payment_intent_id=$1, paid_at=$2 
-                    WHERE id=$3 AND status != 'charged'
-                `, piId, nowIso(), invoiceId);
+                    SET status='charged', paid_at=$1 
+                    WHERE id=$2 AND status != 'charged'
+                `, nowIso(), invoiceId);
                 console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
             }
         }
