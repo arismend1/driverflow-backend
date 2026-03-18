@@ -475,14 +475,20 @@ const authenticateToken = (req, res, next) => {
 
 // --- 5.1 PUSH NOTIFICATIONS ---
 app.post('/api/push/register', authenticateToken, async (req, res) => {
+    console.log(`[PUSH_REG] Entry: user_id=${req.user?.id}, body_keys=${Object.keys(req.body)}`);
     const { token, platform } = req.body;
-    if (!token) return res.status(400).json({ error: 'Missing token' });
+    if (!token) {
+        console.warn(`[PUSH_REG] Missing token in body`);
+        return res.status(400).json({ error: 'Missing token' });
+    }
     try {
-        await db.run(
+        console.log(`[PUSH_REG] Before INSERT: user=${req.user.id}, token=${token.substring(0, 8)}...`);
+        const result = await db.run(
             `INSERT INTO push_tokens (user_id, token, platform) VALUES ($1, $2, $3) 
              ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
             req.user.id, token, platform || 'android'
         );
+        console.log(`[PUSH_REG] After INSERT: success`);
         res.json({ ok: true });
     } catch (e) {
         console.error('[PUSH_REGISTER_FAIL]', e.message);
