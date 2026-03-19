@@ -2884,62 +2884,55 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
             return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
         }
 
-        // --- NEW EXCLUSIVITY CHECK ---
+        // --- CONSOLIDATED EXCLUSIVITY CHECK (ALL checks BEFORE any write) ---
         // Block if driver is already "locked" by another company in any exclusivity-reserved state
         const conflict = await db.get(`
-            SELECT id FROM potential_matches 
+            SELECT id, status FROM potential_matches 
             WHERE driver_id = ? AND id <> ? 
               AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')
         `, parseInt(match.driver_id, 10), parseInt(matchId, 10));
         
         if (conflict) {
-            console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already locked by match=${conflict.id}`);
+            console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already locked by match=${conflict.id} (status=${conflict.status})`);
             return res.status(409).json({ 
                 error: 'Conflict',
                 message: 'This driver is currently in exclusivity or review with another company.' 
             });
         }
 
-        await db.run(
-            'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
-            now, now, parseInt(matchId, 10)
-        );
-        console.log(`[ConsentFlow] company_share_consent_at set`);
+        // --- ALL CHECKS PASSED — BEGIN ATOMIC WRITE ---
+        if (db.IS_POSTGRES) await db.run('BEGIN');
 
-        // --- NEW EXCLUSIVITY CHECK ---
-        // Block if driver is already in exclusivity with another company
-        if (match.status !== 'INFO_SHARED') {
-            const conflict = await db.get(`
-                SELECT id FROM potential_matches 
-                WHERE driver_id = ? AND id <> ? AND status = 'INFO_SHARED'
-            `, parseInt(match.driver_id, 10), parseInt(matchId, 10));
-            
-            if (conflict) {
-                console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already exclusive with match=${conflict.id}`);
-                return res.status(409).json({ 
-                    error: 'Conflict',
-                    message: 'This driver is currently exclusive with another company.' 
-                });
+        try {
+            await db.run(
+                'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
+                now, now, parseInt(matchId, 10)
+            );
+            console.log(`[ConsentFlow] company_share_consent_at set`);
+
+            const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
+            let finalStatus = updated.status;
+            let ticketId = updated.ticket_id || null;
+
+            if (updated.driver_share_consent_at) {
+                ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
+                await finalizeShare(matchId);
+                finalStatus = 'INFO_SHARED';
+                console.log(`[ConsentFlow] status changed to INFO_SHARED`);
+                if (db.IS_POSTGRES) await db.run('COMMIT');
+                return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+            } else {
+                finalStatus = 'SHARE_PENDING_DRIVER';
+                await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
+                console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
             }
+
+            if (db.IS_POSTGRES) await db.run('COMMIT');
+            res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+        } catch (txErr) {
+            if (db.IS_POSTGRES) await db.run('ROLLBACK').catch(() => {});
+            throw txErr;
         }
-
-        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
-        let finalStatus = updated.status;
-        let ticketId = updated.ticket_id || null;
-
-        if (updated.driver_share_consent_at) {
-            ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
-            await finalizeShare(matchId);
-            finalStatus = 'INFO_SHARED';
-            console.log(`[ConsentFlow] status changed to INFO_SHARED`);
-            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
-        } else {
-            finalStatus = 'SHARE_PENDING_DRIVER';
-            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
-            console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
-        }
-
-        res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] company confirm-share error:', e);
         res.status(500).json({ error: 'Server error' });
