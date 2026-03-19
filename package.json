@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "start:worker": "node worker_queue.js",
+    "migrate:push": "node init_push_db.js",
     "migrate": "node migrate_auth_fix.js",
     "test": "node --test \"tests/**/*.test.js\"",
     "test:match": "node --test tests/match_confirmed.test.js",

@@ -17,6 +17,7 @@ const { getStripe } = require('./stripe_client');
 const db = require('./db_adapter'); // NEW Unified Adapter
 const { trackLeadFunnelEvent } = require('./analytics');
 const { sendPush } = require('./notifications_service');
+const runPushMigration = require('./init_push_db');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -484,7 +485,7 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
     try {
         console.log(`[PUSH_REG] Before INSERT: user=${req.user.id}, token=${token.substring(0, 8)}...`);
         const result = await db.run(
-            `INSERT INTO push_tokens (user_id, token, platform) VALUES ($1, $2, $3) 
+            `INSERT INTO push_tokens (user_id, token, platform) VALUES (?, ?, ?) 
              ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
             req.user.id, token, platform || 'android'
         );
@@ -3150,7 +3151,20 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
     }
 }
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
-    console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
-});
+async function startServer() {
+  try {
+    console.log("🚀 Running push_tokens migration...");
+    await runPushMigration();
+    console.log("✅ Migration completed.");
+
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
+        console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
+    });
+  } catch (e) {
+    console.error("❌ Migration failed:", e.message);
+    process.exit(1);
+  }
+}
+
+startServer();
