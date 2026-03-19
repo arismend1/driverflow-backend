@@ -2632,9 +2632,9 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
 
         console.log(`[matches/opportunities] 6. AFTER final SQL query. Rows length: ${rows.length}`);
 
-        if (rows.length > 0) {
-            console.log(`[matches/opportunities] 7. First row sample fully raw BEFORE map:`, JSON.stringify(rows[0]));
-        }
+        // if (rows.length > 0) {
+        //     console.log(`[matches/opportunities] 7. First row sample fully raw BEFORE map:`, JSON.stringify(rows[0]));
+        // }
 
         const sanitized = rows.map(r => {
             let opTypes = r.op_types;
