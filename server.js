@@ -767,14 +767,29 @@ app.post('/resend-verification', async (req, res) => {
             return res.status(400).json({ error: 'Account already verified' });
         }
 
-        const token = crypto.randomBytes(32).toString('hex');
-        const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString();
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
+        const tokenCol = db.IS_POSTGRES ? 'verify_token_hash' : 'verification_token';
+        const expCol = db.IS_POSTGRES ? 'verify_token_expires_at' : 'verification_expires';
 
-        if (db.IS_POSTGRES) {
-            await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=? WHERE id=?`, token, expires, u.id);
+        // Check for existing valid token — reuse if not expired
+        const existing = await db.get(`SELECT ${tokenCol} as token, ${expCol} as expires FROM ${table} WHERE id=?`, u.id);
+        let token;
+
+        if (existing && existing.token && existing.expires && new Date(existing.expires) > new Date(nowEpochMs())) {
+            // Reuse existing valid token — do NOT overwrite
+            token = existing.token;
+            console.log(`[Resend] Reusing existing valid token for ${email} (expires ${existing.expires})`);
         } else {
-            await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+            // Generate new token only if none exists or expired
+            token = crypto.randomBytes(32).toString('hex');
+            const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString();
+
+            if (db.IS_POSTGRES) {
+                await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=? WHERE id=?`, token, expires, u.id);
+            } else {
+                await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+            }
+            console.log(`[Resend] Generated new token for ${email} (old was missing or expired)`);
         }
 
         await db.run(`INSERT INTO events_outbox (event_name, created_at, driver_id, company_id, metadata) VALUES (?, ?, ?, ?, ?)`,
