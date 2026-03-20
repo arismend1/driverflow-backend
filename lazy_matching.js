@@ -224,6 +224,14 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
                 companyId, driverId, score, JSON.stringify(breakdown), nowStr
             );
 
+            // --- PUSH: Notify driver of new match ---
+            try {
+                const { sendPush } = require('./notifications_service');
+                await sendPush(driverId, 'driver', "¡Nuevo Match!", "Tienes una nueva oportunidad de trabajo. Revisa tus matches.");
+            } catch (pushErr) {
+                console.error("[LazyMatch] Push fail:", pushErr.message);
+            }
+
             try {
                 // Fire and forget, do not await to prevent blocking
                 trackLeadFunnelEvent('match_generated', { company_id: companyId, driver_id: driverId, metadata: { match_source: "lazy_matching" } })

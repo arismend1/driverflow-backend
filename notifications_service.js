@@ -21,15 +21,20 @@ try {
 /**
  * Sends a push notification to all devices registered for a user.
  * Best-effort only: never throws upward, logs errors, cleans up stale tokens.
+ * @param {number} userId  - The user's ID (from drivers or empresas table)
+ * @param {string} userType - 'driver' or 'empresa'
+ * @param {string} title
+ * @param {string} body
+ * @param {object} data - optional extra data payload
  */
-async function sendPush(userId, title, body, data = {}) {
+async function sendPush(userId, userType, title, body, data = {}) {
     try {
-        if (!userId || !admin.apps.length) return;
+        if (!userId || !userType || !admin.apps.length) return;
 
-        const tokens = await db.all('SELECT token FROM push_tokens WHERE user_id = ?', userId);
+        const tokens = await db.all('SELECT token FROM push_tokens WHERE user_id = ? AND user_type = ?', userId, userType);
         if (!tokens || tokens.length === 0) return;
 
-        console.log(`[PUSH] User #${userId}: "${title}" (${tokens.length} devices)`);
+        console.log(`[PUSH] User #${userId} (${userType}): "${title}" (${tokens.length} devices)`);
 
         for (const t of tokens) {
             const message = {
@@ -53,7 +58,7 @@ async function sendPush(userId, title, body, data = {}) {
             }
         }
     } catch (err) {
-        logger.error(`[PUSH_SERVICE_FAIL] User #${userId}: ${err.message}`);
+        logger.error(`[PUSH_SERVICE_FAIL] User #${userId} (${userType}): ${err.message}`);
     }
 }
 

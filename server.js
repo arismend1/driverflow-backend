@@ -219,7 +219,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                 
                 // --- HOOK: Push Notification ---
                 try {
-                    await sendPush(session.metadata.company_id, "Payment Received", "Payment received successfully");
+                    await sendPush(session.metadata.company_id, 'empresa', "Payment Received", "Payment received successfully");
                 } catch (pushErr) {
                     console.error("[Stripe Webhook] Push fail:", pushErr.message);
                 }
@@ -476,18 +476,19 @@ const authenticateToken = (req, res, next) => {
 
 // --- 5.1 PUSH NOTIFICATIONS ---
 app.post('/api/push/register', authenticateToken, async (req, res) => {
-    console.log(`[PUSH_REG] Entry: user_id=${req.user?.id}, body_keys=${Object.keys(req.body)}`);
+    console.log(`[PUSH_REG] Entry: user_id=${req.user?.id}, type=${req.user?.type}, body_keys=${Object.keys(req.body)}`);
     const { token, platform } = req.body;
     if (!token) {
         console.warn(`[PUSH_REG] Missing token in body`);
         return res.status(400).json({ error: 'Missing token' });
     }
     try {
-        console.log(`[PUSH_REG] Before INSERT: user=${req.user.id}, token=${token.substring(0, 8)}...`);
+        const userType = req.user.type === 'empresa' ? 'empresa' : 'driver';
+        console.log(`[PUSH_REG] Before INSERT: user=${req.user.id}, type=${userType}, token=${token.substring(0, 8)}...`);
         const result = await db.run(
-            `INSERT INTO push_tokens (user_id, token, platform) VALUES (?, ?, ?) 
-             ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
-            req.user.id, token, platform || 'android'
+            `INSERT INTO push_tokens (user_id, user_type, token, platform) VALUES (?, ?, ?, ?) 
+             ON CONFLICT (user_id, user_type, token) DO UPDATE SET platform = EXCLUDED.platform`,
+            req.user.id, userType, token, platform || 'android'
         );
         console.log(`[PUSH_REG] After INSERT: success`);
         res.json({ ok: true });
@@ -2860,6 +2861,11 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             await finalizeShare(matchId);
             finalStatus = 'INFO_SHARED';
             console.log(`[ConsentFlow] status changed to INFO_SHARED`);
+
+            // --- PUSH: Notify both parties of shared info ---
+            try { await sendPush(updated.company_id, 'empresa', "Información Compartida", "El chofer ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
+            try { await sendPush(updated.driver_id, 'driver', "Información Compartida", "Tu información ha sido compartida con la empresa."); } catch (e) { console.error('[ConsentPush]', e.message); }
+
             return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_COMPANY';
@@ -2934,6 +2940,11 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
                 await finalizeShare(matchId);
                 finalStatus = 'INFO_SHARED';
                 console.log(`[ConsentFlow] status changed to INFO_SHARED`);
+
+                // --- PUSH: Notify both parties of shared info ---
+                try { await sendPush(updated.driver_id, 'driver', "Información Compartida", "La empresa ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
+                try { await sendPush(updated.company_id, 'empresa', "Información Compartida", "Tu información ha sido compartida con el chofer."); } catch (e) { console.error('[ConsentPush]', e.message); }
+
                 if (db.IS_POSTGRES) await db.run('COMMIT');
                 return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
             } else {
@@ -3084,7 +3095,7 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
             // --- HOOK: Push Notification ---
             try {
-                await sendPush(match.company_id, "Driver Hired", "You have hired a new driver");
+                await sendPush(match.company_id, 'empresa', "Driver Hired", "You have hired a new driver");
             } catch (pushErr) {
                 console.error("[RESOLVE_MATCH] Push fail:", pushErr.message);
             }
