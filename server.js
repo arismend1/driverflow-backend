@@ -2731,6 +2731,12 @@ const updateMatchStatus = async (req, res, newStatus) => {
 
         await db.run(updateSql, ...params);
 
+        // --- PUSH: Notify both parties when match transitions to PREMATCH_READY ---
+        if (newStatus === 'PREMATCH_READY' && match.status !== 'PREMATCH_READY') {
+            try { await sendPush(match.driver_id, 'driver', '¡Match Confirmado!', 'La empresa también aceptó tu match. Ya puedes compartir tu información.'); } catch (e) { console.error('[MatchPush]', e.message); }
+            try { await sendPush(match.company_id, 'empresa', '¡Match Confirmado!', 'El chofer también aceptó tu match. Ya puedes compartir tu información.'); } catch (e) { console.error('[MatchPush]', e.message); }
+        }
+
         console.log(`[Matches] Match ${matchId} updated to ${newStatus} by ${userType} ${userId}`);
         res.json({ success: true, status: newStatus });
     } catch (e) {
