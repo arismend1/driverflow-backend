@@ -100,5 +100,36 @@ module.exports = {
     close: () => {
         if (pool) pool.end();
         if (sqliteDb) sqliteDb.close();
+    },
+    beginTransaction: async () => {
+        if (IS_POSTGRES) {
+            const client = await pool.connect();
+            await client.query('BEGIN');
+            return {
+                run: async (sql, ...args) => {
+                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
+                    const res = await client.query(pgSql, args);
+                    return { lastInsertRowid: res.oid || (res.rows[0] ? res.rows[0].id : null), ...res };
+                },
+                get: async (sql, ...args) => {
+                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
+                    const res = await client.query(pgSql, args);
+                    return res.rows.length ? res.rows[0] : null;
+                },
+                commit: async () => { await client.query('COMMIT'); client.release(); },
+                rollback: async () => { await client.query('ROLLBACK'); client.release(); }
+            };
+        } else {
+            sqliteDb.exec('BEGIN');
+            return {
+                run: async (sql, ...args) => {
+                    const info = sqliteDb.prepare(sql).run(args);
+                    return { lastInsertRowid: info.lastInsertRowid, ...info };
+                },
+                get: async (sql, ...args) => sqliteDb.prepare(sql).get(args),
+                commit: async () => sqliteDb.exec('COMMIT'),
+                rollback: async () => { try{ sqliteDb.exec('ROLLBACK') }catch(e){} }
+            };
+        }
     }
 };

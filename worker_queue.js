@@ -239,7 +239,9 @@ const handlers = {
             const usage = await db.get(`
                 SELECT count(*) as cnt, count(distinct driver_id) as drv 
                 FROM tickets 
-                WHERE company_id = ? AND created_at >= ? AND created_at < ? AND billing_status = 'billable'`,
+                WHERE company_id = ? AND created_at >= ? AND created_at < ? 
+                  AND billing_status = 'billable' 
+                  AND billing_status NOT IN ('paid', 'invoiced')`,
                 company_id, start, endPlusOne
             );
 
@@ -253,34 +255,52 @@ const handlers = {
             // 3. Insert Invoice (Idempotent by uniqueness constraints, though we should ideally use ON CONFLICT)
             try {
                 const billing_week = `${week_start} to ${week_end}`;
-                
-                // Calculate due date (7 days from now)
                 const issueDate = new Date();
                 const dueDate = new Date(issueDate);
                 dueDate.setDate(dueDate.getDate() + 7);
-                
-                await db.run(
-                    `INSERT INTO invoices (
-                        company_id, 
-                        billing_week, 
-                        issue_date, 
-                        due_date, 
-                        subtotal_cents, 
-                        total_cents, 
-                        currency, 
-                        status, 
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?)`,
-                    company_id, 
-                    billing_week, 
-                    issueDate.toISOString(), 
-                    dueDate.toISOString(), 
-                    amount, 
-                    amount, 
-                    nowIso()
-                );
 
-                logger.info(`[Billing] Created New Invoice`);
+                const tx = await db.beginTransaction();
+                let activeTx = true;
+
+                try {
+                    const insertInvoiceParams = [ company_id, billing_week, issueDate.toISOString(), dueDate.toISOString(), amount, amount, nowIso() ];
+                    const insertResult = await tx.run(`
+                        INSERT INTO invoices (
+                            company_id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?) RETURNING id
+                    `, ...insertInvoiceParams);
+
+                    const newInvoiceId = (insertResult.rows && insertResult.rows[0]) ? insertResult.rows[0].id : insertResult.lastInsertRowid;
+
+                    if (newInvoiceId) {
+                        await tx.run(`
+                            INSERT INTO invoice_items (invoice_id, ticket_id, amount_cents)
+                            SELECT ?, id, COALESCE(amount_cents, price_cents, 15000)
+                            FROM tickets 
+                            WHERE company_id = ? AND created_at >= ? AND created_at < ? 
+                              AND billing_status = 'billable' 
+                              AND id NOT IN (SELECT ticket_id FROM invoice_items)
+                            ON CONFLICT (ticket_id) DO NOTHING
+                        `, newInvoiceId, company_id, start, endPlusOne);
+
+                        const itemsCount = await tx.get("SELECT COUNT(*) as c FROM invoice_items WHERE invoice_id = ?", newInvoiceId);
+                        if (!itemsCount || Number(itemsCount.c) === 0) {
+                            await tx.run("DELETE FROM invoices WHERE id = ?", newInvoiceId);
+                            await tx.commit();
+                            activeTx = false;
+                            logger.warn(`[Billing] Voided empty invoice ${newInvoiceId} for Co:${company_id} (tickets verified out of scope)`);
+                            return;
+                        }
+                    }
+
+                    await tx.commit();
+                    activeTx = false;
+                    logger.info(`[Billing] Created New Invoice ${newInvoiceId} successfully.`);
+
+                } catch (txErr) {
+                    if (activeTx) await tx.rollback();
+                    throw txErr;
+                }
 
                 // 4. Emit Event usage only on creation
                 await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
@@ -455,6 +475,7 @@ const handlers = {
                 nextStatus = 'suspended';
                 suspendedAt = nowIso();
                 await notifyPaymentSuspended(invoice);
+                await db.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
             } else {
                 nextStatus = (isDecline || ['StripeConnectionError', 'StripeAPIError'].includes(e.type)) ? 'retrying' : 'failed';
                 // Backoff logic: +24h, +48h... (simplified to 24 * attempt hours for now)
@@ -534,6 +555,30 @@ const handlers = {
 async function processJobs() {
     const now = nowIso();
     const jobsToProcess = [];
+
+    // 0. Auto-Rescue Dunning (Retrying Invoices)
+    try {
+        const retryingInvoices = await db.all(`
+            SELECT id FROM invoices 
+            WHERE status = 'retrying' AND next_retry_at <= ?
+        `, now);
+
+        for (const inv of retryingInvoices) {
+            // Check if a job already exists to avoid duplicate flooding
+            const existing = await db.get(`
+                SELECT id FROM jobs_queue 
+                WHERE job_type = 'charge_weekly_invoice' 
+                  AND payload_json LIKE ? 
+                  AND status IN ('pending', 'processing')
+            `, `%{"invoice_id":${inv.id}}%`);
+
+            if (!existing) {
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+            }
+        }
+    } catch (e) {
+        logger.error('[Dunning Rescue] Error:', e.message);
+    }
 
     // 1. Claim Batch (Atomic Transaction)
     try {
