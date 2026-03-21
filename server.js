@@ -2731,6 +2731,17 @@ const updateMatchStatus = async (req, res, newStatus) => {
 
         await db.run(updateSql, ...params);
 
+        // --- PUSH: Inactive to Active (Revival) ---
+        const inactiveStatuses = ['DECLINED', 'CLOSED', 'EXPIRED', 'HIRED_ELSEWHERE'];
+        const activeStatuses = ['ACCEPTED', 'PREMATCH_READY'];
+        if (inactiveStatuses.includes(match.status) && activeStatuses.includes(newStatus)) {
+            if (userType === 'empresa') {
+                try { await sendPush(match.driver_id, 'driver', '¡Nuevo Match!', 'Tienes una nueva oportunidad de trabajo. Revisa tus matches.'); } catch (e) { console.error('[MatchPush]', e.message); }
+            } else {
+                try { await sendPush(match.company_id, 'empresa', '¡Nuevo Match!', 'Un chofer está interesado en tu vacante. Revisa tus matches.'); } catch (e) { console.error('[MatchPush]', e.message); }
+            }
+        }
+
         // --- PUSH: Notify both parties when match transitions to PREMATCH_READY ---
         if (newStatus === 'PREMATCH_READY' && match.status !== 'PREMATCH_READY') {
             try { await sendPush(match.driver_id, 'driver', '¡Match Confirmado!', 'La empresa también aceptó tu match. Ya puedes compartir tu información.'); } catch (e) { console.error('[MatchPush]', e.message); }
@@ -2867,19 +2878,22 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
             await finalizeShare(matchId);
             finalStatus = 'INFO_SHARED';
             console.log(`[ConsentFlow] status changed to INFO_SHARED`);
-
-            // --- PUSH: Notify both parties of shared info ---
-            try { await sendPush(updated.company_id, 'empresa', "Información Compartida", "El chofer ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
-            try { await sendPush(updated.driver_id, 'driver', "Información Compartida", "Tu información ha sido compartida con la empresa."); } catch (e) { console.error('[ConsentPush]', e.message); }
-
-            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } else {
             finalStatus = 'SHARE_PENDING_COMPANY';
             await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
             console.log(`[ConsentFlow] status changed to SHARE_PENDING_COMPANY`);
         }
-
-        res.json({ success: true, status: finalStatus });
+        
+        if (db.IS_POSTGRES) await db.run('COMMIT');
+        
+        if (finalStatus === 'INFO_SHARED') {
+            try { await sendPush(match.company_id, 'empresa', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+            try { await sendPush(match.driver_id, 'driver', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+        } else {
+            try { await sendPush(match.company_id, 'empresa', "Consentimiento Recibido", "El chofer ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
+        }
+        
+        return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] driver confirm-share error:', e);
         res.status(500).json({ error: 'Server error' });
@@ -2946,21 +2960,22 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
                 await finalizeShare(matchId);
                 finalStatus = 'INFO_SHARED';
                 console.log(`[ConsentFlow] status changed to INFO_SHARED`);
-
-                // --- PUSH: Notify both parties of shared info ---
-                try { await sendPush(updated.driver_id, 'driver', "Información Compartida", "La empresa ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
-                try { await sendPush(updated.company_id, 'empresa', "Información Compartida", "Tu información ha sido compartida con el chofer."); } catch (e) { console.error('[ConsentPush]', e.message); }
-
-                if (db.IS_POSTGRES) await db.run('COMMIT');
-                return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
             } else {
                 finalStatus = 'SHARE_PENDING_DRIVER';
                 await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
                 console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
             }
-
+            
             if (db.IS_POSTGRES) await db.run('COMMIT');
-            res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+            
+            if (finalStatus === 'INFO_SHARED') {
+                try { await sendPush(match.company_id, 'empresa', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+                try { await sendPush(match.driver_id, 'driver', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+            } else {
+                try { await sendPush(match.driver_id, 'driver', "Consentimiento Recibido", "La empresa ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
+            }
+            
+            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
         } catch (txErr) {
             if (db.IS_POSTGRES) await db.run('ROLLBACK').catch(() => {});
             throw txErr;
@@ -3081,6 +3096,14 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
         if (resolution === 'REJECTED') {
             await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
             await db.run(`UPDATE tickets SET billing_status = 'void' WHERE match_id = ? AND billing_status != 'billable'`, matchId);
+
+            // --- PUSH: Rechazo Real (CLOSED) ---
+            if (req.user.type === 'empresa') {
+                try { await sendPush(match.driver_id, 'driver', 'Proceso Cerrado', 'La empresa ha cerrado el proceso contigo.'); } catch (e) { console.error('[MatchPush]', e.message); }
+            } else {
+                try { await sendPush(match.company_id, 'empresa', 'Proceso Rechazado', 'El chofer ha rechazado el proceso.'); } catch (e) { console.error('[MatchPush]', e.message); }
+            }
+
             return res.json({ success: true, message: 'Match cerrado. Ya puede buscar otras opciones.', status: 'CLOSED' });
         }
 
