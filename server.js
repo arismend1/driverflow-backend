@@ -167,21 +167,42 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
             if (invoiceId) {
                 // Direct Reconciliation (Worker Originated)
-                await db.run(`
-                    UPDATE invoices 
-                    SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
-                    WHERE id=$6 AND status != 'charged'
-                `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
-                console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
-
+                const pre = await db.get("SELECT status FROM invoices WHERE id=?", invoiceId);
+                if (pre && pre.status !== 'charged') {
+                    await db.run(`
+                        UPDATE invoices 
+                        SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
+                        WHERE id=$6 AND status != 'charged'
+                    `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
+                    
+                    await db.run(`
+                        UPDATE tickets 
+                        SET billing_status = 'paid'
+                        WHERE id IN (
+                            SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                        )
+                    `, invoiceId);
+                    console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
+                }
             } else {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
-                await db.run(`
-                    UPDATE invoices 
-                    SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
-                    WHERE stripe_payment_intent_id=$5 AND status != 'charged'
-                `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
-                console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
+                const pre = await db.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
+                if (pre && pre.status !== 'charged') {
+                    await db.run(`
+                        UPDATE invoices 
+                        SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
+                        WHERE stripe_payment_intent_id=$5 AND status != 'charged'
+                    `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
+
+                    await db.run(`
+                        UPDATE tickets 
+                        SET billing_status = 'paid'
+                        WHERE id IN (
+                            SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                        )
+                    `, pre.id);
+                    console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
+                }
             }
         }
 
@@ -2694,6 +2715,13 @@ const updateMatchStatus = async (req, res, newStatus) => {
     const now = new Date().toISOString();
 
     try {
+        if (userType === 'empresa') {
+            const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', userId);
+            if (emp && (emp.billing_suspended === true || emp.billing_suspended === 1)) {
+                return res.status(402).json({ error: 'Cuenta suspendida por facturación pendiente' });
+            }
+        }
+
         const match = await db.get('SELECT * FROM potential_matches WHERE id = ?', matchId);
         if (!match) return res.status(404).json({ error: 'Match not found' });
 
@@ -2906,6 +2934,11 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
     const now = new Date().toISOString();
 
     try {
+        const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', req.user.id);
+        if (emp && (emp.billing_suspended === true || emp.billing_suspended === 1)) {
+            return res.status(402).json({ error: 'Cuenta suspendida por facturación pendiente' });
+        }
+
         const scopeIds = await getCompanyScopeIds(req.user.id);
         const scopeIn = scopeIds.map(() => '?').join(',');
 
@@ -3044,6 +3077,13 @@ app.post('/api/debug/sql', async (req, res) => {
 // Match Resolution Endpoint
 app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
     try {
+        if (req.user.type === 'empresa') {
+            const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', req.user.id);
+            if (emp && (emp.billing_suspended === true || emp.billing_suspended === 1)) {
+                return res.status(402).json({ error: 'Cuenta suspendida por facturación pendiente' });
+            }
+        }
+
         const matchId = req.params.id;
         const { resolution } = req.body; // HIRED, IN_PROCESS, REJECTED
 
@@ -3136,6 +3176,95 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
         console.error('Match Resolve Error:', e);
         res.status(500).json({ error: 'Server Error' });
     }
+});
+
+// --- 9. ADMIN PANEL CONTROL ROUTES ---
+const requireAdmin = (req, res, next) => {
+    // Audit Verified Fact: Native Admin pattern is via x-admin-secret, not JWT.
+    const secret = req.headers['x-admin-secret'];
+    if (secret && secret === process.env.ADMIN_SECRET) {
+        req.user = { id: 0, role: 'admin' }; // Mock standard user payload for audit tools
+        next();
+    } else {
+        res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
+    }
+};
+
+app.get('/api/admin/problem-companies', requireAdmin, async (req, res) => {
+    try {
+        const rows = await db.all(`
+            SELECT c.id as company_id, c.contacto as email, c.billing_suspended, c.search_status, 
+                   COUNT(i.id) as failed_invoices, MAX(i.issue_date) as last_invoice_date
+            FROM empresas c
+            LEFT JOIN invoices i ON i.company_id = c.id AND i.status IN ('retrying', 'failed')
+            WHERE c.billing_suspended = true OR i.id IS NOT NULL
+            GROUP BY c.id, c.contacto, c.billing_suspended, c.search_status
+        `);
+        res.json({ ok: true, companies: rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/invoices', requireAdmin, async (req, res) => {
+    try {
+        const { status, company_id } = req.query;
+        let where = []; let args = [];
+        if (status) { where.push("i.status = ?"); args.push(status); }
+        if (company_id) { where.push("i.company_id = ?"); args.push(company_id); }
+        
+        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        
+        // Exact JSON matching based on engine to prevent false matches (e.g. 12 matching 112)
+        const joinCondition = db.IS_POSTGRES 
+            ? "CAST(j.payload::json->>'invoice_id' AS TEXT) = CAST(i.id AS TEXT)"
+            : "CAST(json_extract(j.payload, '$.invoice_id') AS TEXT) = CAST(i.id AS TEXT)";
+
+        const rows = await db.all(`
+            SELECT 
+                i.id, i.company_id, i.status, i.total_cents as amount, 
+                COALESCE((
+                    SELECT j.attempts 
+                    FROM jobs_queue j 
+                    WHERE j.job_type = 'charge_weekly_invoice' AND ${joinCondition}
+                    ORDER BY j.id DESC LIMIT 1
+                ), 0) as attempts,
+                (
+                    SELECT j.run_after 
+                    FROM jobs_queue j 
+                    WHERE j.job_type = 'charge_weekly_invoice' AND ${joinCondition}
+                    ORDER BY j.id DESC LIMIT 1
+                ) as next_retry_at,
+                i.created_at
+            FROM invoices i
+            ${whereClause} ORDER BY i.created_at DESC LIMIT 100
+        `, ...args);
+        
+        res.json({ ok: true, invoices: rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/invoices/:id/retry', requireAdmin, async (req, res) => {
+    try {
+        const invoiceId = req.params.id;
+        const inv = await db.get("SELECT id FROM invoices WHERE id = ?", invoiceId);
+        if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+        
+        await db.run("INSERT INTO jobs_queue (job_type, payload, status, attempts, run_after, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?, ?)",
+            'charge_weekly_invoice', JSON.stringify({ invoice_id: invoiceId, admin_forced: true }), nowIso(), nowIso(), nowIso()
+        );
+        
+        await auditLog('admin_force_retry', 0, invoiceId, { source: 'admin_secret', action: 'admin_force_retry', invoice_id: invoiceId }, req);
+        res.json({ ok: true, message: 'Retry job queued for invoice' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/companies/:id/unsuspend', requireAdmin, async (req, res) => {
+    try {
+        const companyId = req.params.id;
+        await db.run("UPDATE empresas SET billing_suspended = false, search_status = 'ON' WHERE id = ?", companyId);
+        
+        await auditLog('admin_unsuspend_company', 0, companyId, { source: 'admin_secret', action: 'admin_unsuspend_company', company_id: companyId }, req);
+        res.json({ ok: true, message: 'Company billing unsuspended and search enabled' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
