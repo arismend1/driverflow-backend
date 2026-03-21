@@ -273,6 +273,27 @@ app.use(express.urlencoded({ limit: '15mb', extended: true }));
 app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// --- 5.1 LEGAL PUBLIC ENDPOINTS ---
+app.get('/legal/privacy', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Privacy Policy - DriverFlow</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:2rem;max-width:800px;margin:auto;line-height:1.6;color:#333;}h1,h2{color:#1a1a1a;}</style></head><body>
+    <h1>Privacy Policy</h1><p><strong>Last Updated: March 2026</strong></p>
+    <h2>1. Data Collection & Usage</h2><p>DriverFlow strictly collects the necessary data (Name, Email, Phone, Company details, and CDL Licensing info) to operate our platform and facilitate direct matches between logistics carriers and truck drivers. We maintain strict access controls and do no sell identifying information to data brokers.</p>
+    <h2>2. Authentication & Core Infrastructure</h2><p>We process your application data locally within encrypted databases. Authentication payloads and verification workflows are handled with robust cryptographic standards.</p>
+    <h2>3. External Third Parties</h2><p><strong>Stripe:</strong> Payment processes are fully isolated. DriverFlow never stores or intercepts credit card credentials natively. <strong>Firebase:</strong> Used exclusively for push notifications regarding match availability.</p>
+    <h2>4. Deletion & Contact</h2><p>You may request the permanent deletion of your profile and data by contacting support. Log data is rotated and automatically voided.</p>
+    </body></html>`);
+});
+
+app.get('/legal/terms', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Terms of Service - DriverFlow</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:2rem;max-width:800px;margin:auto;line-height:1.6;color:#333;}h1,h2{color:#1a1a1a;}</style></head><body>
+    <h1>Terms of Service</h1><p><strong>Last Updated: March 2026</strong></p>
+    <h2>1. Marketplace Role & Scope</h2><p>DriverFlow acts solely as a technological matching intermediary between independent Transport Companies and CDL Drivers. DriverFlow is NOT a motor carrier, broker, or employer, and does not dictate work conditions or guarantee employment.</p>
+    <h2>2. Payments & Billing</h2><p>Companies utilizing the matching engine are billed according to their usage. Delinquent accounts (unpaid invoices via Stripe) will face immediate platform suspension and matching restrictions.</p>
+    <h2>3. Acceptable Use</h2><p>Users must submit accurate identification and licensing info. Fraudulent activity, false document uploads, or attempting to circumvent the DriverFlow billing systems will result in immediate permanent termination.</p>
+    <h2>4. Limitations of Liability</h2><p>DriverFlow accepts no legal liability for any physical, reputational, or financial damages arising directly from the interactions, employment agreements, or road incidents involving the matched entities.</p>
+    </body></html>`);
+});
+
 
 
 app.get('/healthz', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
@@ -474,18 +495,19 @@ if (!JWT_SECRET) {
     process.exit(1);
 }
 
+const LEGAL_VERSION = 'v1';
+
+// Auth Middleware (GLOBAL DEFAULT)
 const authenticateToken = (req, res, next) => {
-    const header = req.headers['authorization'];
-    const token = header && header.split(' ')[1];
-    if (!token) {
-        console.warn(`[Auth] Missing Token. Authorization header present: ${!!header}`);
-        return res.status(401).json({ error: 'Unauthorized', reason: 'MissingToken' });
-    }
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: 'Access token required' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
-            console.warn(`[Auth] JWT Verify Failed - Name: ${err.name}, Message: ${err.message}. Auth header present: ${!!header}`);
-            return res.status(403).json({ error: 'Forbidden', reason: err.name || 'InvalidToken' });
+            console.warn(`[Auth] JWT Verify Failed - Name: ${err.name}, Message: ${err.message}. Auth header present: ${!!authHeader}`);
+            return res.status(403).json({ error: 'Invalid or expired token', is_expired: true, reason: err.name || 'InvalidToken' });
         }
 
         user.type = user.type || user.tipo;
@@ -636,7 +658,27 @@ app.post('/login', async (req, res) => {
             if (row.failed_attempts > 0) {
                 await db.run(`UPDATE ${table} SET failed_attempts=0, lockout_until=NULL WHERE id=?`, row.id);
             }
-            const token = jwt.sign({ id: row.id, type: type === 'empresa' ? 'empresa' : 'driver' }, JWT_SECRET, { expiresIn: '24h' });
+            
+            // LEGAL ENFORCEMENT & TOKEN SCOPE
+            const legalAccepted = !!(row.accepted_terms_at && row.accepted_privacy_at && row.legal_version === LEGAL_VERSION);
+            
+            const token = jwt.sign({ 
+                id: row.id, 
+                type: type === 'empresa' ? 'empresa' : 'driver',
+                legal_accepted: legalAccepted,
+                legal_version: row.legal_version || null
+            }, JWT_SECRET, { expiresIn: '24h' });
+
+            if (!legalAccepted) {
+                console.warn(`[Login] Needs legal acceptance: ${contacto}`);
+                return res.status(403).json({ 
+                    requires_legal_acceptance: true, 
+                    token, 
+                    type, 
+                    id: row.id, 
+                    message: 'Debes aceptar los Términos y Privacidad actualizados.' 
+                });
+            }
 
             await auditLog('login_success', row.id, table, {}, req);
 
@@ -673,7 +715,7 @@ app.post('/login', async (req, res) => {
 // REGISTER
 app.post('/register', async (req, res) => {
     if (!checkRateLimit(req.ip, 'register')) return res.status(429).json({ error: 'RATE_LIMITED' });
-    const { type, nombre, password, ...extras } = req.body;
+    const { type, nombre, password, accept_terms, accept_privacy, ...extras } = req.body;
     const contacto = (req.body.contacto || '').toString().trim().toLowerCase();
     const phone = (req.body.phone || req.body.telefono || extras.contact_phone || '').toString().trim();
 
@@ -681,6 +723,9 @@ app.post('/register', async (req, res) => {
     // Stronger validation: ensure phone is also provided
     if (!nombre || !contacto || !password || !phone) {
         return res.status(400).json({ error: 'Missing fields (nombre, contacto, password, and phone are required)' });
+    }
+    if (accept_terms !== true || accept_privacy !== true) {
+        return res.status(400).json({ error: 'Debes aceptar explícitamente los Términos de Servicio y la Política de Privacidad.' });
     }
     if (!isStrongPassword(password)) return res.status(400).json({ error: 'Weak Password' });
 
@@ -719,16 +764,14 @@ app.post('/register', async (req, res) => {
 
         let newId;
         if (type === 'driver') {
-            // Drivers: Create UNVERIFIED (false/0)
+            // Drivers: Create UNVERIFIED (false/0) AND atomically insert legal consent
             if (db.IS_POSTGRES) {
-                // Postgres: email, phone, verify_token_hash, etc.
-                const result = await db.run(`INSERT INTO drivers (nombre, email, phone, password_hash, tipo_licencia, status, created_at, verified, verify_token_hash, verify_token_expires_at) VALUES (?,?,?,?,?,'active',?,false,?,?) RETURNING id`,
-                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires);
+                const result = await db.run(`INSERT INTO drivers (nombre, email, phone, password_hash, tipo_licencia, status, created_at, verified, verify_token_hash, verify_token_expires_at, accepted_terms_at, accepted_privacy_at, legal_version) VALUES (?,?,?,?,?,'active',?,false,?,?,?,?,?) RETURNING id`,
+                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires, now, now, LEGAL_VERSION);
                 newId = result.rows ? result.rows[0].id : (result.id || result.lastInsertRowid);
             } else {
-                // SQLite: contacto, phone, verification_token, etc.
-                const result = await db.run(`INSERT INTO drivers (nombre, contacto, phone, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires) VALUES (?,?,?,?,?,'active',?,0,?,?)`,
-                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires);
+                const result = await db.run(`INSERT INTO drivers (nombre, contacto, phone, password_hash, tipo_licencia, status, created_at, verified, verification_token, verification_expires, accepted_terms_at, accepted_privacy_at, legal_version) VALUES (?,?,?,?,?,'active',?,0,?,?,?,?,?)`,
+                    nombre, contacto, phone, hash, extras.tipo_licencia || 'B', now, token, expires, now, now, LEGAL_VERSION);
                 newId = result.lastInsertRowid;
             }
 
@@ -743,16 +786,14 @@ app.post('/register', async (req, res) => {
             await db.run(`INSERT INTO events_outbox (request_id, event_name, created_at, driver_id, metadata) VALUES (?,?,?,?,?)`,
                 null, 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'driver' }));
         } else {
-            // Empresas: Create UNVERIFIED (false/0)
+            // Empresas: Create UNVERIFIED (false/0) AND atomically insert legal consent
             if (db.IS_POSTGRES) {
-                // Postgres: email, contacto, telefono, verify_token_hash, etc.
-                const result = await db.run(`INSERT INTO empresas (nombre, email, contacto, telefono, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verify_token_hash, verify_token_expires_at, created_at, contact_person, contact_phone) VALUES (?,?,?,?,?,?,?,?,?,false,'ACTIVE',?,?,?,?,?) RETURNING id`,
-                    nombre, contacto, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '', extras.contact_phone || phone);
+                const result = await db.run(`INSERT INTO empresas (nombre, email, contacto, telefono, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verify_token_hash, verify_token_expires_at, created_at, contact_person, contact_phone, accepted_terms_at, accepted_privacy_at, legal_version) VALUES (?,?,?,?,?,?,?,?,?,false,'ACTIVE',?,?,?,?,?,?,?,?) RETURNING id`,
+                    nombre, contacto, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '', extras.contact_phone || phone, now, now, LEGAL_VERSION);
                 newId = result.rows ? result.rows[0].id : (result.id || result.lastInsertRowid);
             } else {
-                // SQLite: contacto, contact_phone, verification_token, etc.
-                const result = await db.run(`INSERT INTO empresas (nombre, contacto, contact_phone, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verification_token, verification_expires, created_at, contact_person) VALUES (?,?,?,?,?,?,?,?,0,'ACTIVE',?,?,?,?)`,
-                    nombre, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '');
+                const result = await db.run(`INSERT INTO empresas (nombre, contacto, contact_phone, password_hash, legal_name, address_line1, city, ciudad, verified, account_state, verification_token, verification_expires, created_at, contact_person, accepted_terms_at, accepted_privacy_at, legal_version) VALUES (?,?,?,?,?,?,?,?,0,'ACTIVE',?,?,?,?,?,?,?)`,
+                    nombre, contacto, phone, hash, extras.legal_name || nombre, extras.address_line1 || '', extras.address_city || '', extras.address_city || '', token, expires, now, extras.contact_person || '', now, now, LEGAL_VERSION);
                 newId = result.lastInsertRowid;
             }
 
@@ -768,6 +809,33 @@ app.post('/register', async (req, res) => {
         }
         console.error('Register Error', e);
         res.status(500).json({ error: `Server Error: ${e.message}`, stack: e.stack });
+    }
+});
+
+app.post('/api/legal/accept', authenticateToken, async (req, res) => {
+    const { accept_terms, accept_privacy } = req.body;
+    if (accept_terms !== true || accept_privacy !== true) {
+        return res.status(400).json({ error: 'Consentimiento explícito requerido para ambos (terms y privacy).' });
+    }
+    try {
+        const table = req.user.type === 'driver' ? 'drivers' : 'empresas';
+        const now = nowIso();
+        
+        await db.run(`UPDATE ${table} SET accepted_terms_at=?, accepted_privacy_at=?, legal_version=? WHERE id=?`, now, now, LEGAL_VERSION, req.user.id);
+        
+        await auditLog('user_accept_legal', req.user.id, req.user.id, { terms: true, privacy: true, version: LEGAL_VERSION }, req);
+        
+        // Issue fresh unlocked JWT with legal_accepted flag enabled
+        const freshToken = jwt.sign({ 
+            id: req.user.id, 
+            type: req.user.type,
+            legal_accepted: true,
+            legal_version: LEGAL_VERSION
+        }, JWT_SECRET, { expiresIn: '24h' });
+
+        res.json({ ok: true, message: 'Legal accepted successfully', token: freshToken });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
