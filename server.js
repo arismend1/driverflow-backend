@@ -2782,6 +2782,14 @@ const updateMatchStatus = async (req, res, newStatus) => {
     const userType = req.user.type; // 'empresa' or 'driver'
     const now = new Date().toISOString();
 
+    // --- BASIC COMPANY VERIFICATION (ANTI-FAKE) ---
+    if (userType === 'empresa') {
+        const emp = await db.get('SELECT verification_status FROM empresas WHERE id = ?', userId);
+        if (emp && emp.verification_status !== 'approved') {
+            return res.status(403).json({ error: 'Empresa no verificada', requires_verification: true });
+        }
+    }
+
     try {
         if (userType === 'empresa') {
             const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', userId);
@@ -3001,6 +3009,12 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
     const matchId = req.params.id;
     const now = new Date().toISOString();
 
+    // --- BASIC COMPANY VERIFICATION (ANTI-FAKE) ---
+    const vCheck = await db.get('SELECT verification_status FROM empresas WHERE id = ?', req.user.id);
+    if (vCheck && vCheck.verification_status !== 'approved') {
+        return res.status(403).json({ error: 'Empresa no verificada', requires_verification: true });
+    }
+
     try {
         const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', req.user.id);
         if (emp && (emp.billing_suspended === true || emp.billing_suspended === 1)) {
@@ -3146,6 +3160,12 @@ app.post('/api/debug/sql', async (req, res) => {
 app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
     try {
         if (req.user.type === 'empresa') {
+            // --- BASIC COMPANY VERIFICATION (ANTI-FAKE) ---
+            const vCheck = await db.get('SELECT verification_status FROM empresas WHERE id = ?', req.user.id);
+            if (vCheck && vCheck.verification_status !== 'approved') {
+                return res.status(403).json({ error: 'Empresa no verificada', requires_verification: true });
+            }
+
             const emp = await db.get('SELECT billing_suspended FROM empresas WHERE id = ?', req.user.id);
             if (emp && (emp.billing_suspended === true || emp.billing_suspended === 1)) {
                 return res.status(402).json({ error: 'Cuenta suspendida por facturación pendiente' });
@@ -3257,6 +3277,43 @@ const requireAdmin = (req, res, next) => {
         res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
     }
 };
+
+app.get('/api/admin/pending-companies', requireAdmin, async (req, res) => {
+    try {
+        const rows = await db.all(`
+            SELECT id, nombre, contacto as email, created_at, verification_status 
+            FROM empresas 
+            WHERE verification_status = 'pending' 
+            ORDER BY created_at DESC
+        `);
+        res.json({ ok: true, pending_companies: rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/companies/:id/approve', requireAdmin, async (req, res) => {
+    try {
+        const companyId = req.params.id;
+        await db.run("UPDATE empresas SET verification_status = 'approved', verified_at = ? WHERE id = ?", nowIso(), companyId);
+        await auditLog('admin_company_approved', 0, companyId, { company_id: companyId }, req);
+        
+        try { await sendPush(companyId, 'empresa', "¡Empresa Verificada!", "Tu empresa ha sido verificada. Ya puedes operar."); } catch(e) { console.error('[PushError] approve:', e.message); }
+        res.json({ ok: true, message: 'Company approved and verified.' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/companies/:id/reject', requireAdmin, async (req, res) => {
+    try {
+        const companyId = req.params.id;
+        const { reason } = req.body;
+        if (!reason) return res.status(400).json({ error: 'Rejection reason strictly required.' });
+        
+        await db.run("UPDATE empresas SET verification_status = 'rejected', rejected_reason = ? WHERE id = ?", reason, companyId);
+        await auditLog('admin_company_rejected', 0, companyId, { company_id: companyId, reason }, req);
+        
+        try { await sendPush(companyId, 'empresa', "Verificación Fallida", "Tu empresa no fue aprobada. Revisa la información enviada."); } catch(e) { console.error('[PushError] reject:', e.message); }
+        res.json({ ok: true, message: 'Company rejected.' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/admin/problem-companies', requireAdmin, async (req, res) => {
     try {
