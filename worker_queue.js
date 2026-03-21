@@ -560,17 +560,21 @@ async function processJobs() {
     try {
         const retryingInvoices = await db.all(`
             SELECT id FROM invoices 
-            WHERE status = 'retrying' AND next_retry_at <= ?
-        `, now);
+            WHERE status = 'retrying'
+        `);
 
         for (const inv of retryingInvoices) {
             // Check if a job already exists to avoid duplicate flooding
+            const matchQuery = db.IS_POSTGRES 
+                ? "CAST(payload::json->>'invoice_id' AS TEXT) = ?"
+                : "CAST(json_extract(payload, '$.invoice_id') AS TEXT) = ?";
+
             const existing = await db.get(`
                 SELECT id FROM jobs_queue 
                 WHERE job_type = 'charge_weekly_invoice' 
-                  AND payload_json LIKE ? 
+                  AND ${matchQuery} 
                   AND status IN ('pending', 'processing')
-            `, `%{"invoice_id":${inv.id}}%`);
+            `, String(inv.id));
 
             if (!existing) {
                 await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
