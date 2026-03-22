@@ -56,6 +56,11 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
         await safeAddColumn('empresas', 'address_line1', 'TEXT');
         await safeAddColumn('empresas', 'city', 'TEXT');
 
+        // COMPANY ANTI-FAKE VERIFICATION (PHASE 3)
+        await safeAddColumn('empresas', 'verification_status', "TEXT DEFAULT 'approved'");
+        await safeAddColumn('empresas', 'verified_at', 'TEXT');
+        await safeAddColumn('empresas', 'rejected_reason', 'TEXT');
+
         // --- PHASE 3: OBSERVABILITY ---
         console.log('Migrating: Observability...');
         // metrics_snapshot
