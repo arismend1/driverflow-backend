@@ -3412,6 +3412,7 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
 
         // Feature Schema (Hardened against failure)
         const featureMigrations = [
+            'migrate_phase2_legal.js',
             'migrate_auth_indexes.js',
             'migrate_fix_events.js',
             'migrate_company_requirements.js',
