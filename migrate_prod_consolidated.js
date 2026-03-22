@@ -60,6 +60,7 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
         await safeAddColumn('empresas', 'verification_status', "TEXT DEFAULT 'approved'");
         await safeAddColumn('empresas', 'verified_at', 'TEXT');
         await safeAddColumn('empresas', 'rejected_reason', 'TEXT');
+        await safeAddColumn('empresas', 'billing_suspended', 'BOOLEAN DEFAULT FALSE');
 
         // --- PHASE 3: OBSERVABILITY ---
         console.log('Migrating: Observability...');
