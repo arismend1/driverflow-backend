@@ -512,9 +512,8 @@ const authenticateToken = (req, res, next) => {
 
         user.type = user.type || user.tipo;
 
-        // --- GLOBAL COMPLIANCE MIDDLEWARE ---
         if (req.path !== '/api/legal/accept' && req.path !== '/login') {
-            if (user.legal_accepted !== true || user.legal_version !== global.LEGAL_VERSION) {
+            if (user.legal_accepted !== true || user.legal_version !== LEGAL_VERSION) {
                 return res.status(403).json({
                     error: 'Legal terms update required',
                     requires_legal_acceptance: true
