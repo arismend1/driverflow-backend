@@ -1,4 +1,4 @@
-const db = require('../db_adapter');
+const db = require('./db_adapter');
 
 (async () => {
     console.log('--- [MIGRATION] LEGAL CONSENT COLUMNS ---');
