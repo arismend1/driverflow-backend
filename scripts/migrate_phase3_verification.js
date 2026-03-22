@@ -4,7 +4,7 @@ const db = require('../db_adapter');
     console.log('--- [MIGRATION] COMPANY VERIFICATION Phase 3 ---');
     try {
         const queries = [
-            "ALTER TABLE empresas ADD COLUMN verification_status TEXT DEFAULT 'pending';",
+            "ALTER TABLE empresas ADD COLUMN verification_status TEXT DEFAULT 'approved';",
             "ALTER TABLE empresas ADD COLUMN verified_at TEXT;",
             "ALTER TABLE empresas ADD COLUMN rejected_reason TEXT;"
         ];

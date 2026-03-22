@@ -20,6 +20,11 @@ try {
     // 1. Update Empresas (Tier & Creditos)
     addColumn('empresas', "tier TEXT DEFAULT 'STANDARD' CHECK(tier IN ('STANDARD', 'GOLD'))");
     addColumn('empresas', "creditos INTEGER DEFAULT 10");
+    
+    // Anti-Fake Verification (Grandfathered as 'approved' for production fix)
+    addColumn('empresas', "verification_status TEXT DEFAULT 'approved'");
+    addColumn('empresas', "verified_at TEXT");
+    addColumn('empresas', "rejected_reason TEXT");
 
     // 2. Update Solicitudes (Rondas)
     addColumn('solicitudes', "ronda_actual INTEGER DEFAULT 1");
