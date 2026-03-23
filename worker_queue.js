@@ -274,11 +274,11 @@ const handlers = {
 
                     if (newInvoiceId) {
                         await tx.run(`
-                            INSERT INTO invoice_items (invoice_id, ticket_id, amount_cents)
-                            SELECT ?, id, COALESCE(amount_cents, price_cents, 15000)
+                            INSERT INTO invoice_items (invoice_id, ticket_id, price_cents)
+                            SELECT ?, id, COALESCE(price_cents, amount_cents, 15000)
                             FROM tickets 
                             WHERE company_id = ? AND created_at >= ? AND created_at < ? 
-                              AND billing_status = 'billable' 
+                              AND billing_status IN ('unbilled', 'unpaid', 'billable')
                               AND id NOT IN (SELECT ticket_id FROM invoice_items)
                             ON CONFLICT (ticket_id) DO NOTHING
                         `, newInvoiceId, company_id, start, endPlusOne);
