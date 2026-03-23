@@ -1882,6 +1882,23 @@ app.post('/api/driver/search_status', authenticateToken, async (req, res) => {
     }
 });
 
+// GET active banner for drivers
+app.get('/api/driver/banner', authenticateToken, async (req, res) => {
+    try {
+        const banner = await db.get(`
+            SELECT image_url, is_active
+            FROM driver_banner
+            WHERE is_active = true
+            ORDER BY updated_at DESC
+            LIMIT 1
+        `);
+        res.json(banner || null);
+    } catch (e) {
+        // fail silently as per requirements
+        res.json(null);
+    }
+});
+
 // --- DRIVER PROFILE ---
 app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can access' });
@@ -1936,6 +1953,74 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
     } catch (e) {
         console.error('Error fetching driver profile:', e.message);
         res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+// --- INTERNAL ADMIN / BANNER CONTROL ---
+
+const BANNER_TOKEN = process.env.SECURE_BANNER_TOKEN || 'DF_INTERNAL_2026';
+
+app.get('/internal/banner-control', async (req, res) => {
+    const { token } = req.query;
+    if (token !== BANNER_TOKEN) return res.status(403).send('Forbidden: Invalid Token');
+
+    try {
+        const current = await db.get(`SELECT image_url FROM driver_banner WHERE is_active = true ORDER BY updated_at DESC LIMIT 1`);
+        
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Banner Control</title>
+                <style>
+                    body { font-family: sans-serif; padding: 40px; background: #0d1117; color: #c9d1d9; }
+                    .card { background: #161b22; padding: 20px; border-radius: 8px; border: 1px solid #30363d; max-width: 500px; }
+                    input { width: 100%; padding: 10px; margin: 10px 0; background: #0d1117; color: white; border: 1px solid #30363d; border-radius: 4px; box-sizing: border-box; }
+                    button { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; }
+                    img { max-width: 100%; border-radius: 8px; margin-top: 10px; }
+                    .status { margin-bottom: 20px; font-size: 0.9rem; color: #8b949e; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>DF Banner Control</h2>
+                    <div class="status">Current Banner:</div>
+                    ${current ? `<img src="${current.image_url}" />` : '<p>No active banner</p>'}
+                    <hr style="border: 0; border-top: 1px solid #30363d; margin: 20px 0;">
+                    <form action="/api/admin/banner?token=${token}" method="POST">
+                        <label>New Image URL:</label>
+                        <input type="text" name="imageUrl" placeholder="https://..." required>
+                        <button type="submit">Activate Banner</button>
+                    </form>
+                </div>
+            </body>
+            </html>
+        `);
+    } catch (e) {
+        res.status(500).send('Server Error');
+    }
+});
+
+// Endpoint to process banner update
+app.post('/api/admin/banner', async (req, res) => {
+    const { token } = req.query;
+    if (token !== BANNER_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+
+    const { imageUrl } = req.body;
+    if (!imageUrl) return res.status(400).json({ error: 'Image URL required' });
+
+    try {
+        await db.run('UPDATE driver_banner SET is_active = false');
+        await db.run('INSERT INTO driver_banner (image_url, is_active, updated_at) VALUES (?, true, CURRENT_TIMESTAMP)', imageUrl);
+        res.send(`
+            <div style="font-family: sans-serif; padding: 40px; background: #0d1117; color: white; text-align: center;">
+                <h2>✅ Banner Updated</h2>
+                <p>The new banner is now active in the driver app.</p>
+                <a href="/internal/banner-control?token=${token}" style="color: #58a6ff;">Return to control</a>
+            </div>
+        `);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -3435,7 +3520,8 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
             'migrate_lead_funnel_events.js',
             'migrate_phase6_driver_profile.js',
             'migrate_phase6_production_fix.js',
-            'migrate_fix_duplicate_tickets.js'
+            'migrate_fix_duplicate_tickets.js',
+            'scripts/migrate_driver_banner.js'
         ];
 
         for (const m of featureMigrations) {

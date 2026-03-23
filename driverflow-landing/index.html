@@ -4,70 +4,104 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DriverFlow - Conexión Eficiente de Transporte</title>
+    <title>DriverFlow - Encuentra Oportunidades Reales</title>
     <link rel="stylesheet" href="css/styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 </head>
 
 <body>
     <header>
         <a href="#" class="logo">DriverFlow</a>
-        <nav>
-            <a href="#features">Funcionalidades</a>
-            <a href="#pricing">Precios</a>
+        <nav class="nav-links">
+            <a href="#beneficios">Beneficios</a>
+            <a href="#como-funciona">Cómo funciona</a>
             <a href="mailto:support@driverflow.app">Soporte</a>
         </nav>
     </header>
 
-    <div class="hero">
-        <h1>DriverFlow</h1>
-        <p>Plataforma SaaS para gestión operativa y automatización de procesos para empresas de transporte y servicios
-            privados.</p>
-        <a href="#pricing" class="cta-button">Ver Planes</a>
-    </div>
-
-    <section id="features" class="section">
-        <h2>¿Qué es DriverFlow?</h2>
-        <div class="grid">
-            <div class="card" style="grid-column: span 3;">
-                <h3>Solución Integral</h3>
-                <p>DriverFlow es una plataforma digital basada en la nube que ayuda a empresas de transporte y servicios
-                    privados a gestionar operaciones, conductores, procesos internos y facturación de manera eficiente
-                    mediante herramientas automatizadas.</p>
+    <main>
+        <section class="hero">
+            <h1>Encuentra oportunidades reales como conductor</h1>
+            <p>Conecta directamente con empresas que buscan tu perfil. Sin intermediarios, sin spam y con total control de tu información.</p>
+            <div class="cta-group">
+                <a href="#" class="btn btn-primary">Únete como conductor</a>
+                <a href="#empresas" class="btn btn-secondary">Soy una empresa</a>
             </div>
-        </div>
-    </section>
+        </section>
 
-    <section id="pricing" class="section">
-        <h2>Modelo de Negocio</h2>
-        <div class="grid">
-            <div class="card pricing-card">
-                <h3>Suscripción Mensual</h3>
-                <div class="price">$29 USD <span style="font-size: 1rem; color: #8b949e">/ mes</span></div>
-                <p>DriverFlow opera bajo un modelo de suscripción mensual. Los clientes pagan una tarifa recurrente para
-                    acceder a las funcionalidades digitales de la plataforma. No se venden productos físicos.</p>
-                <div style="margin: 20px 0; font-size: 0.9rem; color: #8b949e;">
-                    <p>Los pagos se procesan en línea de forma segura mediante Stripe, utilizando suscripciones
-                        recurrentes.</p>
+        <section id="beneficios" class="section">
+            <h2 class="section-title">Diseñado para tu tranquilidad</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>Matches reales</h3>
+                    <p>Nada de perfiles falsos o bots. Conectamos conductores reales con empresas verificadas que necesitan talento hoy mismo.</p>
                 </div>
-                <a href="#" class="cta-button" style="display: block; width: 100%; box-sizing: border-box;">Comenzar</a>
+                <div class="card">
+                    <h3>Control total</h3>
+                    <p>Tú decides con quién hablar. Nada de tu información se comparte sin que ambos acepten el match primero.</p>
+                </div>
+                <div class="card">
+                    <h3>Privacidad protegida</h3>
+                    <p>Tu privacidad es nuestra prioridad. Tus datos están seguros y solo son visibles para empresas con las que decides conectar.</p>
+                </div>
+                <div class="card">
+                    <h3>Sin ruido innecesario</h3>
+                    <p>Dile adiós al spam. Solo recibes notificaciones de oportunidades que realmente encajan con tu experiencia y disponibilidad.</p>
+                </div>
             </div>
-        </div>
-    </section>
+        </section>
+
+        <section id="como-funciona" class="section">
+            <h2 class="section-title">¿Cómo funciona?</h2>
+            <div class="steps">
+                <div class="step-item">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <h4>Crea tu perfil</h4>
+                        <p>Completa tu información profesional y establece tu disponibilidad en pocos minutos.</p>
+                    </div>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">2</div>
+                    <div class="step-content">
+                        <h4>Recibe matches</h4>
+                        <p>Nuestro sistema te conecta con empresas según tus preferencias y ubicación.</p>
+                    </div>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">3</div>
+                    <div class="step-content">
+                        <h4>Conectas y decides</h4>
+                        <p>Si el interés es mutuo, se abre un canal directo. Tú tienes la última palabra.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="empresas" class="section">
+            <div class="company-minimal">
+                <h2 style="margin-top: 0; color: #fff;">También para empresas</h2>
+                <p>Ayudamos a empresas de transporte a encontrar conductores calificados de forma eficiente, eliminando el proceso manual de búsqueda.</p>
+                <a href="#" class="btn btn-secondary">Saber más como empresa</a>
+            </div>
+        </section>
+
+        <section class="section" style="text-align: center;">
+            <h2 class="section-title">Empieza hoy mismo</h2>
+            <p style="margin-bottom: 32px; color: var(--text-muted);">Únete a la red de conductores que eligen un proceso más transparente.</p>
+            <a href="#" class="btn btn-primary">Crear cuenta gratis</a>
+        </section>
+    </main>
 
     <footer>
-        <div class="contact-info">
-            <p><strong>DriverFlow</strong> es operado por:</p>
-            <p><strong>Florida Luxury Services LLC</strong></p>
-            <p>Correo de soporte: <a href="mailto:support@driverflow.app">support@driverflow.app</a></p>
-        </div>
-        <div class="legal-links">
+        <div class="footer-links">
             <a href="legal/terms.html">Términos de Servicio</a>
             <a href="legal/privacy.html">Política de Privacidad</a>
+            <a href="mailto:support@driverflow.app">Soporte</a>
         </div>
-        <p style="margin-top: 40px; font-size: 0.8rem;">&copy; 2026 DriverFlow. Todos los derechos reservados.</p>
+        <p class="copyright">&copy; 2026 DriverFlow - Florida Luxury Services LLC. Todos los derechos reservados.</p>
     </footer>
 </body>
 
