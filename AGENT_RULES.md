@@ -15,9 +15,18 @@ The following files and systems are frozen and cannot be modified unless explici
 - database schema
 - production migrations
 - payment logic
-- match resolution flow (/api/matches/:id/resolve)
+- match resolution flow (/api/matches/:id/resolve) (including PUSH logic)
+- push notification system (MATCH FLOW)
+- `sendPush(...)` function
+- `notifications_service.js` (including Firebase Admin initialization)
+- `/matches/:id/updateMatchStatus` (push triggers)
+- `/driver/confirm-share` (post-commit push logic)
+- `/company/confirm-share` (post-commit push logic)
+- `lazy_matching.js` (push section)
+- `push_tokens` table schema and indices
 
-All Phase 6 components are officially FROZEN as of 2026-03-16.
+All Phase 6 components and PUSH NOTIFICATION MATCH FLOW are officially FROZEN as of 2026-03-20.
+COMMIT → PUSH order is a non-negotiable rule.
 
 Agents must NEVER modify these systems automatically.
 

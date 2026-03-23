@@ -1,0 +1,53 @@
+--- INVOICES TABLE SCHEMA ---
+id: integer
+company_id: integer
+billing_week: text
+issue_date: timestamp with time zone
+status: text
+currency: text
+subtotal_cents: integer
+total_cents: integer
+created_at: timestamp with time zone
+due_date: timestamp with time zone
+paid_at: timestamp with time zone
+paid_method: text
+
+--- EMPRESAS TABLE SCHEMA ---
+id: integer
+nombre: text
+email: text
+password_hash: text
+contacto: text
+telefono: text
+ciudad: text
+estado: text
+fecha_registro: timestamp with time zone
+tier: text
+creditos: integer
+is_blocked: boolean
+blocked_reason: text
+blocked_at: timestamp with time zone
+search_status: text
+legal_name: text
+address_line1: text
+address_state: text
+contact_person: text
+contact_phone: text
+account_state: text
+created_at: timestamp with time zone
+verified: boolean
+verification_token: text
+verification_expires: timestamp with time zone
+reset_token: text
+reset_expires: timestamp with time zone
+failed_attempts: integer
+lockout_until: timestamp with time zone
+city: text
+stripe_subscription_id: text
+stripe_payment_method_id: text
+stripe_customer_id: text
+search_expires_at: timestamp with time zone
+verify_token_hash: text
+verify_token_expires_at: text
+company_logo: text
+company_bio: text
