@@ -240,7 +240,7 @@ const handlers = {
                 SELECT count(*) as cnt, count(distinct driver_id) as drv 
                 FROM tickets 
                 WHERE company_id = ? AND created_at >= ? AND created_at < ? 
-                  AND billing_status = 'billable' 
+                  AND billing_status IN ('unbilled', 'unpaid')
                   AND billing_status NOT IN ('paid', 'invoiced')`,
                 company_id, start, endPlusOne
             );

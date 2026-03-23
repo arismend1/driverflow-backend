@@ -1142,7 +1142,7 @@ app.post('/approve_driver', authenticateToken, async (req, res) => {
         await db.run("UPDATE solicitudes SET estado='ACEPTADA' WHERE id=?", request_id);
 
         // Create Ticket
-        const t = await db.run("INSERT INTO tickets (company_id, driver_id, request_id, price_cents, currency, created_at, billing_status) VALUES (?,?,?,15000,'USD',?,'unpaid')",
+        const t = await db.run("INSERT INTO tickets (company_id, driver_id, request_id, price_cents, currency, created_at, billing_status) VALUES (?,?,?,15000,'USD',?,'unbilled')",
             req.user.id, r.driver_id, request_id, nowIso());
         const tid = t.lastInsertRowid;
 
