@@ -11,6 +11,7 @@ created_at: timestamp with time zone
 due_date: timestamp with time zone
 paid_at: timestamp with time zone
 paid_method: text
+updated_at: timestamp with time zone
 
 --- EMPRESAS TABLE SCHEMA ---
 id: integer
@@ -51,3 +52,11 @@ verify_token_hash: text
 verify_token_expires_at: text
 company_logo: text
 company_bio: text
+accepted_terms_at: text
+accepted_privacy_at: text
+legal_version: text
+requieres_legal_accepted: boolean
+verification_status: text
+verified_at: text
+rejected_reason: text
+billing_suspended: boolean

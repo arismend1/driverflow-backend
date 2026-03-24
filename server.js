@@ -288,7 +288,7 @@ app.get('/legal/terms', (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Terms of Service - DriverFlow</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:2rem;max-width:800px;margin:auto;line-height:1.6;color:#333;}h1,h2{color:#1a1a1a;}</style></head><body>
     <h1>Terms of Service</h1><p><strong>Last Updated: March 2026</strong></p>
     <h2>1. Marketplace Role & Scope</h2><p>DriverFlow acts solely as a technological matching intermediary between independent Transport Companies and CDL Drivers. DriverFlow is NOT a motor carrier, broker, or employer, and does not dictate work conditions or guarantee employment.</p>
-    <h2>2. Payments & Billing</h2><p>Companies utilizing the matching engine are billed according to their usage. Delinquent accounts (unpaid invoices via Stripe) will face immediate platform suspension and matching restrictions.</p>
+    <h2>2. Payments & Billing</h2><p>Companies utilizing the matching engine are billed according to their usage. Delinquent accounts (outstanding invoices via Stripe) will face immediate platform suspension and matching restrictions.</p>
     <h2>3. Acceptable Use</h2><p>Users must submit accurate identification and licensing info. Fraudulent activity, false document uploads, or attempting to circumvent the DriverFlow billing systems will result in immediate permanent termination.</p>
     <h2>4. Limitations of Liability</h2><p>DriverFlow accepts no legal liability for any physical, reputational, or financial damages arising directly from the interactions, employment agreements, or road incidents involving the matched entities.</p>
     </body></html>`);
@@ -355,7 +355,7 @@ app.get('/admin/metrics', async (req, res) => {
         const drivers = await fetchCount('drivers');
         const empresas = await fetchCount('empresas');
         const activeReqs = await fetchCount('solicitudes', "WHERE estado IN ('PENDIENTE','EN_REVISION')");
-        const ticketsUnpaid = await fetchCount('tickets', "WHERE billing_status='unpaid'");
+        const ticketsUnbilled = await fetchCount('tickets', "WHERE billing_status='unbilled'");
         const jobsPending = await fetchCount('jobs_queue', "WHERE status IN ('pending','retry')");
         const eventsPending = await fetchCount('events_outbox', "WHERE queue_status='pending'");
 
@@ -370,7 +370,7 @@ app.get('/admin/metrics', async (req, res) => {
                     <div style="background: #eef; padding: 1rem; border-radius: 4px;"><strong>Drivers:</strong> ${drivers}</div>
                     <div style="background: #eef; padding: 1rem; border-radius: 4px;"><strong>Companies:</strong> ${empresas}</div>
                     <div style="background: #ffe; padding: 1rem; border-radius: 4px;"><strong>Active Reqs:</strong> ${activeReqs}</div>
-                    <div style="background: #fdd; padding: 1rem; border-radius: 4px;"><strong>Unpaid Tickets:</strong> ${ticketsUnpaid}</div>
+                    <div style="background: #fdd; padding: 1rem; border-radius: 4px;"><strong>Unbilled Tickets:</strong> ${ticketsUnbilled}</div>
                     <div style="background: #eee; padding: 1rem; border-radius: 4px;"><strong>Pending Jobs:</strong> ${jobsPending}</div>
                     <div style="background: #eee; padding: 1rem; border-radius: 4px;"><strong>Pending Events:</strong> ${eventsPending}</div>
                 </div>
@@ -3008,7 +3008,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
     if (ticketId) {
         await db.run(
             'UPDATE potential_matches SET ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
-            ticketId, amount, 'USD', now, matchId
+            ticketId, price_cents, 'USD', now, matchId
         );
         console.log(`[ConsentFlow] ticket generated ticket_id=${ticketId}`);
     }

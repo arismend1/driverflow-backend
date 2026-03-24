@@ -790,6 +790,7 @@ async function startQueueWorker() {
     // });
 
     // Heartbeat Loop
+    const HEARTBEAT_INTERVAL_MS = 15000;
     setInterval(async () => {
         try {
             // Upsert Heartbeat
@@ -800,7 +801,7 @@ async function startQueueWorker() {
                 ON CONFLICT(worker_name) DO UPDATE SET last_seen=excluded.last_seen
             `, nowIso());
         } catch (e) { }
-    }, 15000);
+    }, HEARTBEAT_INTERVAL_MS);
 
     // Processing Loop
     while (true) {

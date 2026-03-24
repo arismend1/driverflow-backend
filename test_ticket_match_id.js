@@ -22,8 +22,8 @@ const db = require('./db_adapter');
 
         if (!existingTicket1) {
             const t = await db.run(
-                "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,?,'pending',?)",
-                testMatchId, match.company_id, match.driver_id, 15000, 15000, 'USD', now, `Test Match ID: ${testMatchId}`
+                "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, currency, created_at, billing_status, billing_notes) VALUES (?,?,?,?,?,?,'unbilled',?)",
+                testMatchId, match.company_id, match.driver_id, 15000, 'USD', now, `Test Match ID: ${testMatchId}`
             );
             ticketId = t.lastInsertRowid || (t.rows && t.rows[0] ? t.rows[0].id : null);
             console.log(`✅ 1st call: Ticket created with id=${ticketId}`);
@@ -52,8 +52,8 @@ const db = require('./db_adapter');
         console.log('\n--- DB Constraint Test ---');
         try {
             await db.run(
-                "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status) VALUES (?,?,?,?,?,?,?,'pending')",
-                testMatchId, match.company_id, match.driver_id, 15000, 15000, 'USD', now
+                "INSERT INTO tickets (match_id, company_id, driver_id, price_cents, currency, created_at, billing_status) VALUES (?,?,?,?,?,?,'unbilled')",
+                testMatchId, match.company_id, match.driver_id, 15000, 'USD', now
             );
             console.log('❌ FAIL: DB allowed duplicate!');
         } catch (e) {
