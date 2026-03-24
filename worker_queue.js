@@ -37,13 +37,11 @@ async function enqueueJob(type, payload, options = {}) {
 async function bridgeOutbox() {
     const now = nowIso();
 
-    // Atomic Bridge Transaction using manual BEGIN/COMMIT for Postgres compatibility
+    // Atomic Bridge Transaction using the official beginTransaction helper
+    const tx = await db.beginTransaction();
     try {
-        await db.run('BEGIN');
-
         // Select pending (limit 50 to avoid big transactions)
-        // FOR UPDATE SKIP LOCKED would be better in PG, but keeping it simple for MVP compatibility
-        const rows = await db.all(`
+        const rows = await tx.all(`
             SELECT id, event_name, metadata, audience_type, audience_id, event_key 
             FROM events_outbox 
             WHERE queue_status = 'pending' 
@@ -51,24 +49,21 @@ async function bridgeOutbox() {
         `);
 
         if (rows.length === 0) {
-            await db.run('COMMIT');
+            await tx.commit();
             return;
         }
 
         const ids = rows.map(r => r.id);
 
-        // Mark as 'queued' immediately
-        // In PG, we're in a transaction, so this is safe.
-        // We can't easily do "WHERE id IN (?)" with generic adapter array params efficiently in one go 
-        // without dynamic SQL or JSON args.
-        // Simplest: Loop updates (inside tx, it's fast enough) or dynamic SQL.
-        // Let's use dynamic SQL for the IDs since we have them.
-
-        // Safety: ids are numbers.
+        // Mark as 'queued' immediately with defensive check
         const idList = ids.join(',');
-        await db.run(`UPDATE events_outbox SET queue_status = 'queued', queued_at = ? WHERE id IN (${idList})`, now);
+        await tx.run(`UPDATE events_outbox SET queue_status = 'queued', queued_at = ? WHERE id IN (${idList}) AND queue_status = 'pending'`, now);
 
-        for (const ev of rows) {
+        // Re-fetch only those successfully queued by this transaction to avoid duplicates
+        // Note: For PG, we could use RETURNING, but for cross-compatibility we re-select
+        const confirmedRows = await tx.all(`SELECT * FROM events_outbox WHERE id IN (${idList}) AND queue_status = 'queued' AND queued_at = ?`, now);
+
+        for (const ev of confirmedRows) {
             let meta = {};
             try { meta = JSON.parse(ev.metadata || '{}'); } catch { }
 
@@ -93,34 +88,27 @@ async function bridgeOutbox() {
 
             if (jobType) {
                 try {
-                    await db.run(`
+                    await tx.run(`
                         INSERT INTO jobs_queue (
                             job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, source_event_id, status
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-                    `,
-                        jobType,
-                        JSON.stringify(payload),
-                        now,
-                        5,
-                        now,
-                        `ev_${ev.id}`, // idempotency_key
-                        ev.id          // source_event_id (UNIQUE constraint)
-                    );
-                } catch (e) {
-                    if (e.message.includes('UNIQUE')) {
-                        logger.warn(`Duplicate bridge attempt for event ${ev.id}`);
+                    `, jobType, JSON.stringify(payload), now, 5, now, ev.event_key || null, ev.id);
+                } catch (err) {
+                    if (err.message.toUpperCase().includes('UNIQUE')) {
+                        logger.warn(`Skip duplicate job for event ${ev.id}`);
                     } else {
-                        throw e;
+                        throw err;
                     }
                 }
             }
         }
 
-        await db.run('COMMIT');
+        await tx.commit();
 
     } catch (e) {
-        try { await db.run('ROLLBACK'); } catch (err) { }
-        if (!e.message.includes('busy')) logger.error('Bridge Error', e);
+        await tx.rollback();
+        if (!e.message.includes('busy')) logger.error('Bridge Outbox Error', e);
+        return;
     }
 }
 
@@ -594,22 +582,10 @@ async function processJobs() {
     }
 
     // 1. Claim Batch (Atomic Transaction)
+    const tx = await db.beginTransaction();
     try {
-        await db.run('BEGIN');
-
-        // Note: For high concurrency in Postgres, "FOR UPDATE SKIP LOCKED" is best.
-        // Using simple UPDATE ... WHERE ... RETURNING is a good approximation for MVP if rows are locked.
-        // But here we do: Select -> Update. 
-        // In Repeatable Read this might serialize or fail. In Read Committed it's okay but might race.
-        // We'll rely on optimistic locking or standard locking.
-
         // Simpler approach compatible with Generic Adapter:
-        // Use a single atomic UPDATE ... RETURNING ... LIMIT?
-        // SQLite doesn't support UPDATE LIMIT easily without compiled options.
-        // PG does with CTEs.
-        // Standard MVP way: Fetch candidate IDs -> Update them -> Process them.
-
-        const candidates = await db.all(`
+        const candidates = await tx.all(`
             SELECT id FROM jobs_queue 
             WHERE status = 'pending' AND run_at <= ? 
             LIMIT ?
@@ -619,22 +595,25 @@ async function processJobs() {
             const ids = candidates.map(c => c.id);
             const idList = ids.join(',');
 
-            // Mark captured
-            await db.run(`
+            // Mark captured ONLY if still pending
+            await tx.run(`
                 UPDATE jobs_queue 
                 SET status = 'processing', locked_by = ?, locked_at = ? 
-                WHERE id IN (${idList})
+                WHERE id IN (${idList}) AND status = 'pending'
             `, WORKER_ID, now);
 
-            // Re-fetch full data
-            const claimed = await db.all(`SELECT * FROM jobs_queue WHERE id IN (${idList})`);
+            // Re-fetch ONLY jobs successfully claimed by THIS worker
+            const claimed = await tx.all(`
+                SELECT * FROM jobs_queue 
+                WHERE id IN (${idList}) AND status = 'processing' AND locked_by = ? AND locked_at = ?
+            `, WORKER_ID, now);
             jobsToProcess.push(...claimed);
         }
 
-        await db.run('COMMIT');
+        await tx.commit();
 
     } catch (e) {
-        try { await db.run('ROLLBACK'); } catch { }
+        await tx.rollback();
         if (!e.message.includes('busy')) logger.error('Worker Claim Error', e);
         return;
     }

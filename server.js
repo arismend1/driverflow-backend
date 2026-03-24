@@ -122,22 +122,25 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    const tx = await db.beginTransaction();
     try {
         // 1. Safe insertion mapped as lock (PostgreSQL ON CONFLICT)
         try {
-            await db.run(
-                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES ($1, $2, CURRENT_TIMESTAMP, 'pending')`,
+            await tx.run(
+                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES (?, ?, CURRENT_TIMESTAMP, 'pending')`,
                 event.id, event.type
             );
         } catch (err) {
             // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
             if (err.code === '23505' || err.message.includes('UNIQUE')) {
-                const existing = await db.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=$1`, event.id);
+                const existing = await tx.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=?`, event.id);
                 if (existing && existing.status === 'processed') {
+                    await tx.rollback();
                     return res.json({ received: true });
                 }
                 // If pending/failed from a previous crash, fall through and retry processing
             } else {
+                await tx.rollback();
                 throw err;
             }
         }
@@ -167,15 +170,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
             if (invoiceId) {
                 // Direct Reconciliation (Worker Originated)
-                const pre = await db.get("SELECT status FROM invoices WHERE id=?", invoiceId);
+                const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
                 if (pre && pre.status !== 'charged') {
-                    await db.run(`
+                    await tx.run(`
                         UPDATE invoices 
-                        SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
-                        WHERE id=$6 AND status != 'charged'
+                        SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
+                        WHERE id=? AND status != 'charged'
                     `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
                     
-                    await db.run(`
+                    await tx.run(`
                         UPDATE tickets 
                         SET billing_status = 'paid'
                         WHERE id IN (
@@ -186,15 +189,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                 }
             } else {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
-                const pre = await db.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
+                const pre = await tx.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
                 if (pre && pre.status !== 'charged') {
-                    await db.run(`
+                    await tx.run(`
                         UPDATE invoices 
-                        SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
-                        WHERE stripe_payment_intent_id=$5 AND status != 'charged'
+                        SET status='charged', stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
+                        WHERE stripe_payment_intent_id=? AND status != 'charged'
                     `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
 
-                    await db.run(`
+                    await tx.run(`
                         UPDATE tickets 
                         SET billing_status = 'paid'
                         WHERE id IN (
@@ -212,7 +215,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             const ticketId = session.metadata?.ticket_id || session.client_reference_id;
             if (ticketId) {
                 // Load ticket from DB for amount validation
-                const ticket = await db.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
+                const ticket = await tx.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
                 if (!ticket) {
                     console.error(`[Stripe Webhook] Ticket #${ticketId} NOT FOUND in DB. Skipping.`);
                 } else if (session.amount_total !== ticket.price_cents) {
@@ -222,7 +225,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                 } else {
                     const piId = session.payment_intent || null;
                     const customerId = session.customer || null;
-                    await db.run(
+                    await tx.run(
                         `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
                         nowIso(), piId, customerId, ticketId
                     );
@@ -231,11 +234,19 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             } else if (session.metadata?.type === 'weekly_invoice' && session.metadata?.invoice_id) {
                 const invoiceId = session.metadata.invoice_id;
                 const piId = session.payment_intent || null;
-                await db.run(`
+                await tx.run(`
                     UPDATE invoices 
-                    SET status='charged', paid_at=$1 
-                    WHERE id=$2 AND status != 'charged'
-                `, nowIso(), invoiceId);
+                    SET status='charged', paid_at=?, updated_at=? 
+                    WHERE id=? AND status != 'charged'
+                `, nowIso(), nowIso(), invoiceId);
+
+                await tx.run(`
+                    UPDATE tickets 
+                    SET billing_status = 'paid'
+                    WHERE id IN (
+                        SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                    )
+                `, invoiceId);
                 console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
                 
                 // --- HOOK: Push Notification ---
@@ -248,9 +259,12 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         }
 
         // Complete Event Lock
-        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=$1`, event.id);
+        await tx.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=?`, event.id);
+        
+        await tx.commit();
         res.json({ received: true });
     } catch (err) {
+        await tx.rollback();
         console.error('[Stripe Processing Error]', err);
         res.status(500).send('Internal Server Error');
     }

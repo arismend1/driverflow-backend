@@ -116,6 +116,11 @@ module.exports = {
                     const res = await client.query(pgSql, args);
                     return res.rows.length ? res.rows[0] : null;
                 },
+                all: async (sql, ...args) => {
+                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
+                    const res = await client.query(pgSql, args);
+                    return res.rows;
+                },
                 commit: async () => { await client.query('COMMIT'); client.release(); },
                 rollback: async () => { await client.query('ROLLBACK'); client.release(); }
             };
@@ -127,6 +132,7 @@ module.exports = {
                     return { lastInsertRowid: info.lastInsertRowid, ...info };
                 },
                 get: async (sql, ...args) => sqliteDb.prepare(sql).get(args),
+                all: async (sql, ...args) => sqliteDb.prepare(sql).all(args),
                 commit: async () => sqliteDb.exec('COMMIT'),
                 rollback: async () => { try{ sqliteDb.exec('ROLLBACK') }catch(e){} }
             };
