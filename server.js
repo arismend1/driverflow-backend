@@ -87,16 +87,21 @@ async function auditLog(action, actorId, targetId, metadata, req) {
     } catch (e) { console.error('Audit Fail:', e.message); }
 }
 
-// 3.4 Request ID
-app.use((req, res, next) => {
-    const rid = req.headers['x-request-id'] || crypto.randomUUID();
-    req.requestId = rid;
-    res.setHeader('X-Request-Id', rid);
-    res.setHeader('X-App-Version', '1.3.1-fix-json');
-    next();
+// 3.4 Static Files (Dashboard)
+app.use(express.static('public'));
+
+// 3.5 Root Health Route (Ensure Render sees service)
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'UP', 
+        version: '1.4.0-atomic', 
+        engine: db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite' 
+    });
 });
 
-console.log("[SERVER] Starting Version: 1.3.1-fix-json");
+app.get('/health', (req, res) => res.sendStatus(200));
+
+console.log("[SERVER] Starting Version: 1.4.0-atomic");
 
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
@@ -269,6 +274,10 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         res.status(500).send('Internal Server Error');
     }
 });
+
+// JSON & URL encoded body parsers (AFTER raw webhook)
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Legacy Webhook Redirects
 const legacyWebhook = (req, res) => {
@@ -3639,15 +3648,17 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
 async function startServer() {
   try {
     console.log("🚀 Running push_tokens migration...");
-    await runPushMigration();
-    console.log("✅ Migration completed.");
+    await runPushMigration().catch(err => {
+      console.error("⚠️ Migration warning:", err.message);
+    });
+    console.log("✅ Migration step finished.");
 
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
         console.log(`DB Mode: ${db.IS_POSTGRES ? 'PostgreSQL' : 'SQLite'}`);
     });
   } catch (e) {
-    console.error("❌ Migration failed:", e.message);
+    console.error("❌ Critical start error:", e.message);
     process.exit(1);
   }
 }
