@@ -14,6 +14,7 @@ const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com"
 const FROM_NAME = "DriverFlow";
 
 // --- ENQUEUE HELPER ---
+
 async function enqueueJob(type, payload, options = {}) {
     // options: { run_at, max_attempts, idempotency_key }
     const runAt = options.run_at || nowIso();
@@ -751,6 +752,28 @@ async function startQueueWorker() {
             }
         } catch (err) {
             logger.error("[Scheduler][Dunning] Error", err);
+        }
+    });
+
+    // 4. Janitor Job: Rescata facturas atascadas en 'charging' (Ejecución cada hora)
+    cron.schedule('45 * * * *', async () => {
+        logger.info('[Janitor] Checking for stuck invoices...');
+        try {
+            // Umbral: 1 hora de inactividad
+            const threshold = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+            const stuck = await db.all(`
+                SELECT id FROM invoices 
+                WHERE status = 'charging' 
+                  AND updated_at < ? 
+                  AND paid_at IS NULL
+            `, threshold);
+
+            for (const inv of stuck) {
+                await db.run(`UPDATE invoices SET status = 'retrying', updated_at = ? WHERE id = ?`, nowIso(), inv.id);
+                logger.warn(`[Janitor] Recovered stuck invoice ${inv.id}`);
+            }
+        } catch (e) {
+            logger.error('[Janitor] Fatal error in recovery loop', e);
         }
     });
 
