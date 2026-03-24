@@ -6,7 +6,7 @@ async function testCharge() {
         console.log("--- Setup Test Charge Invoice #5 ---");
 
         // 1. Set Amount to 100 (so it doesn't auto-close)
-        await db.run("UPDATE weekly_invoices SET amount_cents = 100, status='pending' WHERE id = 5");
+        await db.run("UPDATE invoices SET total_cents = 100, status='pending' WHERE id = 5");
         console.log("Updated Invoice 5 amount to 100.");
 
         // 2. Enqueue Job

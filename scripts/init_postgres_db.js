@@ -116,7 +116,7 @@ async function initDB() {
                     id SERIAL PRIMARY KEY,
                     invoice_id INTEGER,
                     ticket_id INTEGER,
-                    amount_cents INTEGER,
+                    price_cents INTEGER,
                     description TEXT,
                     created_at TEXT
                 );
@@ -126,7 +126,7 @@ async function initDB() {
                 CREATE TABLE IF NOT EXISTS credit_notes (
                     id SERIAL PRIMARY KEY,
                     company_id INTEGER,
-                    amount_cents INTEGER,
+                    price_cents INTEGER,
                     reason TEXT,
                     created_at TEXT
                 );

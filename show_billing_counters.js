@@ -19,7 +19,7 @@ try {
     const ticketsBilled = getCount("SELECT COUNT(1) as count FROM tickets WHERE billing_status = 'billed'");
     const invoicesTotal = getCount("SELECT COUNT(1) as count FROM invoices");
     const invoicesPending = getCount("SELECT COUNT(1) as count FROM invoices WHERE status = 'pending'");
-    const eventsPending = getCount("SELECT COUNT(1) as count FROM events_outbox WHERE process_status = 'pending' AND event_name = 'invoice_generated'");
+    const eventsPending = getCount("SELECT COUNT(1) as count FROM events_outbox WHERE process_status = 'pending' AND event_name = 'weekly_invoice_generated'");
 
     // 4. Output Results
     console.log(`tickets_unbilled: ${ticketsUnbilled}`);

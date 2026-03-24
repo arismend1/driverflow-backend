@@ -85,7 +85,7 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
                 company_id INTEGER,
                 driver_id INTEGER,
                 price_cents INTEGER,
-                amount_cents INTEGER, -- Fallback
+                total_cents INTEGER, -- Fallback
                 currency TEXT DEFAULT 'usd',
                 billing_status TEXT DEFAULT 'pending', -- pending, paid, void, failed
                 created_at TEXT,
@@ -124,7 +124,7 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
                 invoice_id INTEGER,
                 ticket_id INTEGER,
                 description TEXT,
-                amount_cents INTEGER,
+                total_cents INTEGER,
                 currency TEXT
             )
         `);
@@ -135,7 +135,7 @@ console.log('--- [PROD MIGRATION] CONSOLIDATED SCHEMA FIX ---');
                 id SERIAL PRIMARY KEY,
                 company_id INTEGER,
                 invoice_id INTEGER,
-                amount_cents INTEGER,
+                total_cents INTEGER,
                 reason TEXT,
                 created_at TEXT
             )

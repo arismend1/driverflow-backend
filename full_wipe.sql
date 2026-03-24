@@ -24,7 +24,7 @@ DELETE FROM stripe_webhook_events;
 DELETE FROM jobs_queue;
 DELETE FROM admin_users;
 DELETE FROM admin_audit_log;
-DELETE FROM weekly_invoices;
+DELETE FROM invoices;
 DELETE FROM metrics_snapshot;
 DELETE FROM tickets;
 

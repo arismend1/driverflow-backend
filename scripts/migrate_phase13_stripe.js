@@ -4,8 +4,8 @@ async function migrate() {
     try {
         console.log('Beginning Phase 13 Migration: Stripe Automation...');
 
-        // 1. Add columns to weekly_invoices
-        console.log('Adding Stripe columns to weekly_invoices...');
+        // 1. Add columns to invoices
+        console.log('Adding Stripe columns to invoices...');
 
         // We use a block to handle "column exists" errors gracefully in Postgres without PL/pgSQL if possible, 
         // but since we are using the adapter, we can just run ALTER TABLE IF NOT EXISTS logic or catch errors.
@@ -22,7 +22,7 @@ async function migrate() {
 
         for (const col of columns) {
             try {
-                await db.exec(`ALTER TABLE weekly_invoices ${col};`);
+                await db.exec(`ALTER TABLE invoices ${col};`);
                 console.log(`Executed: ${col}`);
             } catch (e) {
                 // Ignore "already exists" errors specifically, but log others
@@ -49,7 +49,7 @@ async function migrate() {
 
         // 3. Create Index on stripe_payment_intent_id for lookups
         console.log('Creating index on stripe_payment_intent_id...');
-        await db.exec(`CREATE INDEX IF NOT EXISTS idx_weekly_invoices_stripe_pi ON weekly_invoices(stripe_payment_intent_id);`);
+        await db.exec(`CREATE INDEX IF NOT EXISTS idx_invoices_stripe_pi ON invoices(stripe_payment_intent_id);`);
 
         console.log('Phase 13 Migration completed successfully.');
         process.exit(0);

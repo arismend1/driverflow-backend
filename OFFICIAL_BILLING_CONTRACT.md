@@ -9,7 +9,7 @@
 - **Reglas**:
     - NO puede ser NULL.
     - DEBE ser > 0.
-    - PROHIBIDO el uso de `amount_cents`.
+    - PROHIBIDO el uso de `total_cents`.
     - PROHIBIDO fallbacks o valores hardcodeados.
 
 ## [2] ESTADOS DE TICKETS
@@ -24,6 +24,14 @@ graph TD
     invoiced --> paid
     unbilled --> void
 ```
+
+## [3.1] ESTADOS DE INVOICE
+- `pending`: Creada, esperando proceso de cobro.
+- `charging`: Bloqueo de seguridad durante transacción con Stripe.
+- `failed`: **ESTADO TRANSITORIO RECUPERABLE**. Indica fallo en el último intento (e.g. fondos insuficientes). Permite reintentos automáticos (Dunning) o manuales.
+- `retrying`: Programada para reintento automático por el Worker.
+- `charged`: Estado final exitoso (Pagada).
+- `suspended`: Estado terminal por fallo reiterado (Dunning Maxed). Requiere intervención manual.
 
 ## [4] FACTURACIÓN (QUERY OFICIAL)
 - **Filtro**: `WHERE billing_status = 'unbilled'`
@@ -49,12 +57,13 @@ graph TD
 - **Columnas**: `created_at`, `updated_at`, `paid_at`
 - **Regla**: Toda actualización DEBE modificar `updated_at`.
 
-## [8] JANITOR JOB
-- **Condición**:
+## [8] JANITOR JOB / DUNNING
+- **Condición Janitor**:
     - `status = 'charging'`
-    - `updated_at < NOW() - INTERVAL '1 hour'`
+    - `updated_at < (Now - 1 hour)`
     - `paid_at IS NULL`
-- **Acción**: `status` → `'retrying'`
+- **Acción Janitor**: `status` → `'retrying'`
+- **Recuperación Failed**: Las facturas en `failed` son elegibles para reintento automático basado en `next_retry_at`.
 
 ## [9] REGLAS ABSOLUTAS
 1. No crear nuevas columnas sin autorización.

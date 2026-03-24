@@ -5,7 +5,7 @@ const tables = [
     'drivers', 'empresas', 'potential_matches', 'matches', 'tickets',
     'solicitudes', 'ratings', 'driver_profiles', 'company_requirements',
     'company_match_prefs', 'invoices', 'invoice_items', 'events_outbox',
-    'jobs_queue', 'audit_logs', 'admin_audit_log', 'weekly_invoices',
+    'jobs_queue', 'audit_logs', 'admin_audit_log', 'invoices',
     'metrics_snapshot', 'request_visibility', 'webhook_events',
     'credit_notes', 'password_resets', 'email_verifications',
     'worker_heartbeat', 'stripe_webhook_events', 'admin_users'

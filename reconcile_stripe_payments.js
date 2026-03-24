@@ -14,24 +14,15 @@ async function reconcileStripePayments() {
 
     console.log(`[Reconciler] Starting — looking for tickets stuck in checkout_created > ${STALE_MINUTES}m`);
 
-    let staleTickets;
-    if (db.IS_POSTGRES) {
-        staleTickets = await db.all(
-            `SELECT id, stripe_checkout_session_id, price_cents, currency
-             FROM tickets
-             WHERE billing_status = 'checkout_created'
-               AND stripe_checkout_session_id IS NOT NULL
-               AND created_at < NOW() - INTERVAL '${STALE_MINUTES} minutes'`
-        );
-    } else {
-        staleTickets = await db.all(
-            `SELECT id, stripe_checkout_session_id, price_cents, currency
-             FROM tickets
-             WHERE billing_status = 'checkout_created'
-               AND stripe_checkout_session_id IS NOT NULL
-               AND created_at < datetime('now', '-${STALE_MINUTES} minutes')`
-        );
-    }
+    const staleAt = new Date(Date.now() - STALE_MINUTES * 60000).toISOString();
+    const query = `
+        SELECT id, stripe_checkout_session_id, price_cents, currency
+        FROM tickets
+        WHERE billing_status = 'checkout_created'
+          AND stripe_checkout_session_id IS NOT NULL
+          AND created_at < ?
+    `;
+    staleTickets = await db.all(query, staleAt);
 
     console.log(`[Reconciler] Found ${staleTickets.length} stale ticket(s)`);
 

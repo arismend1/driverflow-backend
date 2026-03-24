@@ -45,7 +45,7 @@ function getWeekData(cId, weekLabel) {
 
   // 1. Debt at start of week: Invoices created BEFORE monday AND (paid_at IS NULL OR paid_at >= monday)
   // Logic: Invoice exists ('created_at' < monday) and is not paid by monday.
-  // Note: generate_weekly_invoices sets 'issue_date'.
+  // Note: generate_invoices sets 'issue_date'.
   // We assume 'issue_date' is the main timestamp.
   const debtRows = db.prepare(`
     SELECT issue_date, paid_at, total_cents

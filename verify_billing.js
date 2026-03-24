@@ -79,7 +79,7 @@ const check = (desc) => {
 
     // Event checking
     // request_id is the invoice_id for this event
-    const evt = db.prepare("SELECT * FROM events_outbox WHERE request_id = ? AND event_name='invoice_generated'").get(inv.id);
+    const evt = db.prepare("SELECT * FROM events_outbox WHERE request_id = ? AND event_name='weekly_invoice_generated'").get(inv.id);
     console.log(`Event found: ${!!evt}`);
     if (evt) console.log(`Event Metadata: ${evt.metadata}`);
 }

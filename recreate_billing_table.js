@@ -2,14 +2,14 @@ const db = require('./db_adapter');
 
 async function migrate() {
     try {
-        console.log("Creando tabla weekly_invoices si no existe...");
+        console.log("Creando tabla invoices si no existe...");
         await db.run(`
-            CREATE TABLE IF NOT EXISTS weekly_invoices (
+            CREATE TABLE IF NOT EXISTS invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
                 week_start TEXT NOT NULL,
                 week_end TEXT NOT NULL,
-                amount_cents INTEGER NOT NULL DEFAULT 0,
+                total_cents INTEGER NOT NULL DEFAULT 0,
                 currency TEXT DEFAULT 'usd',
                 status TEXT NOT NULL DEFAULT 'pending',
                 stripe_payment_intent_id TEXT,
@@ -31,8 +31,8 @@ async function migrate() {
         `);
 
         // Ensure columns if table already existed without them
-        try { await db.run("ALTER TABLE weekly_invoices ADD COLUMN stripe_charge_id TEXT;"); } catch (e) { }
-        try { await db.run("ALTER TABLE weekly_invoices ADD COLUMN receipt_url TEXT;"); } catch (e) { }
+        try { await db.run("ALTER TABLE invoices ADD COLUMN stripe_charge_id TEXT;"); } catch (e) { }
+        try { await db.run("ALTER TABLE invoices ADD COLUMN receipt_url TEXT;"); } catch (e) { }
 
         console.log("Migracion completada exitosamente.");
     } catch (e) {

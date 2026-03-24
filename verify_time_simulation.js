@@ -95,11 +95,11 @@ try {
     // Since we rely on `getMondayBasedWeekLabel` inside the script if no arg provided.
 
     // Let's create tickets dynamically after setup?
-    // Actually, `generate_weekly_invoices` takes an arg.
+    // Actually, `generate_invoices` takes an arg.
     // We should use specific weeks corresponding to "Simulated Now".
 
     // To simplify: I'll manually determine the weeks based on the Start Time, create tickets, then run the sequence.
-    // PROBLEM: `generate_weekly_invoices` sets `due_date` based on the target week.
+    // PROBLEM: `generate_invoices` sets `due_date` based on the target week.
     // If target week is "2025-01", Due Date is "2025-01-03".
     // If Sim Time is "2026", "2025-01-03" IS overdue.
     // So we MUST use weeks close to "Real Now".

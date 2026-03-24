@@ -29,7 +29,7 @@ for (let i = 1; i <= 4; i++) db.prepare(reqSql).run(200 + i);
 // Create Tickets for Current and Future Weeks
 // We don't know exact week labels easily without the helper.
 // But we can just create tickets with dates spaced 7 days apart starting "Tomorrow".
-// `generate_weekly_invoices` detects week from `created_at`.
+// `generate_invoices` detects week from `created_at`.
 const now = new Date(); // Real Now
 const oneDay = 24 * 3600 * 1000;
 const startT = now.getTime() + oneDay; // start tomorrow

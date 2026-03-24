@@ -25,7 +25,7 @@
 3.  **Match Confirmed (Ticket Generated)**
     *   **Trigger**: Mutually accepted request (Company & Driver both accepted).
     *   **Recipient**: Company Admin & Driver.
-    *   **Purpose**: Notification of successful match and release of contact details. **Marks the creation of a billable ticket.**
+    *   **Purpose**: Notification of successful match and release of contact details. **Marks the creation of a unbilled ticket.**
     *   **Nature**: Informational / Operational.
 
 ### B) Financial
@@ -51,25 +51,25 @@
 ### C) Risk / Delinquency
 
 7.  **Late Payment Notice #1**
-    *   **Trigger**: 1 unpaid billing cycle (Friday pass without payment).
+    *   **Trigger**: 1 unbilled billing cycle (Friday pass without payment).
     *   **Recipient**: Company Admin.
     *   **Purpose**: Friendly reminder of overdue balance.
     *   **Nature**: Warning (Low).
 
 8.  **Late Payment Notice #2**
-    *   **Trigger**: 2 unpaid billing cycles.
+    *   **Trigger**: 2 unbilled billing cycles.
     *   **Recipient**: Company Admin.
     *   **Purpose**: Urgent reminder of overdue balance.
     *   **Nature**: Warning (Medium).
 
 9.  **Late Payment Notice #3**
-    *   **Trigger**: 3 unpaid billing cycles.
+    *   **Trigger**: 3 unbilled billing cycles.
     *   **Recipient**: Company Admin.
     *   **Purpose**: Final warning before service blockage.
     *   **Nature**: Warning (Critical).
 
 10. **Account Blocked Notice**
-    *   **Trigger**: 4 unpaid billing cycles.
+    *   **Trigger**: 4 unbilled billing cycles.
     *   **Recipient**: Company Admin.
     *   **Purpose**: Notification that the account has been suspended due to non-payment.
     *   **Nature**: Warning (Blockage / Service Suspension).
@@ -83,8 +83,8 @@
 *   **Aggregation**: All tickets generated within the Accounting Week are grouped by Company.
 *   **Invoice Issuance**: Generated and sent every **Monday** for the preceding week.
 *   **Target Payment Day**: **Friday** of the week the invoice is issued.
-*   **Grace Period**: The system allows continued operation for up to 4 consecutive unpaid weekly cycles.
-*   **Action at 4th Unpaid Cycle**: **Automatic Account Block**. The company cannot create new requests until the debt is resolved.
+*   **Grace Period**: The system allows continued operation for up to 4 consecutive unbilled weekly cycles.
+*   **Action at 4th Unbilled Cycle**: **Automatic Account Block**. The company cannot create new requests until the debt is resolved.
 *   **Reactivation**: Account is reactivated **only** after full payment of all overdue invoices.
 
 ---

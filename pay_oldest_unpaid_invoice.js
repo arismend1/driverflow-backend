@@ -5,15 +5,15 @@ const { checkAndEnforceBlocking } = require('./delinquency');
 const companyId = parseInt(process.argv[2]);
 
 if (!companyId) {
-    console.log("Usage: node pay_oldest_unpaid_invoice.js <company_id>");
+    console.log("Usage: node pay_oldest_unbilled_invoice.js <company_id>");
     process.exit(1);
 }
 
-// 1. Find the oldest invoice that is PENDING (unpaid) or PARTIAL?
+// 1. Find the oldest invoice that is PENDING (unbilled) or PARTIAL?
 // Schema says check if `paid_at` is null or status?
 // Invoices table has 'status'. 'pending', 'paid', 'overdue'?
 // delinquency.js checks if due_date < now AND (status='pending' OR status='overdue'??)
-// Actually generate_weekly_invoices sets status='pending'.
+// Actually generate_invoices sets status='pending'.
 // Let's check pending or overdue. Ideally anything not 'paid' or 'void'.
 const invoice = db.prepare(`
     SELECT id, status, due_date, total_cents 
@@ -29,7 +29,7 @@ if (!invoice) {
     process.exit(0);
 }
 
-console.log(`Found Oldest Unpaid Invoice: ID ${invoice.id} (Status: ${invoice.status}, Due: ${invoice.due_date})`);
+console.log(`Found Oldest Unbilled Invoice: ID ${invoice.id} (Status: ${invoice.status}, Due: ${invoice.due_date})`);
 
 // 2. Mark Paid
 // Transaction
@@ -51,7 +51,7 @@ const runTx = db.transaction(() => {
         VALUES ('invoice_paid', ?, ?, ?, ?)
     `).run(paidTime, companyId, invoice.id, JSON.stringify({
         invoice_id: invoice.id,
-        amount_cents: invoice.total_cents,
+        total_cents: invoice.total_cents,
         method: 'manual_sim'
     }));
 });

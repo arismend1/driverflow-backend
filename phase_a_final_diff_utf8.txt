@@ -1,0 +1,287 @@
+﻿diff --git a/db_adapter.js b/db_adapter.js
+index b7bcb25..4ec83ea 100644
+--- a/db_adapter.js
++++ b/db_adapter.js
+@@ -116,6 +116,11 @@ module.exports = {
+                     const res = await client.query(pgSql, args);
+                     return res.rows.length ? res.rows[0] : null;
+                 },
++                all: async (sql, ...args) => {
++                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
++                    const res = await client.query(pgSql, args);
++                    return res.rows;
++                },
+                 commit: async () => { await client.query('COMMIT'); client.release(); },
+                 rollback: async () => { await client.query('ROLLBACK'); client.release(); }
+             };
+@@ -127,6 +132,7 @@ module.exports = {
+                     return { lastInsertRowid: info.lastInsertRowid, ...info };
+                 },
+                 get: async (sql, ...args) => sqliteDb.prepare(sql).get(args),
++                all: async (sql, ...args) => sqliteDb.prepare(sql).all(args),
+                 commit: async () => sqliteDb.exec('COMMIT'),
+                 rollback: async () => { try{ sqliteDb.exec('ROLLBACK') }catch(e){} }
+             };
+diff --git a/server.js b/server.js
+index fed8226..1b42ba0 100644
+--- a/server.js
++++ b/server.js
+@@ -122,22 +122,25 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+         return res.status(400).send(`Webhook Error: ${err.message}`);
+     }
+ 
++    const tx = await db.beginTransaction();
+     try {
+         // 1. Safe insertion mapped as lock (PostgreSQL ON CONFLICT)
+         try {
+-            await db.run(
+-                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES ($1, $2, CURRENT_TIMESTAMP, 'pending')`,
++            await tx.run(
++                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES (?, ?, CURRENT_TIMESTAMP, 'pending')`,
+                 event.id, event.type
+             );
+         } catch (err) {
+             // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
+             if (err.code === '23505' || err.message.includes('UNIQUE')) {
+-                const existing = await db.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=$1`, event.id);
++                const existing = await tx.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=?`, event.id);
+                 if (existing && existing.status === 'processed') {
++                    await tx.rollback();
+                     return res.json({ received: true });
+                 }
+                 // If pending/failed from a previous crash, fall through and retry processing
+             } else {
++                await tx.rollback();
+                 throw err;
+             }
+         }
+@@ -167,15 +170,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+ 
+             if (invoiceId) {
+                 // Direct Reconciliation (Worker Originated)
+-                const pre = await db.get("SELECT status FROM invoices WHERE id=?", invoiceId);
++                const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
+                 if (pre && pre.status !== 'charged') {
+-                    await db.run(`
++                    await tx.run(`
+                         UPDATE invoices 
+-                        SET status='charged', stripe_payment_intent_id=$1, stripe_charge_id=$2, receipt_url=$3, paid_at=$4, updated_at=$5 
+-                        WHERE id=$6 AND status != 'charged'
++                        SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
++                        WHERE id=? AND status != 'charged'
+                     `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
+                     
+-                    await db.run(`
++                    await tx.run(`
+                         UPDATE tickets 
+                         SET billing_status = 'paid'
+                         WHERE id IN (
+@@ -186,15 +189,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+                 }
+             } else {
+                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
+-                const pre = await db.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
++                const pre = await tx.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
+                 if (pre && pre.status !== 'charged') {
+-                    await db.run(`
++                    await tx.run(`
+                         UPDATE invoices 
+-                        SET status='charged', stripe_charge_id=$1, receipt_url=$2, paid_at=$3, updated_at=$4 
+-                        WHERE stripe_payment_intent_id=$5 AND status != 'charged'
++                        SET status='charged', stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
++                        WHERE stripe_payment_intent_id=? AND status != 'charged'
+                     `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
+ 
+-                    await db.run(`
++                    await tx.run(`
+                         UPDATE tickets 
+                         SET billing_status = 'paid'
+                         WHERE id IN (
+@@ -212,7 +215,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+             const ticketId = session.metadata?.ticket_id || session.client_reference_id;
+             if (ticketId) {
+                 // Load ticket from DB for amount validation
+-                const ticket = await db.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
++                const ticket = await tx.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
+                 if (!ticket) {
+                     console.error(`[Stripe Webhook] Ticket #${ticketId} NOT FOUND in DB. Skipping.`);
+                 } else if (session.amount_total !== ticket.price_cents) {
+@@ -222,7 +225,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+                 } else {
+                     const piId = session.payment_intent || null;
+                     const customerId = session.customer || null;
+-                    await db.run(
++                    await tx.run(
+                         `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
+                         nowIso(), piId, customerId, ticketId
+                     );
+@@ -231,10 +234,10 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+             } else if (session.metadata?.type === 'weekly_invoice' && session.metadata?.invoice_id) {
+                 const invoiceId = session.metadata.invoice_id;
+                 const piId = session.payment_intent || null;
+-                await db.run(`
++                await tx.run(`
+                     UPDATE invoices 
+-                    SET status='charged', paid_at=$1 
+-                    WHERE id=$2 AND status != 'charged'
++                    SET status='charged', paid_at=? 
++                    WHERE id=? AND status != 'charged'
+                 `, nowIso(), invoiceId);
+                 console.log(`[Stripe Webhook] Γ£à Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
+                 
+@@ -248,9 +251,12 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
+         }
+ 
+         // Complete Event Lock
+-        await db.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=$1`, event.id);
++        await tx.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=?`, event.id);
++        
++        await tx.commit();
+         res.json({ received: true });
+     } catch (err) {
++        await tx.rollback();
+         console.error('[Stripe Processing Error]', err);
+         res.status(500).send('Internal Server Error');
+     }
+diff --git a/worker_queue.js b/worker_queue.js
+index 2e4d5ac..f4ed972 100644
+--- a/worker_queue.js
++++ b/worker_queue.js
+@@ -37,13 +37,11 @@ async function enqueueJob(type, payload, options = {}) {
+ async function bridgeOutbox() {
+     const now = nowIso();
+ 
+-    // Atomic Bridge Transaction using manual BEGIN/COMMIT for Postgres compatibility
++    // Atomic Bridge Transaction using the official beginTransaction helper
++    const tx = await db.beginTransaction();
+     try {
+-        await db.run('BEGIN');
+-
+         // Select pending (limit 50 to avoid big transactions)
+-        // FOR UPDATE SKIP LOCKED would be better in PG, but keeping it simple for MVP compatibility
+-        const rows = await db.all(`
++        const rows = await tx.all(`
+             SELECT id, event_name, metadata, audience_type, audience_id, event_key 
+             FROM events_outbox 
+             WHERE queue_status = 'pending' 
+@@ -51,22 +49,15 @@ async function bridgeOutbox() {
+         `);
+ 
+         if (rows.length === 0) {
+-            await db.run('COMMIT');
++            await tx.commit();
+             return;
+         }
+ 
+         const ids = rows.map(r => r.id);
+ 
+         // Mark as 'queued' immediately
+-        // In PG, we're in a transaction, so this is safe.
+-        // We can't easily do "WHERE id IN (?)" with generic adapter array params efficiently in one go 
+-        // without dynamic SQL or JSON args.
+-        // Simplest: Loop updates (inside tx, it's fast enough) or dynamic SQL.
+-        // Let's use dynamic SQL for the IDs since we have them.
+-
+-        // Safety: ids are numbers.
+         const idList = ids.join(',');
+-        await db.run(`UPDATE events_outbox SET queue_status = 'queued', queued_at = ? WHERE id IN (${idList})`, now);
++        await tx.run(`UPDATE events_outbox SET queue_status = 'queued', queued_at = ? WHERE id IN (${idList})`, now);
+ 
+         for (const ev of rows) {
+             let meta = {};
+@@ -93,34 +84,27 @@ async function bridgeOutbox() {
+ 
+             if (jobType) {
+                 try {
+-                    await db.run(`
++                    await tx.run(`
+                         INSERT INTO jobs_queue (
+                             job_type, payload_json, run_at, max_attempts, created_at, idempotency_key, source_event_id, status
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+-                    `,
+-                        jobType,
+-                        JSON.stringify(payload),
+-                        now,
+-                        5,
+-                        now,
+-                        `ev_${ev.id}`, // idempotency_key
+-                        ev.id          // source_event_id (UNIQUE constraint)
+-                    );
+-                } catch (e) {
+-                    if (e.message.includes('UNIQUE')) {
+-                        logger.warn(`Duplicate bridge attempt for event ${ev.id}`);
++                    `, jobType, JSON.stringify(payload), now, 5, now, ev.event_key || null, ev.id);
++                } catch (err) {
++                    if (err.message.toUpperCase().includes('UNIQUE')) {
++                        logger.warn(`Skip duplicate job for event ${ev.id}`);
+                     } else {
+-                        throw e;
++                        throw err;
+                     }
+                 }
+             }
+         }
+ 
+-        await db.run('COMMIT');
++        await tx.commit();
+ 
+     } catch (e) {
+-        try { await db.run('ROLLBACK'); } catch (err) { }
+-        if (!e.message.includes('busy')) logger.error('Bridge Error', e);
++        await tx.rollback();
++        if (!e.message.includes('busy')) logger.error('Bridge Outbox Error', e);
++        return;
+     }
+ }
+ 
+@@ -594,22 +578,10 @@ async function processJobs() {
+     }
+ 
+     // 1. Claim Batch (Atomic Transaction)
++    const tx = await db.beginTransaction();
+     try {
+-        await db.run('BEGIN');
+-
+-        // Note: For high concurrency in Postgres, "FOR UPDATE SKIP LOCKED" is best.
+-        // Using simple UPDATE ... WHERE ... RETURNING is a good approximation for MVP if rows are locked.
+-        // But here we do: Select -> Update. 
+-        // In Repeatable Read this might serialize or fail. In Read Committed it's okay but might race.
+-        // We'll rely on optimistic locking or standard locking.
+-
+         // Simpler approach compatible with Generic Adapter:
+-        // Use a single atomic UPDATE ... RETURNING ... LIMIT?
+-        // SQLite doesn't support UPDATE LIMIT easily without compiled options.
+-        // PG does with CTEs.
+-        // Standard MVP way: Fetch candidate IDs -> Update them -> Process them.
+-
+-        const candidates = await db.all(`
++        const candidates = await tx.all(`
+             SELECT id FROM jobs_queue 
+             WHERE status = 'pending' AND run_at <= ? 
+             LIMIT ?
+@@ -620,21 +592,21 @@ async function processJobs() {
+             const idList = ids.join(',');
+ 
+             // Mark captured
+-            await db.run(`
++            await tx.run(`
+                 UPDATE jobs_queue 
+                 SET status = 'processing', locked_by = ?, locked_at = ? 
+                 WHERE id IN (${idList})
+             `, WORKER_ID, now);
+ 
+             // Re-fetch full data
+-            const claimed = await db.all(`SELECT * FROM jobs_queue WHERE id IN (${idList})`);
++            const claimed = await tx.all(`SELECT * FROM jobs_queue WHERE id IN (${idList})`);
+             jobsToProcess.push(...claimed);
+         }
+ 
+-        await db.run('COMMIT');
++        await tx.commit();
+ 
+     } catch (e) {
+-        try { await db.run('ROLLBACK'); } catch { }
++        await tx.rollback();
+         if (!e.message.includes('busy')) logger.error('Worker Claim Error', e);
+         return;
+     }

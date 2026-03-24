@@ -151,8 +151,8 @@ const schema = [
             }
         }
 
-        // 3. Auto-Patch Historic Currency Displays (weekly_invoices is the real table name)
-        const currencyTables = ['weekly_invoices', 'tickets'];
+        // 3. Auto-Patch Historic Currency Displays (invoices is the real table name)
+        const currencyTables = ['invoices', 'tickets'];
         for (const tbl of currencyTables) {
             try {
                 await db.run(`UPDATE ${tbl} SET currency = 'usd' WHERE currency IS NULL OR currency = 'mxn' OR currency = 'MXN'`);

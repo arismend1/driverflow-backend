@@ -32,7 +32,7 @@ const global = {
   outbox_pending_invoice_generated: q(`
     SELECT COUNT(*) AS count
     FROM events_outbox
-    WHERE event_name='invoice_generated' AND process_status='pending'
+    WHERE event_name='weekly_invoice_generated' AND process_status='pending'
   `)[0]?.count ?? 0,
 };
 

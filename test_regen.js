@@ -53,11 +53,11 @@ async function regen() {
         console.log(`Amount (cents): ${amount}`);
 
         // Insert Invoice
-        await db.run(`INSERT INTO weekly_invoices (company_id, week_start, week_end, total_requests, active_drivers, amount_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
+        await db.run(`INSERT INTO invoices (company_id, week_start, week_end, total_requests, active_drivers, total_cents, currency, status, created_at) VALUES (?,?,?,?,?,?,'USD','pending',?)`,
             3, week_start, week_end, total, drivers, amount, new Date().toISOString());
 
         console.log(`\n--- 4. Final DB State ---`);
-        const inv = await db.get("SELECT id, company_id, week_start, week_end, amount_cents, currency, status FROM weekly_invoices WHERE company_id=3");
+        const inv = await db.get("SELECT id, company_id, week_start, week_end, total_cents, currency, status FROM invoices WHERE company_id=3");
         console.log(inv);
 
     } catch (e) {

@@ -160,7 +160,7 @@ const idDriver = runSql("INSERT INTO drivers (nombre, contacto, password_hash, t
 // 1. Pending
 const r1 = runSql("INSERT INTO solicitudes (empresa_id, licencia_req, ubicacion, tiempo_estimado, estado, fecha_expiracion) VALUES (?, 'A', 'Loc1', 60, 'PENDIENTE', ?)", [idSafe, nowIso]).lastInsertRowid;
 
-// 2. Unpaid
+// 2. Unbilled
 const r2 = runSql("INSERT INTO solicitudes (empresa_id, driver_id, licencia_req, ubicacion, tiempo_estimado, estado, fecha_expiracion) VALUES (?, ?, 'A', 'Loc2', 60, 'ACEPTADA', ?)", [idSafe, idDriver, nowIso]).lastInsertRowid;
 const t2 = runSql("INSERT INTO tickets (company_id, driver_id, request_id, price_cents, billing_status, created_at) VALUES (?, ?, ?, 1000, 'billed', ?)", [idSafe, idDriver, r2, nowIso]).lastInsertRowid;
 const inv2 = runSql("INSERT INTO invoices (company_id, total_cents, status, issue_date, due_date, billing_week, currency) VALUES (?, 1000, 'pending', ?, ?, '2026-W03', 'USD')", [idSafe, nowIso, nowIso]).lastInsertRowid;
@@ -237,7 +237,7 @@ const request = (method, path, body, headers = {}) => {
         console.log(`[${tag}] Req ${rid}: ${r.status} (Exp: ${exp}) Body: ${JSON.stringify(r.body)}`);
     };
     await chk(r1, 403, 'Pending');
-    await chk(r2, 402, 'Unpaid');
+    await chk(r2, 402, 'Unbilled');
     await chk(r3, 200, 'Paid');
     await chk(r4, 403, 'Void');
 

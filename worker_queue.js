@@ -203,7 +203,7 @@ const handlers = {
         // Placeholder for SSE/Push logic
     },
 
-    // --- WEEKLY BILLING ---
+    // --- BILLING GENERATION ---
     async generate_weekly_invoices(payload) {
         const { company_id, week_start, week_end } = payload;
         if (!company_id || !week_start || !week_end) {
@@ -427,8 +427,8 @@ const handlers = {
             // Save PI ID immediately if new to allow robust inverse reconciliation in Webhook
             if (!invoice.stripe_payment_intent_id && paymentIntent.id) {
                 await db.run(
-                    "UPDATE invoices SET stripe_payment_intent_id=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND stripe_payment_intent_id IS NULL",
-                    paymentIntent.id, invoice.id
+                    "UPDATE invoices SET stripe_payment_intent_id=?, updated_at=? WHERE id=? AND stripe_payment_intent_id IS NULL",
+                    paymentIntent.id, nowIso(), invoice.id
                 );
                 invoice.stripe_payment_intent_id = paymentIntent.id;
             }
@@ -856,10 +856,12 @@ if (require.main === module) {
     async function expireSearches() {
         try {
             const r1 = await db.run(
-                `UPDATE drivers SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= NOW()`
+                `UPDATE drivers SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= ?`,
+                nowIso()
             );
             const r2 = await db.run(
-                `UPDATE empresas SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= NOW()`
+                `UPDATE empresas SET search_status='OFF' WHERE search_status='ON' AND search_expires_at IS NOT NULL AND search_expires_at <= ?`,
+                nowIso()
             );
             const d = (r1.rowCount || 0) + (r2.rowCount || 0);
             console.log(`[Programador][SearchExpiration] Expiration check executed${d > 0 ? ` — expired ${d}` : ''}`);
@@ -884,8 +886,9 @@ if (require.main === module) {
                    AND status IN ('NEW','INVITED')
                    AND is_synthetic = false
                    AND (invite_count IS NULL OR invite_count < 5)
-                   AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
-                 LIMIT 50`
+                   AND (invited_at IS NULL OR invited_at < ?)
+                 LIMIT 50`,
+                new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
             );
 
             if (leads.length === 0) {
@@ -899,8 +902,8 @@ if (require.main === module) {
             for (const lead of leads) {
                 try {
                     await db.run(
-                        `UPDATE driver_leads SET status='INVITED', invited_at=NOW(), invite_count=COALESCE(invite_count,0)+1, updated_at=NOW() WHERE id=?`,
-                        lead.id
+                        `UPDATE driver_leads SET status='INVITED', invited_at=?, invite_count=COALESCE(invite_count,0)+1, updated_at=? WHERE id=?`,
+                        nowIso(), nowIso(), lead.id
                     );
 
                     const { trackLeadFunnelEvent } = require('./analytics');

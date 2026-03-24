@@ -18,13 +18,13 @@ try {
     };
 
     // 1. Ensure columns exist
-    // Requirements: billing_status (exists but default check needed?), amount_cents, currency, paid_at, payment_ref, billing_notes
+    // Requirements: billing_status (exists but default check needed?), total_cents, currency, paid_at, payment_ref, billing_notes
     // Current tickets: id, company_id, driver_id, request_id, price_cents, currency, billing_status, created_at
 
-    // We strictly follow "amount_cents" requirement. We will use that moving forward.
+    // We strictly follow "total_cents" requirement. We will use that moving forward.
     // We assume 'currency' and 'billing_status' exist but might need backfill.
 
-    addCol('tickets', 'amount_cents', 'INTEGER DEFAULT 0');
+    addCol('tickets', 'total_cents', 'INTEGER DEFAULT 0');
     addCol('tickets', 'paid_at', 'TEXT');
     addCol('tickets', 'payment_ref', 'TEXT');
     addCol('tickets', 'billing_notes', 'TEXT');
@@ -42,14 +42,14 @@ try {
         `).run();
         if (resStatus.changes > 0) console.log(`🔄 Updated ${resStatus.changes} tickets status to 'pending'`);
 
-        // B) Backfill amount_cents from price_cents if amount_cents is 0 (default)
+        // B) Backfill total_cents from price_cents if total_cents is 0 (default)
         // Check if price_cents exists just to be safe (it does based on my check)
         const resAmount = db.prepare(`
             UPDATE tickets 
-            SET amount_cents = price_cents 
-            WHERE (amount_cents IS NULL OR amount_cents = 0) AND price_cents > 0
+            SET total_cents = price_cents 
+            WHERE (total_cents IS NULL OR total_cents = 0) AND price_cents > 0
         `).run();
-        if (resAmount.changes > 0) console.log(`🔄 Backfilled ${resAmount.changes} tickets amount_cents from price_cents`);
+        if (resAmount.changes > 0) console.log(`🔄 Backfilled ${resAmount.changes} tickets total_cents from price_cents`);
 
         // C) Ensure Currency
         const resCurr = db.prepare(`

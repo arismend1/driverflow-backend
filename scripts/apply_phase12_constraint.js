@@ -22,15 +22,15 @@ async function run() {
 
     try {
         const sql = `
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_invoices_unique_company_week 
-            ON weekly_invoices(company_id, week_start);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_unique_company_week 
+            ON invoices(company_id, week_start);
         `;
 
         // Using exec() as it is designed for DDL scripts in db_adapter
         // Note: db_adapter.exec() handles both Postgres and SQLite
         await db.exec(sql);
 
-        console.log('✅ Success: Unique index created/verified on weekly_invoices.');
+        console.log('✅ Success: Unique index created/verified on invoices.');
         process.exit(0);
     } catch (error) {
         console.error('❌ Error applying constraint:', error);

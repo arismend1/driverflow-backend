@@ -26,7 +26,7 @@ try {
         CREATE TABLE IF NOT EXISTS credit_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             company_id INTEGER,
-            amount_cents INTEGER,
+            total_cents INTEGER,
             reason TEXT,
             created_at DATETIME DEFAULT (datetime('now')),
             used_at DATETIME

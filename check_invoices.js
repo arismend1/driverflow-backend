@@ -4,7 +4,7 @@ const db = require('./db_adapter');
 async function run() {
     try {
         console.log("--- INVOICE 4 ---");
-        const inv = await db.get("SELECT id, created_at, week_start, amount_cents FROM weekly_invoices WHERE id=4");
+        const inv = await db.get("SELECT id, created_at, week_start, total_cents FROM invoices WHERE id=4");
         console.log(inv);
 
         console.log("--- TICKETS CO 3 ---");

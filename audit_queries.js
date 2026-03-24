@@ -11,19 +11,18 @@ async function audit() {
         const invoices = await db.all("SELECT * FROM invoices ORDER BY created_at DESC LIMIT 20");
         console.table(invoices);
 
-        console.log("\n--- WEEKLY_INVOICES (Last 20) ---");
-        // Note: The code in worker_queue.js uses 'invoices' table, 
-        // but user mentioned 'weekly_invoices'. I'll check both if they exist.
+        console.log("\n--- INVOICES (Manual Audit) ---");
+        // invoices table is the source of truth
         try {
-            const weekly_invoices = await db.all("SELECT * FROM weekly_invoices ORDER BY created_at DESC LIMIT 20");
-            console.table(weekly_invoices);
+            const invoices_check = await db.all("SELECT * FROM invoices ORDER BY created_at DESC LIMIT 20");
+            console.table(invoices_check);
         } catch (e) {
-            console.log("weekly_invoices table NOT found or error:", e.message);
+            console.log("invoices table error:", e.message);
         }
 
-        console.log("\n--- BILLABLE TICKETS CHECK ---");
-        const billable = await db.all("SELECT count(*) as cnt FROM tickets WHERE billing_status = 'billable'");
-        console.log("Billable tickets count:", billable[0].cnt);
+        console.log("\n--- UNBILLED TICKETS CHECK ---");
+        const unbilled = await db.all("SELECT count(*) as cnt FROM tickets WHERE billing_status = 'unbilled'");
+        console.log("Unbilled tickets count:", unbilled[0].cnt);
 
         console.log("\n--- TICKETS 16 & 18 RELATIONSHIP ---");
         const t16_18 = await db.all("SELECT id, billing_status, created_at FROM tickets WHERE id IN (16, 18)");

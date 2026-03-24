@@ -2,7 +2,7 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 
-console.log('--- TEST PHASE 4: BILLING SMOKE ---');
+console.log('--- TEST PHASE 4: BILLING SMOKE (LEGACY/DEPRECATED) ---');
 
 const DB_PATH = 'repro_phase4.db';
 const PORT = '3004';
@@ -96,7 +96,7 @@ setTimeout(async () => {
         const summary1 = await (await req('GET', '/billing/summary', null, cToken)).json();
         console.log('Summary Pending:', summary1);
 
-        if (summary1.pending_count !== 1 || summary1.pending_amount_cents !== 999) throw new Error('Summary Pending Mismatch');
+        if (summary1.pending_count !== 1 || summary1.total_cents !== 999) throw new Error('Summary Pending Mismatch');
         if (summary1.currency !== 'mxn') throw new Error('Currency Mismatch');
 
         // D. Mark Paid (With Admin Token)
@@ -108,7 +108,7 @@ setTimeout(async () => {
         // E. Verify Paid
         const summary2 = await (await req('GET', '/billing/summary', null, cToken)).json();
         console.log('Summary Paid:', summary2);
-        if (summary2.paid_count !== 1 || summary2.paid_amount_cents !== 999) throw new Error('Summary Paid Mismatch');
+        if (summary2.paid_count !== 1 || summary2.total_cents !== 999) throw new Error('Summary Paid Mismatch');
         if (summary2.pending_count !== 0) throw new Error('Summary Pending should be 0');
 
         // F. Try Void (Should Fail 409)

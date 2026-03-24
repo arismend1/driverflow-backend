@@ -43,12 +43,12 @@ async function verify() {
                 const countRes = await client.query(`SELECT COUNT(*) as c FROM "${tableName}"`);
                 console.log(`   - ${tableName}: ${countRes.rows[0].c} registros`);
 
-                // Check columns for weekly_invoices
-                if (tableName === 'weekly_invoices') {
+                // Check columns for invoices
+                if (tableName === 'invoices') {
                     const cols = await client.query(`
                         SELECT column_name 
                         FROM information_schema.columns 
-                        WHERE table_name = 'weekly_invoices'
+                        WHERE table_name = 'invoices'
                     `);
                     const colNames = cols.rows.map(r => r.column_name);
                     console.log(`     Columnas: ${colNames.join(', ')}`);

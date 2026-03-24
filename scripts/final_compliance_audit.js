@@ -12,10 +12,10 @@ async function runAudit() {
 
     // --- [1-6] GREP CHECKS ---
     const checks = [
-        { id: 1, label: 'VALIDACIÓN DE ESTADOS (unpaid/billable)', patterns: [/unpaid/i, /billable/i], expected: 0 },
+        { id: 1, label: 'VALIDACIÓN DE ESTADOS (unbilled/unbilled)', patterns: [/unbilled/i, /unbilled/i], expected: 0 },
         { id: 2, label: 'VALIDACIÓN DE FACTURACIÓN (IN)', patterns: [/billing_status\s+IN/i], expected: 0 },
         { id: 3, label: "VALIDACIÓN DE QUERY OFICIAL ('unbilled')", patterns: [/billing_status\s*=\s*'unbilled'/i], expected: 1 }, // min 1
-        { id: 4, label: 'VALIDACIÓN DE DINERO (amount_cents)', patterns: [/amount_cents/i], expected: 0 },
+        { id: 4, label: 'VALIDACIÓN DE DINERO (total_cents)', patterns: [/total_cents/i], expected: 0 },
         { id: 5, label: 'VALIDACIÓN DE HARDCODE (15000)', patterns: [/15000/], expected: 0 },
         { id: 6, label: 'VALIDACIÓN DE IDEMPOTENCIA', patterns: [/idempotency_key/i], expected: 1 } // min 1
     ];

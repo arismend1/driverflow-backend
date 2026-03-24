@@ -1,4 +1,4 @@
-﻿const db = require('./db_adapter');
+const db = require('./db_adapter');
 const time = require('./time_contract');
 
 async function getMondayBasedWeekLabel(dateInput) {
@@ -68,7 +68,7 @@ async function run() {
                      ON CONFLICT (invoice_id, ticket_id) DO NOTHING`,
           invoice.id, ticket.id, ticket.price_cents
         );
-        await db.run("UPDATE tickets SET billing_status = 'billed', billing_week = ? WHERE id = ?", targetWeek, ticket.id);
+        await db.run("UPDATE tickets SET billing_status = 'invoiced', billing_week = ? WHERE id = ?", targetWeek, ticket.id);
       }
 
       // Update Totals

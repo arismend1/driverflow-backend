@@ -101,7 +101,7 @@ try {
         const delinquencyStmt = dbLoop.prepare("UPDATE empresas SET is_blocked = 1, blocked_reason = ? WHERE id = ?");
 
         pending.forEach(inv => {
-            const issueDate = new Date(inv.issue_date); // This depends on what generate_weekly_invoices put there
+            const issueDate = new Date(inv.issue_date); // This depends on what generate_invoices put there
             const ageMs = simDate.getTime() - issueDate.getTime();
             const ageDays = ageMs / ONE_DAY_MS;
 
@@ -109,7 +109,7 @@ try {
                 blockedCount++;
                 blockedCompanies.add(inv.company_id);
                 // Simulate the block
-                delinquencyStmt.run(`Simulated Block: Unpaid invoice ${inv.id} (${ageDays.toFixed(1)} days old)`, inv.company_id);
+                delinquencyStmt.run(`Simulated Block: Unbilled invoice ${inv.id} (${ageDays.toFixed(1)} days old)`, inv.company_id);
             }
         });
 

@@ -3,8 +3,8 @@
 ### A) Ejecutar migración en DBeaver
 Copia y pega este script SQL idempotente:
 ```sql
-ALTER TABLE weekly_invoices ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT;
-ALTER TABLE weekly_invoices ADD COLUMN IF NOT EXISTS receipt_url TEXT;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS receipt_url TEXT;
 ```
 
 ### B) Query para confirmar columnas
@@ -12,7 +12,7 @@ Revisa que ambas existan:
 ```sql
 SELECT column_name, data_type 
 FROM information_schema.columns 
-WHERE table_name = 'weekly_invoices' AND column_name IN ('stripe_charge_id', 'receipt_url');
+WHERE table_name = 'invoices' AND column_name IN ('stripe_charge_id', 'receipt_url');
 ```
 
 ### C) Curl para `/api/billing/invoices/me`
@@ -34,7 +34,7 @@ curl -i -X GET "https://TU_RENDER_URL/api/billing/invoices/ID_AJENO" \
 Ejecuta el query para ver la URL del recibo (Stripe):
 ```sql
 SELECT id, status, receipt_url, stripe_charge_id 
-FROM weekly_invoices 
+FROM invoices 
 WHERE status = 'charged' 
 ORDER BY id DESC LIMIT 1;
 ```

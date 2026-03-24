@@ -7,7 +7,7 @@ const db = new Database(dbPath);
 const rows = db.prepare(`
   SELECT id, event_name, request_id, process_status, send_attempts, last_error, created_at
   FROM events_outbox
-  WHERE process_status='pending' AND event_name='invoice_generated'
+  WHERE process_status='pending' AND event_name='weekly_invoice_generated'
   ORDER BY id ASC
 `).all();
 

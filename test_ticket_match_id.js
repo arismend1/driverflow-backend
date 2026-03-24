@@ -41,7 +41,7 @@ const db = require('./db_adapter');
         }
 
         // Verify: Exactly 1 ticket
-        const tickets = await db.all('SELECT id, match_id, company_id, driver_id, amount_cents FROM tickets WHERE match_id = ?', testMatchId);
+        const tickets = await db.all('SELECT id, match_id, company_id, driver_id, price_cents FROM tickets WHERE match_id = ?', testMatchId);
         console.log(`\n--- VERIFICATION ---`);
         console.log(`Tickets for match_id=${testMatchId}: ${tickets.length}`);
         console.log(JSON.stringify(tickets, null, 2));

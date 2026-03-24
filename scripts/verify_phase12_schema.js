@@ -12,7 +12,7 @@ async function verify() {
             query = `
                 SELECT indexname, indexdef 
                 FROM pg_indexes 
-                WHERE tablename = 'weekly_invoices';
+                WHERE tablename = 'invoices';
             `;
         } else {
             console.log('💻 Connection: SQLite (Local)');
@@ -20,14 +20,14 @@ async function verify() {
                 SELECT name, sql 
                 FROM sqlite_master 
                 WHERE type = 'index' 
-                AND tbl_name = 'weekly_invoices';
+                AND tbl_name = 'invoices';
             `;
         }
 
         // Run without params to avoid binding issues
         const results = await db.all(query);
 
-        const targetIndex = 'idx_weekly_invoices_unique_period';
+        const targetIndex = 'idx_invoices_unique_period';
         const found = results.find(r => (r.indexname || r.name) === targetIndex);
 
         if (found) {
@@ -43,13 +43,13 @@ async function verify() {
         // Also verify the table structure generally
         console.log('\n🔍 Checking Table Structure...');
         const tableCheck = process.env.DATABASE_URL
-            ? "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'weekly_invoices';"
-            : "PRAGMA table_info(weekly_invoices);";
+            ? "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'invoices';"
+            : "PRAGMA table_info(invoices);";
 
         const columns = await db.all(tableCheck);
-        console.log(`✅ Table weekly_invoices has ${columns.length} columns.`);
+        console.log(`✅ Table invoices has ${columns.length} columns.`);
         if (columns.length === 0) {
-            console.error('❌ FAIL: Table weekly_invoices appears to be missing or empty (0 columns).');
+            console.error('❌ FAIL: Table invoices appears to be missing or empty (0 columns).');
             process.exit(1);
         }
 

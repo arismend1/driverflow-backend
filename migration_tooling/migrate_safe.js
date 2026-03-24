@@ -144,7 +144,7 @@ const SCHEMA = [
         created_at TIMESTAMPTZ,
         updated_at TIMESTAMPTZ,
         billing_week TEXT,
-        amount_cents INTEGER, -- Legacy duplicate?
+        total_cents INTEGER, -- Legacy duplicate?
         paid_at TIMESTAMPTZ,
         payment_ref TEXT,
         billing_notes TEXT,

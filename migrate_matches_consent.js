@@ -47,7 +47,7 @@ const db = require('./db_adapter');
                         created_at TEXT DEFAULT (datetime('now')),
                         updated_at TEXT,
                         billing_week TEXT, 
-                        amount_cents INTEGER DEFAULT 0, 
+                        total_cents INTEGER DEFAULT 0, 
                         paid_at TEXT, 
                         payment_ref TEXT, 
                         billing_notes TEXT, 
@@ -60,8 +60,8 @@ const db = require('./db_adapter');
                     )
                 `);
                 await db.run(`
-                    INSERT INTO tickets_new (id, company_id, driver_id, request_id, price_cents, currency, billing_status, created_at, updated_at, billing_week, amount_cents, paid_at, payment_ref, billing_notes, stripe_checkout_session_id, stripe_payment_intent_id, stripe_customer_id)
-                    SELECT id, company_id, driver_id, request_id, price_cents, currency, billing_status, created_at, updated_at, billing_week, amount_cents, paid_at, payment_ref, billing_notes, stripe_checkout_session_id, stripe_payment_intent_id, stripe_customer_id FROM tickets
+                    INSERT INTO tickets_new (id, company_id, driver_id, request_id, price_cents, currency, billing_status, created_at, updated_at, billing_week, total_cents, paid_at, payment_ref, billing_notes, stripe_checkout_session_id, stripe_payment_intent_id, stripe_customer_id)
+                    SELECT id, company_id, driver_id, request_id, price_cents, currency, billing_status, created_at, updated_at, billing_week, total_cents, paid_at, payment_ref, billing_notes, stripe_checkout_session_id, stripe_payment_intent_id, stripe_customer_id FROM tickets
                 `);
                 await db.run("DROP TABLE tickets");
                 await db.run("ALTER TABLE tickets_new RENAME TO tickets");

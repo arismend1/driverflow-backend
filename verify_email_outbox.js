@@ -19,7 +19,7 @@ const setup = () => {
 
     db.prepare(`
         INSERT INTO events_outbox (event_name, created_at, company_id, request_id, metadata, process_status)
-        VALUES ('invoice_generated', datetime('now'), 999, 9999, ?, 'pending')
+        VALUES ('weekly_invoice_generated', datetime('now'), 999, 9999, ?, 'pending')
     `).run(JSON.stringify(payload));
 
     console.log("Inserted test event for Invoice 9999 (Pending)");

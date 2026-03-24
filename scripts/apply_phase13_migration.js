@@ -46,7 +46,7 @@ async function runMigration() {
         const res = await client.query(`
             SELECT column_name 
             FROM information_schema.columns 
-            WHERE table_name = 'weekly_invoices' 
+            WHERE table_name = 'invoices' 
             AND column_name IN ('stripe_payment_intent_id', 'paid_at', 'failure_reason', 'attempt_count', 'last_error');
         `);
 

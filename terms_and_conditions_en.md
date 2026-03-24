@@ -58,11 +58,11 @@ All billing and collections are performed by Florida Luxury Services LLC.
 
 5. NON-PAYMENT, TOLERANCE, AND ACCOUNT BLOCKING
 
-A maximum tolerance of four (4) unpaid weekly billing cycles is granted.
+A maximum tolerance of four (4) unbilled weekly billing cycles is granted.
 
 During this period, the account may continue operating and payment reminders will be issued.
 
-After four (4) unpaid weekly cycles, the COMPANY’s account will be automatically blocked from creating new requests.
+After four (4) unbilled weekly cycles, the COMPANY’s account will be automatically blocked from creating new requests.
 
 Blocking does not eliminate or reduce the outstanding debt, which remains fully due and payable.
 

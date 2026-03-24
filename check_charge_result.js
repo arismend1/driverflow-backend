@@ -8,7 +8,7 @@ async function checkResult() {
         console.log("Last Job:", JSON.stringify(job, null, 2));
 
         console.log("\n--- Checking Invoice #5 ---");
-        const inv = await db.get("SELECT * FROM weekly_invoices WHERE id = 5");
+        const inv = await db.get("SELECT * FROM invoices WHERE id = 5");
         console.log("Invoice 5:", JSON.stringify(inv, null, 2));
 
     } catch (e) {

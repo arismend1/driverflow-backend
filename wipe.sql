@@ -18,7 +18,7 @@ DELETE FROM matches;
 DELETE FROM webhook_events;
 DELETE FROM driver_profiles;
 DELETE FROM metrics_snapshot;
-DELETE FROM weekly_invoices;
+DELETE FROM invoices;
 DELETE FROM drivers;
 DELETE FROM password_resets;
 DELETE FROM worker_heartbeat;

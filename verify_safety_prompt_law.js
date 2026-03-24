@@ -96,7 +96,7 @@ async function run() {
         res = await request(`/request/${reqId1}/contact`, 'GET', null, companyToken);
         if (res.status !== 402) {
             console.log("FAILED RESPONSE BODY (Expected 402):", JSON.stringify(res.body));
-            throw new Error(`A1: Expected 402 Blocked (Unbilled/Unpaid), got ${res.status}`);
+            throw new Error(`A1: Expected 402 Blocked (Unbilled/Unbilled), got ${res.status}`);
         }
 
         // 2. Stimulate Billing & Payment
@@ -182,7 +182,7 @@ async function run() {
         if (!res.body.success || !res.body.message.includes('Credit Note')) throw new Error("E: Did not issue credit note: " + JSON.stringify(res.body));
 
         const credit = db.prepare('SELECT * FROM credit_notes WHERE company_id = 10').get();
-        if (!credit || credit.amount_cents !== 15000) throw new Error("E: Credit Note missing or wrong amount");
+        if (!credit || credit.total_cents !== 15000) throw new Error("E: Credit Note missing or wrong amount");
         console.log("  [PASS] Credit Note Issued");
 
         const audit = db.prepare("SELECT * FROM audit_logs WHERE action = 'void_ticket' AND target_id = ?").get(800);

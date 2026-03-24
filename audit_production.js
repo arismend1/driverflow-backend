@@ -17,12 +17,12 @@ async function runAudit() {
         const res2 = await pool.query("SELECT * FROM invoices ORDER BY created_at DESC LIMIT 20");
         console.table(res2.rows);
 
-        console.log("\n--- WEEKLY_INVOICES (Last 20) ---");
+        console.log("\n--- INVOICES (Manual Audit) ---");
         try {
-            const res3 = await pool.query("SELECT * FROM weekly_invoices ORDER BY created_at DESC LIMIT 20");
+            const res3 = await pool.query("SELECT * FROM invoices ORDER BY created_at DESC LIMIT 20");
             console.table(res3.rows);
         } catch (e) {
-            console.log("Table 'weekly_invoices' does not exist or failed:", e.message);
+            console.log("Table 'invoices' does not exist or failed:", e.message);
         }
 
         console.log("\n--- TICKET STATUS COUNTS ---");

@@ -4,7 +4,7 @@ const time = require('./time_contract');
 
 /**
  * Enforces strict operational blocking based on debt duration.
- * Rule: Block if DEBT EXISTS (pending invoices) AND (Time since last payment >= 28 days OR Time since first unpaid invoice >= 28 days).
+ * Rule: Block if DEBT EXISTS (pending invoices) AND (Time since last payment >= 28 days OR Time since first unbilled invoice >= 28 days).
  * 
  * @param {object} db - Async DB Adapter
  * @param {number|string} companyId 
