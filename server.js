@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -88,7 +89,7 @@ async function auditLog(action, actorId, targetId, metadata, req) {
 }
 
 // 3.4 Static Files (Dashboard)
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // 3.5 Root Health Route (Ensure Render sees service)
 app.get('/', (req, res) => {
