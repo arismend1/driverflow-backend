@@ -1142,8 +1142,13 @@ app.post('/approve_driver', authenticateToken, async (req, res) => {
         await db.run("UPDATE solicitudes SET estado='ACEPTADA' WHERE id=?", request_id);
 
         // Create Ticket
-        const t = await db.run("INSERT INTO tickets (company_id, driver_id, request_id, price_cents, currency, created_at, billing_status) VALUES (?,?,?,15000,'USD',?,'unbilled')",
-            req.user.id, r.driver_id, request_id, nowIso());
+        const price_cents = parseInt(process.env.WEEKLY_FEE_CENTS);
+        if (isNaN(price_cents) || price_cents <= 0) {
+            throw new Error(`[Billing] Missing or invalid WEEKLY_FEE_CENTS: ${process.env.WEEKLY_FEE_CENTS}. Ticket generation aborted.`);
+        }
+
+        const t = await db.run("INSERT INTO tickets (company_id, driver_id, request_id, price_cents, currency, created_at, billing_status) VALUES (?,?,?,?,'USD',?,'unbilled')",
+            req.user.id, r.driver_id, request_id, price_cents, nowIso());
         const tid = t.lastInsertRowid;
 
         // Notify Driver & System
@@ -1301,7 +1306,7 @@ app.post('/admin/invoices/generate', async (req, res) => {
                 company_id: c.id,
                 week_start,
                 week_end
-            });
+            }, { idempotency_key: `gen_${c.id}_${week_start}` });
             count++;
         }
 
@@ -1336,7 +1341,7 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
         await db.run("UPDATE invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
 
         const { enqueueJob } = require('./worker_queue');
-        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
+        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId }, { idempotency_key: `charge_${invoiceId}` });
 
         await auditLog('invoice_retry_manual', 'admin', invoiceId, {}, req);
 
@@ -1389,7 +1394,7 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
 
         // Also enqueue it immediately just in case
         const { enqueueJob } = require('./worker_queue');
-        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId });
+        await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId }, { idempotency_key: `charge_${invoiceId}` });
 
         await auditLog('invoice_unsuspended_manual', 'admin', invoiceId, {}, req);
 
@@ -1572,7 +1577,7 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
             return res.status(409).json({ error: `Checkout not allowed for status: ${invoice.status}` });
         }
 
-        if (invoice.amount_cents <= 0) {
+        if (invoice.total_cents <= 0) {
             return res.status(400).json({ error: 'Invoice has no amount to pay' });
         }
 
@@ -2976,15 +2981,18 @@ const finalizeShare = async (matchId) => {
 async function ensureTicketGenerated(matchId, companyId, driverId, now) {
     const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
     let ticketId = existingTicket ? existingTicket.id : null;
-    const amount = parseInt(process.env.WEEKLY_FEE_CENTS) || 15000;
+    const price_cents = parseInt(process.env.WEEKLY_FEE_CENTS);
+    if (isNaN(price_cents) || price_cents <= 0) {
+        throw new Error(`[Billing] Missing or invalid WEEKLY_FEE_CENTS: ${process.env.WEEKLY_FEE_CENTS}. Ticket generation aborted.`);
+    }
 
     if (!ticketId) {
         try {
             const t = await db.run(
-                `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, amount_cents, currency, created_at, billing_status, billing_notes)
-                 VALUES (?,?,?,?,?,'USD',?,'hold',?)
+                `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, currency, created_at, billing_status, billing_notes)
+                 VALUES (?,?,?,?,'USD',?,'hold',?)
                  RETURNING id`,
-                parseInt(matchId), companyId, driverId, amount, amount, now, `Match ID: ${matchId}`
+                parseInt(matchId), companyId, driverId, price_cents, now, `Match ID: ${matchId}`
             );
             ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
         } catch (insertErr) {
@@ -3317,7 +3325,7 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
         if (resolution === 'REJECTED') {
             await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
-            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE match_id = ? AND billing_status != 'billable'`, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE match_id = ? AND billing_status NOT IN ('invoiced', 'paid')`, matchId);
 
             // --- PUSH: Rechazo Real (CLOSED) ---
             if (req.user.type === 'empresa') {
@@ -3331,7 +3339,7 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
         if (resolution === 'HIRED') {
             await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
-            await db.run(`UPDATE tickets SET billing_status = 'billable' WHERE match_id = ?`, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'unbilled' WHERE match_id = ?`, matchId);
             await db.run(`UPDATE tickets SET billing_status = 'void' WHERE driver_id = (SELECT driver_id FROM potential_matches WHERE id = ?) AND match_id != ?`, matchId, matchId);
 
             // Turn off driver's search status

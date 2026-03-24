@@ -27,7 +27,7 @@ async function enqueueJob(type, payload, options = {}) {
         `, type, JSON.stringify(payload), runAt, max, now, options.idempotency_key || null);
         return true;
     } catch (e) {
-        if (e.message.includes('UNIQUE')) return false; // Idempotent ignore
+        if (e.code === '23505' || e.message.toUpperCase().includes('UNIQUE')) return false; // Idempotent ignore
         throw e;
     }
 }
@@ -237,20 +237,17 @@ const handlers = {
             } catch (e) { endPlusOne = week_end; }
 
             const usage = await db.get(`
-                SELECT count(*) as cnt, count(distinct driver_id) as drv 
+                SELECT count(*) as cnt, count(distinct driver_id) as drv, SUM(price_cents) as total_price
                 FROM tickets 
                 WHERE company_id = ? AND created_at >= ? AND created_at < ? 
-                  AND billing_status IN ('unbilled', 'unpaid')
-                  AND billing_status NOT IN ('paid', 'invoiced')`,
+                  AND billing_status = 'unbilled'
+                  AND price_cents IS NOT NULL AND price_cents > 0`,
                 company_id, start, endPlusOne
             );
 
             const total = usage ? (usage.cnt || 0) : 0;
-            const drivers = usage ? (usage.drv || 0) : 0;
+            const amount = usage ? (usage.total_price || 0) : 0;
 
-            // 2. Pricing Logic (150 USD per ticket -> 15000 cents)
-            const PRICE_PER_TICKET_CENTS = 15000;
-            const amount = total * PRICE_PER_TICKET_CENTS;
 
             // 3. Insert Invoice (Idempotent by uniqueness constraints, though we should ideally use ON CONFLICT)
             try {
@@ -275,16 +272,27 @@ const handlers = {
                     if (newInvoiceId) {
                         await tx.run(`
                             INSERT INTO invoice_items (invoice_id, ticket_id, price_cents)
-                            SELECT ?, id, COALESCE(price_cents, amount_cents, 15000)
+                            SELECT ?, id, price_cents
                             FROM tickets 
                             WHERE company_id = ? AND created_at >= ? AND created_at < ? 
-                              AND billing_status IN ('unbilled', 'unpaid', 'billable')
+                              AND billing_status = 'unbilled'
+                              AND price_cents IS NOT NULL AND price_cents > 0
                               AND id NOT IN (SELECT ticket_id FROM invoice_items)
-                            ON CONFLICT (ticket_id) DO NOTHING
                         `, newInvoiceId, company_id, start, endPlusOne);
 
+                        // Mark tickets as invoiced in the SAME transaction
+                        await tx.run(`
+                            UPDATE tickets SET billing_status = 'invoiced'
+                            WHERE company_id = ? AND created_at >= ? AND created_at < ? 
+                              AND billing_status = 'unbilled'
+                              AND id IN (SELECT ticket_id FROM invoice_items WHERE invoice_id = ?)
+                        `, company_id, start, endPlusOne, newInvoiceId);
+
                         const itemsCount = await tx.get("SELECT COUNT(*) as c FROM invoice_items WHERE invoice_id = ?", newInvoiceId);
-                        if (!itemsCount || Number(itemsCount.c) === 0) {
+                        const count = itemsCount ? Number(itemsCount.c) : 0;
+
+
+                        if (count === 0) {
                             await tx.run("DELETE FROM invoices WHERE id = ?", newInvoiceId);
                             await tx.commit();
                             activeTx = false;
@@ -385,7 +393,7 @@ const handlers = {
             return;
         }
 
-        if (invoice.amount_cents <= 0) {
+        if (invoice.total_cents <= 0) {
             logger.info(`${logPrefix} Auto-closing $0 invoice`);
             await db.run("UPDATE invoices SET status='charged', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
             return;
@@ -393,7 +401,7 @@ const handlers = {
 
         const stripe = require('stripe')(stripeKey);
         const isLive = stripeKey.startsWith('sk_live_');
-        logger.info(`${logPrefix} Processing Charge: $${invoice.amount_cents / 100} (Live: ${isLive})`);
+        logger.info(`${logPrefix} Processing Charge: $${invoice.total_cents / 100} (Live: ${isLive})`);
 
         // 5. Idempotency Key & Create-or-Confirm Logic
         const idempotencyKey = `invoice_${invoice.id}_charge`;
@@ -411,7 +419,7 @@ const handlers = {
             } else {
                 logger.info(`${logPrefix} Creating new PI with key: ${idempotencyKey}`);
                 paymentIntent = await stripe.paymentIntents.create({
-                    amount: invoice.amount_cents,
+                    amount: invoice.total_cents,
                     currency: invoice.currency || 'usd',
                     customer: invoice.stripe_customer_id,
                     confirm: true, // Try to charge immediately
@@ -538,7 +546,7 @@ const handlers = {
             `, invoice.id, successAttempt, 'charged', paymentIntent.id, nowIso());
 
             await db.run(`INSERT INTO events_outbox (event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?)`,
-                'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.amount_cents, stripe_pi: paymentIntent.id }));
+                'invoice_paid', nowIso(), invoice.company_id, JSON.stringify({ invoice_id: invoice.id, amount: invoice.total_cents, stripe_pi: paymentIntent.id }));
         } else {
             // If we reach here, it means the paymentIntent was not 'succeeded' after creation/confirmation,
             // but also didn't throw an error. This is an unexpected state for a 'confirm: true' flow.
@@ -566,8 +574,8 @@ async function processJobs() {
         for (const inv of retryingInvoices) {
             // Check if a job already exists to avoid duplicate flooding
             const matchQuery = db.IS_POSTGRES 
-                ? "CAST(payload::json->>'invoice_id' AS TEXT) = ?"
-                : "CAST(json_extract(payload, '$.invoice_id') AS TEXT) = ?";
+                ? "CAST(payload_json::json->>'invoice_id' AS TEXT) = ?"
+                : "CAST(json_extract(payload_json, '$.invoice_id') AS TEXT) = ?";
 
             const existing = await db.get(`
                 SELECT id FROM jobs_queue 
@@ -696,7 +704,7 @@ async function startQueueWorker() {
                     company_id: c.id,
                     week_start,
                     week_end
-                });
+                }, { idempotency_key: `gen_${c.id}_${week_start}` });
             }
             logger.info(`[Scheduler] Enqueued generation for ${companies.length} companies.`);
 
@@ -711,9 +719,9 @@ async function startQueueWorker() {
     cron.schedule('0 14 * * 1', async () => {
         logger.info('[Scheduler] Starting Automatic Billing Execution...');
         try {
-            const invoices = await db.all("SELECT id FROM invoices WHERE status IN ('pending', 'failed') AND amount_cents > 0");
+            const invoices = await db.all("SELECT id FROM invoices WHERE status IN ('pending', 'failed') AND total_cents > 0");
             for (const inv of invoices) {
-                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id }, { idempotency_key: `charge_${inv.id}` });
             }
             logger.info(`[Scheduler] Enqueued charges for ${invoices.length} invoices.`);
         } catch (e) {
@@ -739,20 +747,10 @@ async function startQueueWorker() {
 
             for (const inv of invoices) {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);
-                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id }, { idempotency_key: `charge_${inv.id}` });
             }
-            if (invoices.length > 0) logger.info(`[Dunning] Enqueued ${invoices.length} invoices for retry.`);
         } catch (err) {
-            console.error("[Scheduler][Dunning] PG ERROR", {
-                message: err.message,
-                code: err.code,
-                column: err.column,
-                table: err.table,
-                schema: err.schema,
-                position: err.position,
-                detail: err.detail,
-                where: err.where
-            });
+            logger.error("[Scheduler][Dunning] Error", err);
         }
     });
 
