@@ -268,6 +268,7 @@ app.post('/webhooks/payment', legacyWebhook);
 // --- 5. APP CONFIG & PUBLIC ROUTES ---
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ limit: '15mb', extended: true }));
+app.use(express.static('public'));
 
 // Health Check
 app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));

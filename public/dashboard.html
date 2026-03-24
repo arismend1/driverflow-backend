@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DriverFlow | Admin Health Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --text-main: #f8fafc;
+            --text-dim: #94a3b8;
+            --primary: #3b82f6;
+            --success: #22c55e;
+            --warning: #eab308;
+            --danger: #ef4444;
+            --critical: #dc2626;
+            --border: rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 2rem;
+            background-image: radial-gradient(circle at top right, rgba(59, 130, 246, 0.1), transparent),
+                              radial-gradient(circle at bottom left, rgba(34, 197, 94, 0.05), transparent);
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        h1 span {
+            color: var(--primary);
+        }
+
+        .auth-bar {
+            display: flex;
+            gap: 0.75rem;
+            background: var(--card-bg);
+            padding: 0.5rem;
+            border-radius: 12px;
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border);
+        }
+
+        input {
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid var(--border);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            outline: none;
+            transition: border-color 0.2s;
+            font-family: inherit;
+        }
+
+        input:focus {
+            border-color: var(--primary);
+        }
+
+        button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.5rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+
+        button:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        .status-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-green { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+        .status-yellow { background: rgba(234, 179, 8, 0.2); color: var(--warning); }
+        .status-red { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 1.5rem;
+            border: 1px solid var(--border);
+            backdrop-filter: blur(12px);
+            transition: transform 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(255,255,255,0.2);
+        }
+
+        .card h2 {
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .stats-list {
+            list-style: none;
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+        }
+
+        .stat-value {
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        .stat-value.highlight-yellow { color: var(--warning); }
+        .stat-value.highlight-red { color: var(--danger); font-weight: 800; }
+        .stat-value.highlight-critical { color: var(--critical); font-weight: 900; animation: pulse 2s infinite; }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+
+        .error-msg {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            display: none;
+        }
+
+        #loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-dim);
+            display: none;
+        }
+
+        .footer {
+            margin-top: 4rem;
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 0.8rem;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>DriverFlow <span>Admin Health</span></h1>
+            <div class="auth-bar">
+                <input type="password" id="adminSecret" placeholder="Admin Secret" />
+                <button id="loadBtn">Cargar</button>
+            </div>
+        </header>
+
+        <div id="errorBox" class="error-msg"></div>
+
+        <div id="loading">Obteniendo datos del sistema...</div>
+
+        <div id="dashboardContent" style="display: none;">
+            <div class="status-header">
+                <span id="globalBadge" class="status-badge">Estado Desconocido</span>
+                <span id="lastUpdate" style="font-size: 0.8rem; color: var(--text-dim);"></span>
+            </div>
+
+            <div class="grid">
+                <!-- Invoices -->
+                <div class="card">
+                    <h2>📦 Invoices</h2>
+                    <ul class="stats-list">
+                        <li class="stat-item"><span class="stat-label">Pending</span> <span id="inv-pending" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Charging</span> <span id="inv-charging" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Retrying</span> <span id="inv-retrying" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Charged</span> <span id="inv-charged" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Other</span> <span id="inv-other" class="stat-value">0</span></li>
+                    </ul>
+                </div>
+
+                <!-- Tickets -->
+                <div class="card">
+                    <h2>🎫 Tickets</h2>
+                    <ul class="stats-list">
+                        <li class="stat-item"><span class="stat-label">Unbilled</span> <span id="tix-unbilled" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Total Items</span> <span id="items-total" class="stat-value">0</span></li>
+                    </ul>
+                </div>
+
+                <!-- Jobs -->
+                <div class="card">
+                    <h2>⚙️ Worker Jobs</h2>
+                    <ul class="stats-list">
+                        <li class="stat-item"><span class="stat-label">Pending</span> <span id="job-pending" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Processing</span> <span id="job-processing" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Failed</span> <span id="job-failed" class="stat-value">0</span></li>
+                        <li class="stat-item"><span class="stat-label">Other</span> <span id="job-other" class="stat-value">0</span></li>
+                    </ul>
+                </div>
+
+                <!-- Janitor -->
+                <div class="card">
+                    <h2>🧹 Janitor System</h2>
+                    <ul class="stats-list">
+                        <li class="stat-item"><span class="stat-label">Stuck Invoices</span> <span id="janitor-stuck" class="stat-value">0</span></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            DriverFlow Billing Monitoring System &copy; 2026 | Seguridad Nivel Admin
+        </div>
+    </div>
+
+    <script>
+        const loadBtn = document.getElementById('loadBtn');
+        const adminInput = document.getElementById('adminSecret');
+        const errorBox = document.getElementById('errorBox');
+        const loading = document.getElementById('loading');
+        const dashboard = document.getElementById('dashboardContent');
+
+        async function fetchData() {
+            const secret = adminInput.value.trim();
+            if (!secret) {
+                showError('Por favor, ingresa el Secret Admin.');
+                return;
+            }
+
+            errorBox.style.display = 'none';
+            loading.style.display = 'block';
+            dashboard.style.display = 'none';
+
+            try {
+                const response = await fetch('/admin/health', {
+                    headers: { 'x-admin-secret': secret }
+                });
+
+                if (response.status === 403) {
+                    throw new Error('Secret Inválido (403 Forbidden)');
+                }
+                if (!response.ok) {
+                    throw new Error(`Error del servidor (${response.status})`);
+                }
+
+                const data = await response.json();
+                renderDashboard(data);
+            } catch (err) {
+                showError(err.message);
+            } finally {
+                loading.style.display = 'none';
+            }
+        }
+
+        function showError(msg) {
+            errorBox.textContent = msg;
+            errorBox.style.display = 'block';
+        }
+
+        function renderDashboard(data) {
+            // Invoices
+            document.getElementById('inv-pending').textContent = data.invoices.pending;
+            
+            const invCharging = document.getElementById('inv-charging');
+            invCharging.textContent = data.invoices.charging;
+            invCharging.className = data.invoices.charging > 0 ? 'stat-value highlight-yellow' : 'stat-value';
+
+            document.getElementById('inv-retrying').textContent = data.invoices.retrying;
+            document.getElementById('inv-charged').textContent = data.invoices.charged;
+            document.getElementById('inv-other').textContent = data.invoices.other;
+
+            // Tickets
+            const tixUnbilled = document.getElementById('tix-unbilled');
+            tixUnbilled.textContent = data.tickets.unbilled;
+            tixUnbilled.className = data.tickets.unbilled > 0 ? 'stat-value highlight-yellow' : 'stat-value';
+
+            document.getElementById('items-total').textContent = data.invoice_items;
+
+            // Jobs
+            document.getElementById('job-pending').textContent = data.jobs.pending;
+            document.getElementById('job-processing').textContent = data.jobs.processing;
+            
+            const jobFailed = document.getElementById('job-failed');
+            jobFailed.textContent = data.jobs.failed;
+            jobFailed.className = data.jobs.failed > 0 ? 'stat-value highlight-red' : 'stat-value';
+
+            document.getElementById('job-other').textContent = data.jobs.other;
+
+            // Janitor
+            const janitorStuck = document.getElementById('janitor-stuck');
+            janitorStuck.textContent = data.janitor.stuck_invoices;
+            janitorStuck.className = data.janitor.stuck_invoices > 0 ? 'stat-value highlight-critical' : 'stat-value';
+
+            // Global Status
+            const badge = document.getElementById('globalBadge');
+            if (data.janitor.stuck_invoices > 0 || data.jobs.failed > 0) {
+                badge.textContent = 'Estado Crítico';
+                badge.className = 'status-badge status-red';
+            } else if (data.invoices.charging > 0 || data.tickets.unbilled > 0) {
+                badge.textContent = 'Atención Requerida';
+                badge.className = 'status-badge status-yellow';
+            } else {
+                badge.textContent = 'Sistema Saludable';
+                badge.className = 'status-badge status-green';
+            }
+
+            document.getElementById('lastUpdate').textContent = `Actualizado: ${new Date().toLocaleTimeString()}`;
+            dashboard.style.display = 'block';
+        }
+
+        loadBtn.addEventListener('click', fetchData);
+        adminInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') fetchData();
+        });
+    </script>
+</body>
+</html>
