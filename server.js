@@ -1229,6 +1229,60 @@ app.post('/admin/tickets/:id/void', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// --- 7.0 SYSTEM MONITORING ---
+app.get('/admin/health', async (req, res) => {
+    const adminParam = req.headers['x-admin-secret'];
+    if (!adminParam || adminParam !== process.env.ADMIN_SECRET) return res.sendStatus(403);
+
+    try {
+        const [invoices, tickets, invoiceItems, jobs, janitor] = await Promise.all([
+            db.all("SELECT status, count(*) as count FROM invoices GROUP BY status"),
+            db.get("SELECT count(*) as count FROM tickets WHERE billing_status = 'unbilled'"),
+            db.get("SELECT count(*) as count FROM invoice_items"),
+            db.all("SELECT status, count(*) as count FROM jobs_queue GROUP BY status"),
+            db.get(`
+                SELECT count(*) as count 
+                FROM invoices 
+                WHERE status = 'charging' 
+                AND updated_at < NOW() - INTERVAL '1 hour' 
+                AND paid_at IS NULL
+            `)
+        ]);
+
+        const invSummary = { pending: 0, charging: 0, retrying: 0, charged: 0 };
+        (invoices || []).forEach(r => {
+            const c = parseInt(r.count) || 0;
+            if (r.status === 'pending') invSummary.pending = c;
+            else if (r.status === 'charging') invSummary.charging = c;
+            else if (r.status === 'retrying') invSummary.retrying = c;
+            else if (r.status === 'charged' || r.status === 'paid') invSummary.charged += c;
+        });
+
+        const jobSummary = { pending: 0, processing: 0, failed: 0 };
+        (jobs || []).forEach(r => {
+            const c = parseInt(r.count) || 0;
+            if (r.status === 'pending') jobSummary.pending = c;
+            else if (r.status === 'processing') jobSummary.processing = c;
+            else if (r.status === 'failed') jobSummary.failed = c;
+        });
+
+        const response = {
+            invoices: invSummary,
+            tickets: { unbilled: parseInt(tickets?.count) || 0 },
+            invoice_items: parseInt(invoiceItems?.count) || 0,
+            jobs: jobSummary,
+            janitor: { stuck_invoices: parseInt(janitor?.count) || 0 }
+        };
+
+        console.log(`[HEALTH_CHECK] ${new Date().toISOString()} | Invoices Total: ${invSummary.charged} | Stuck: ${response.janitor.stuck_invoices}`);
+        res.json(response);
+
+    } catch (e) {
+        console.error('[HEALTH_CHECK ERR]', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 7.1 WEEKLY BILLING ADMIN ---
 
 app.get('/admin/invoices', async (req, res) => {
