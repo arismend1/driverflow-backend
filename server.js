@@ -1249,32 +1249,42 @@ app.get('/admin/health', async (req, res) => {
             `)
         ]);
 
-        const invSummary = { pending: 0, charging: 0, retrying: 0, charged: 0 };
+        const invSummary = { pending: 0, charging: 0, retrying: 0, charged: 0, other: 0 };
+        const invRaw = {};
         (invoices || []).forEach(r => {
+            const s = r.status || 'unknown';
             const c = parseInt(r.count) || 0;
-            if (r.status === 'pending') invSummary.pending = c;
-            else if (r.status === 'charging') invSummary.charging = c;
-            else if (r.status === 'retrying') invSummary.retrying = c;
-            else if (r.status === 'charged' || r.status === 'paid') invSummary.charged += c;
+            invRaw[s] = c;
+            if (s === 'pending') invSummary.pending = c;
+            else if (s === 'charging') invSummary.charging = c;
+            else if (s === 'retrying') invSummary.retrying = c;
+            else if (s === 'charged' || s === 'paid') invSummary.charged += c;
+            else invSummary.other += c;
         });
 
-        const jobSummary = { pending: 0, processing: 0, failed: 0 };
+        const jobSummary = { pending: 0, processing: 0, failed: 0, other: 0 };
+        const jobRaw = {};
         (jobs || []).forEach(r => {
+            const s = r.status || 'unknown';
             const c = parseInt(r.count) || 0;
-            if (r.status === 'pending') jobSummary.pending = c;
-            else if (r.status === 'processing') jobSummary.processing = c;
-            else if (r.status === 'failed') jobSummary.failed = c;
+            jobRaw[s] = c;
+            if (s === 'pending') jobSummary.pending = c;
+            else if (s === 'processing') jobSummary.processing = c;
+            else if (s === 'failed') jobSummary.failed = c;
+            else jobSummary.other += c;
         });
+
+        const totalInvoicedCount = (invoices || []).reduce((acc, curr) => acc + (parseInt(curr.count) || 0), 0);
 
         const response = {
-            invoices: invSummary,
+            invoices: { ...invSummary, raw_statuses: invRaw },
             tickets: { unbilled: parseInt(tickets?.count) || 0 },
             invoice_items: parseInt(invoiceItems?.count) || 0,
-            jobs: jobSummary,
+            jobs: { ...jobSummary, raw_statuses: jobRaw },
             janitor: { stuck_invoices: parseInt(janitor?.count) || 0 }
         };
 
-        console.log(`[HEALTH_CHECK] ${new Date().toISOString()} | Invoices Total: ${invSummary.charged} | Stuck: ${response.janitor.stuck_invoices}`);
+        console.log(`[HEALTH_CHECK] ${new Date().toISOString()} | Total Invoices DB: ${totalInvoicedCount} | Stuck: ${response.janitor.stuck_invoices}`);
         res.json(response);
 
     } catch (e) {
