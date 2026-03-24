@@ -261,11 +261,11 @@ const handlers = {
                 let activeTx = true;
 
                 try {
-                    const insertInvoiceParams = [ company_id, billing_week, issueDate.toISOString(), dueDate.toISOString(), amount, amount, nowIso() ];
+                    const insertInvoiceParams = [ company_id, billing_week, issueDate.toISOString(), dueDate.toISOString(), amount, amount, nowIso(), nowIso() ];
                     const insertResult = await tx.run(`
                         INSERT INTO invoices (
-                            company_id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?) RETURNING id
+                            company_id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?, ?) RETURNING id
                     `, ...insertInvoiceParams);
 
                     const newInvoiceId = (insertResult.rows && insertResult.rows[0]) ? insertResult.rows[0].id : insertResult.lastInsertRowid;
@@ -495,9 +495,9 @@ const handlers = {
 
             await db.run(`
                 UPDATE invoices 
-                SET status=? 
+                SET status=?, updated_at=? 
                 WHERE id=?
-            `, nextStatus, invoice.id);
+            `, nextStatus, nowIso(), invoice.id);
 
             // Audit
             await db.run(`
