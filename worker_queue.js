@@ -253,8 +253,8 @@ const handlers = {
                     const insertResult = await tx.run(`
                         INSERT INTO invoices (
                             company_id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?, ?) RETURNING id
-                    `, ...insertInvoiceParams);
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?, ?)
+                    ` + (db.IS_POSTGRES ? ' RETURNING id' : ''), ...insertInvoiceParams);
 
                     const newInvoiceId = (insertResult.rows && insertResult.rows[0]) ? insertResult.rows[0].id : insertResult.lastInsertRowid;
 
@@ -265,8 +265,9 @@ const handlers = {
                             FROM tickets 
                             WHERE company_id = ? AND created_at >= ? AND created_at < ? 
                               AND billing_status = 'unbilled'
-                              AND price_cents IS NOT NULL AND price_cents > 0
-                              AND id NOT IN (SELECT ticket_id FROM invoice_items)
+                               AND NOT EXISTS (
+                                SELECT 1 FROM invoice_items ii WHERE ii.ticket_id = tickets.id
+                              )
                         `, newInvoiceId, company_id, start, endPlusOne);
 
                         // Mark tickets as invoiced in the SAME transaction
@@ -274,7 +275,10 @@ const handlers = {
                             UPDATE tickets SET billing_status = 'invoiced'
                             WHERE company_id = ? AND created_at >= ? AND created_at < ? 
                               AND billing_status = 'unbilled'
-                              AND id IN (SELECT ticket_id FROM invoice_items WHERE invoice_id = ?)
+                              AND EXISTS (
+                                SELECT 1 FROM invoice_items ii 
+                                WHERE ii.ticket_id = tickets.id AND ii.invoice_id = ?
+                              )
                         `, company_id, start, endPlusOne, newInvoiceId);
 
                         const itemsCount = await tx.get("SELECT COUNT(*) as c FROM invoice_items WHERE invoice_id = ?", newInvoiceId);
@@ -306,7 +310,7 @@ const handlers = {
                 // --- HOOK: Push Notification ---
                 try {
                     const { sendPush } = require('./notifications_service');
-                    await sendPush(company_id, "New Invoice", "You have a new invoice ready to pay");
+                    await sendPush(company_id, 'empresa', "New Invoice", "You have a new invoice ready to pay");
                 } catch (pushErr) {
                     logger.error(`[Billing] Push fail for Co:${company_id}: ${pushErr.message}`);
                 }
@@ -941,6 +945,28 @@ if (require.main === module) {
 
     setInterval(runDailyLeadInvites, DAILY_INVITE_INTERVAL);
     setTimeout(runDailyLeadInvites, 180000); // Run once at startup after 3 min
+
+    // Jobs Janitor (every 5 minutes) - Resets jobs stuck in 'processing' for > 60 mins
+    const JOBS_JANITOR_INTERVAL = 5 * 60 * 1000;
+    async function runJobsJanitor() {
+        try {
+            // Very conservative threshold (1 hour) to avoid interrupting heavy jobs
+            const threshold = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+            const res = await db.run(`
+                UPDATE jobs_queue
+                SET status='pending', locked_by=NULL, locked_at=NULL
+                WHERE status='processing' AND locked_at < ?
+            `, threshold);
+            const count = (res && res.rowCount) || (res && res.changes) || 0;
+            if (count > 0) {
+                logger.info(`[Janitor] Reset ${count} STUCK jobs (stale since < ${threshold}) to pending.`);
+            }
+        } catch (e) {
+            logger.error('[Janitor] Job cleanup failed:', e.message);
+        }
+    }
+    setInterval(runJobsJanitor, JOBS_JANITOR_INTERVAL);
+    setTimeout(runJobsJanitor, 60000); // Run once at startup after 1 min
 
     startQueueWorker().catch(err => {
         logger.error('FATAL: Worker Failed', err);

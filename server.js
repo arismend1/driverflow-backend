@@ -187,8 +187,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     await tx.run(`
                         UPDATE tickets 
                         SET billing_status = 'paid'
-                        WHERE id IN (
-                            SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                        WHERE EXISTS (
+                            SELECT 1 FROM invoice_items ii 
+                            WHERE ii.ticket_id = tickets.id AND ii.invoice_id = ?
                         )
                     `, invoiceId);
                     console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
@@ -206,8 +207,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     await tx.run(`
                         UPDATE tickets 
                         SET billing_status = 'paid'
-                        WHERE id IN (
-                            SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                        WHERE EXISTS (
+                            SELECT 1 FROM invoice_items ii 
+                            WHERE ii.ticket_id = tickets.id AND ii.invoice_id = ?
                         )
                     `, pre.id);
                     console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
@@ -249,8 +251,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                 await tx.run(`
                     UPDATE tickets 
                     SET billing_status = 'paid'
-                    WHERE id IN (
-                        SELECT ticket_id FROM invoice_items WHERE invoice_id = ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM invoice_items ii 
+                        WHERE ii.ticket_id = tickets.id AND ii.invoice_id = ?
                     )
                 `, invoiceId);
                 console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
@@ -421,18 +424,12 @@ app.get('/admin/analytics/funnel', async (req, res) => {
     if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
 
     try {
-        const days = parseInt(req.query.days);
-        const timeFilter = !isNaN(days) && days > 0 ? `WHERE created_at > datetime('now', '-${days} days')` : '';
-        const pgTimeFilter = !isNaN(days) && days > 0 ? `WHERE created_at > NOW() - INTERVAL '${days} days'` : '';
+        const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+        const baseQuery = `SELECT event_type, COUNT(*) as count FROM lead_funnel_events`;
+        const filter = !isNaN(days) && days > 0 ? `WHERE created_at > ?` : '';
+        const params = !isNaN(days) && days > 0 ? [cutoff] : [];
 
-        const filter = db.IS_POSTGRES ? pgTimeFilter : timeFilter;
-
-        const results = await db.all(`
-            SELECT event_type, COUNT(*) as count 
-            FROM lead_funnel_events 
-            ${filter}
-            GROUP BY event_type
-        `);
+        const results = await db.all(`${baseQuery} ${filter} GROUP BY event_type`, ...params);
 
         // Convert array to object
         const counts = {
@@ -693,7 +690,7 @@ app.post('/login', async (req, res) => {
         if (match) {
             // Success
             if (row.failed_attempts > 0) {
-                await db.run(`UPDATE ${table} SET failed_attempts=0, lockout_until=NULL WHERE id=?`, row.id);
+                await db.run(`UPDATE ${table} SET failed_attempts=0, lockout_until=NULL, updated_at=? WHERE id=?`, nowIso(), row.id);
             }
             
             // LEGAL ENFORCEMENT & TOKEN SCOPE
@@ -729,8 +726,8 @@ app.post('/login', async (req, res) => {
         } else {
             // Bad Password
             const fails = (row.failed_attempts || 0) + 1;
-            let sql = `UPDATE ${table} SET failed_attempts = ?`;
-            const args = [fails];
+            let sql = `UPDATE ${table} SET failed_attempts = ?, updated_at = ?`;
+            const args = [fails, nowIso()];
             if (fails >= 5) {
                 sql += `, lockout_until = ?`;
                 args.push(new Date(nowEpochMs() + 15 * 60 * 1000).toISOString()); // 15m
@@ -858,7 +855,7 @@ app.post('/api/legal/accept', authenticateToken, async (req, res) => {
         const table = req.user.type === 'driver' ? 'drivers' : 'empresas';
         const now = nowIso();
         
-        await db.run(`UPDATE ${table} SET accepted_terms_at=?, accepted_privacy_at=?, legal_version=? WHERE id=?`, now, now, LEGAL_VERSION, req.user.id);
+        await db.run(`UPDATE ${table} SET accepted_terms_at=?, accepted_privacy_at=?, legal_version=?, updated_at=? WHERE id=?`, now, now, LEGAL_VERSION, now, req.user.id);
         
         await auditLog('user_accept_legal', req.user.id, req.user.id, { terms: true, privacy: true, version: LEGAL_VERSION }, req);
         
@@ -912,9 +909,9 @@ app.post('/resend-verification', async (req, res) => {
             const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString();
 
             if (db.IS_POSTGRES) {
-                await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=? WHERE id=?`, token, expires, u.id);
+                await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=?, updated_at=? WHERE id=?`, token, expires, nowIso(), u.id);
             } else {
-                await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=? WHERE id=?`, token, expires, u.id);
+                await db.run(`UPDATE ${table} SET verification_token=?, verification_expires=?, updated_at=? WHERE id=?`, token, expires, nowIso(), u.id);
             }
             console.log(`[Resend] Generated new token for ${email} (old was missing or expired)`);
         }
@@ -958,9 +955,9 @@ app.all('/verify-email', async (req, res) => {
 
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
         if (db.IS_POSTGRES) {
-            await db.run(`UPDATE ${table} SET verified=true, verify_token_hash=NULL, verify_token_expires_at=NULL WHERE id=?`, u.id);
+            await db.run(`UPDATE ${table} SET verified=true, verify_token_hash=NULL, verify_token_expires_at=NULL, updated_at=? WHERE id=?`, nowIso(), u.id);
         } else {
-            await db.run(`UPDATE ${table} SET verified=1, verification_token=NULL, verification_expires=NULL WHERE id=?`, u.id);
+            await db.run(`UPDATE ${table} SET verified=1, verification_token=NULL, verification_expires=NULL, updated_at=? WHERE id=?`, nowIso(), u.id);
         }
 
         res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.</p>');
@@ -1015,7 +1012,7 @@ app.post('/reset_password', async (req, res) => {
         const hash = await bcrypt.hash(newPassword, 10);
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
 
-        await db.run(`UPDATE ${table} SET password_hash=?, reset_token=NULL, reset_expires=NULL WHERE id=?`, hash, u.id);
+        await db.run(`UPDATE ${table} SET password_hash=?, reset_token=NULL, reset_expires=NULL, updated_at=? WHERE id=?`, hash, nowIso(), u.id);
         await auditLog('password_reset_success', u.id, u.type, {}, req);
 
         res.json({ ok: true });
@@ -1134,8 +1131,8 @@ app.post('/apply_for_request', authenticateToken, async (req, res) => {
         if (check.driver_id) throw new Error('TAKEN');
 
         // Update
-        await db.run("UPDATE solicitudes SET estado='EN_REVISION', driver_id=? WHERE id=?", req.user.id, request_id);
-        await db.run("UPDATE drivers SET estado='OCUPADO' WHERE id=?", req.user.id);
+        await db.run("UPDATE solicitudes SET estado='EN_REVISION', driver_id=?, updated_at=? WHERE id=?", req.user.id, nowIso(), request_id);
+        await db.run("UPDATE drivers SET estado='OCUPADO', updated_at=? WHERE id=?", nowIso(), req.user.id);
 
         // Notify Company
         await db.run(`INSERT INTO events_outbox (event_name,created_at,company_id,driver_id,request_id,metadata) VALUES (?,?,?,?,?,?)`,
@@ -1167,7 +1164,7 @@ app.post('/approve_driver', authenticateToken, async (req, res) => {
         if (r.estado !== 'EN_REVISION') throw new Error('INVALID_STATE');
 
         // Update Request
-        await db.run("UPDATE solicitudes SET estado='ACEPTADA' WHERE id=?", request_id);
+        await db.run("UPDATE solicitudes SET estado='ACEPTADA', updated_at=? WHERE id=?", nowIso(), request_id);
 
         // Create Ticket
         const price_cents = parseInt(process.env.WEEKLY_FEE_CENTS);
@@ -1226,8 +1223,8 @@ app.post('/billing/tickets/:id/checkout', authenticateToken, async (req, res) =>
         });
 
         await db.run(
-            "UPDATE tickets SET stripe_checkout_session_id=?, billing_status='checkout_created' WHERE id=? AND billing_status <> 'paid'",
-            session.id, tid
+            "UPDATE tickets SET stripe_checkout_session_id=?, billing_status='checkout_created', updated_at=? WHERE id=? AND billing_status <> 'paid'",
+            session.id, nowIso(), tid
         );
         res.json({ success: true, checkout_url: session.url });
 
@@ -1251,7 +1248,7 @@ app.post('/admin/tickets/:id/void', authenticateToken, async (req, res) => {
     }
 
     try {
-        await db.run("UPDATE tickets SET billing_status='void' WHERE id=?", req.params.id);
+        await db.run("UPDATE tickets SET billing_status='void', updated_at=? WHERE id=?", nowIso(), req.params.id);
         await auditLog('ticket_voided', 'admin', req.params.id, {}, req);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1272,9 +1269,9 @@ app.get('/admin/health', async (req, res) => {
                 SELECT count(*) as count 
                 FROM invoices 
                 WHERE status = 'charging' 
-                AND updated_at < NOW() - INTERVAL '1 hour' 
+                AND updated_at < ? 
                 AND paid_at IS NULL
-            `)
+            `, new Date(Date.now() - 3600 * 1000).toISOString())
         ]);
 
         const invSummary = { pending: 0, charging: 0, retrying: 0, charged: 0, other: 0 };
@@ -1430,7 +1427,7 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
         }
 
         // Set to retrying and reset next_retry_at to now for immediate pickup by Dunning loop or direct queue
-        await db.run("UPDATE invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await db.run("UPDATE invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=?, last_attempt_at=? WHERE id=?", nowIso(), nowIso(), nowIso(), invoiceId);
 
         const { enqueueJob } = require('./worker_queue');
         await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId }, { idempotency_key: `charge_${invoiceId}` });
@@ -1876,7 +1873,8 @@ const updateCompanyRequirements = async (req, res) => {
                 empSql += 'contact_phone = ?, ';
                 empParams.push(contact_phone);
             }
-            empSql = empSql.slice(0, -2); // remove last comma
+            empSql += 'updated_at = ?';
+            empParams.push(nowIso());
             empSql += ' WHERE id = ?';
             empParams.push(companyId);
             await db.run(empSql, ...empParams);
@@ -1911,7 +1909,7 @@ const updateCompanyRequirements = async (req, res) => {
         }
 
         // Set search status ON instantly
-        await db.run(`UPDATE empresas SET search_status = 'ON' WHERE id = ?`, companyId);
+        await db.run(`UPDATE empresas SET search_status = 'ON', updated_at = ? WHERE id = ?`, nowIso(), companyId);
 
         res.json({ ok: true });
     } catch (e) {
@@ -1944,7 +1942,7 @@ app.post('/api/company/search_status', authenticateToken, async (req, res) => {
     const { status } = req.body;
     if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
     try {
-        await db.run("UPDATE empresas SET search_status = ? WHERE id = ?", status, req.user.id);
+        await db.run("UPDATE empresas SET search_status = ?, updated_at = ? WHERE id = ?", status, nowIso(), req.user.id);
         res.json({ ok: true, status });
     } catch (e) {
         console.error('Error updating company search_status:', e.message);
@@ -1971,7 +1969,7 @@ app.post('/api/driver/search_status', authenticateToken, async (req, res) => {
     const { status } = req.body;
     if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
     try {
-        await db.run("UPDATE drivers SET search_status = ? WHERE id = ?", status, req.user.id);
+        await db.run("UPDATE drivers SET search_status = ?, updated_at = ? WHERE id = ?", status, nowIso(), req.user.id);
         res.json({ ok: true, status });
     } catch (e) {
         console.error('Error updating driver search_status:', e.message);
@@ -2107,8 +2105,8 @@ app.post('/api/admin/banner', async (req, res) => {
     if (!imageUrl) return res.status(400).json({ error: 'Image URL required' });
 
     try {
-        await db.run('UPDATE driver_banner SET is_active = false');
-        await db.run('INSERT INTO driver_banner (image_url, is_active, updated_at) VALUES (?, true, CURRENT_TIMESTAMP)', imageUrl);
+        await db.run('UPDATE driver_banner SET is_active = false, updated_at = ?', nowIso());
+        await db.run('INSERT INTO driver_banner (image_url, is_active, updated_at) VALUES (?, true, ?)', imageUrl, nowIso());
         res.send(`
             <div style="font-family: sans-serif; padding: 40px; background: #0d1117; color: white; text-align: center;">
                 <h2>✅ Banner Updated</h2>
@@ -2298,7 +2296,7 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         console.log(`[DRIVER_PROFILE] Bridge tables updated`);
 
         // Set search status ON instantly, don't use updated_at since it might be missing like in empresas
-        await db.run(`UPDATE drivers SET search_status = 'ON' WHERE id = ?`, driverId);
+        await db.run(`UPDATE drivers SET search_status = 'ON', updated_at = ? WHERE id = ?`, nowIso(), driverId);
 
         res.json({ ok: true });
     } catch (e) {
@@ -2421,9 +2419,9 @@ async function claimLeadForDriver(driverId, email, phone) {
     if (!lead) return;
 
     await db.run(
-        `UPDATE driver_leads SET status='CLAIMED', claimed_driver_id=?, updated_at=NOW()
+        `UPDATE driver_leads SET status='CLAIMED', claimed_driver_id=?, updated_at=?
          WHERE id=? AND status IN ('NEW','INVITED')`,
-        driverId, lead.id
+        driverId, nowIso(), lead.id
     );
     console.log(`[LeadClaim] driver_id=${driverId} lead_id=${lead.id} company_id=${lead.company_id}`);
     await trackLeadFunnelEvent('lead_claimed', { lead_id: lead.id, driver_id: driverId, company_id: lead.company_id, metadata: { claim_method: "auto_email_match" } });
@@ -2587,10 +2585,10 @@ async function writeGenerationLog(userType, userId) {
     try {
         await db.run(
             `INSERT INTO user_match_generation_log (user_type, user_id, last_generated_at)
-             VALUES (?, ?, NOW())
+             VALUES (?, ?, ?)
              ON CONFLICT (user_type, user_id)
-             DO UPDATE SET last_generated_at = NOW()`,
-            userType, userId
+             DO UPDATE SET last_generated_at = ?`,
+            userType, userId, nowIso(), nowIso()
         );
     } catch (e) {
         if (String(e.message || "").includes("does not exist") || e.code === "42P01") {
@@ -2598,10 +2596,10 @@ async function writeGenerationLog(userType, userId) {
             try {
                 await db.run(
                     `INSERT INTO user_match_generation_log (user_type, user_id, last_generated_at)
-                     VALUES (?, ?, NOW())
+                     VALUES (?, ?, ?)
                      ON CONFLICT (user_type, user_id)
-                     DO UPDATE SET last_generated_at = NOW()`,
-                    userType, userId
+                     DO UPDATE SET last_generated_at = ?`,
+                    userType, userId, nowIso(), nowIso()
                 );
             } catch (e2) {
                 console.error("[matches] writeGenerationLog retry failed:", e2);
@@ -2693,15 +2691,16 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
         // 2.5) Auto-invite matching leads
         try {
             const MAX_INVITE_COUNT = 5;
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
             const leads = await db.all(
                 `SELECT id, name, email FROM driver_leads
                  WHERE company_id = ? AND status IN ('NEW','INVITED')
                    AND email IS NOT NULL AND email <> ''
                    AND is_synthetic = false
-                   AND (invited_at IS NULL OR invited_at < NOW() - INTERVAL '7 days')
+                   AND (invited_at IS NULL OR invited_at < ?)
                    AND (invite_count IS NULL OR invite_count < ?)
                  LIMIT 10`,
-                req.user.id, MAX_INVITE_COUNT
+                req.user.id, sevenDaysAgo, MAX_INVITE_COUNT
             );
 
             if (leads.length > 0) {
@@ -2709,9 +2708,10 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 const companyName = companyRow ? companyRow.nombre : 'Una empresa';
 
                 for (const lead of leads) {
+                    const now = nowIso();
                     await db.run(
-                        `UPDATE driver_leads SET invited_at = NOW(), invite_count = COALESCE(invite_count, 0) + 1, status = 'INVITED', updated_at = NOW() WHERE id = ?`,
-                        lead.id
+                        `UPDATE driver_leads SET invited_at = ?, invite_count = COALESCE(invite_count, 0) + 1, status = 'INVITED', updated_at = ? WHERE id = ?`,
+                        now, now, lead.id
                     );
                     await db.run(
                         `INSERT INTO events_outbox (request_id, event_name, created_at, company_id, metadata) VALUES (?, ?, ?, ?, ?)`,
@@ -3082,8 +3082,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
         try {
             const t = await db.run(
                 `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, currency, created_at, billing_status, billing_notes)
-                 VALUES (?,?,?,?,'USD',?,'hold',?)
-                 RETURNING id`,
+                 VALUES (?,?,?,?,'USD',?,'hold',?)` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
                 parseInt(matchId), companyId, driverId, price_cents, now, `Match ID: ${matchId}`
             );
             ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
@@ -3132,12 +3131,8 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         // Prevent driver from sharing info if they recently shared with ANY other company.
         const EXCLUSIVE_HOURS = 72;
 
-        const hoursElapsedSQL = db.IS_POSTGRES
-            ? "EXTRACT(EPOCH FROM (NOW() - driver_share_consent_at::timestamp)) / 3600"
-            : "CAST(strftime('%s', 'now') - strftime('%s', driver_share_consent_at) AS INTEGER) / 3600";
-
-        let existingConsentSql = `
-            SELECT id, ${hoursElapsedSQL} as hours_elapsed, exclusivity_extension_hours
+        const existingConsentSql = `
+            SELECT id, driver_share_consent_at, exclusivity_extension_hours
             FROM potential_matches 
             WHERE driver_id = ? 
               AND id <> ?
@@ -3145,11 +3140,13 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         `;
         const activeConsents = await db.all(existingConsentSql, parseInt(req.user.id, 10), parseInt(matchId, 10));
 
-        // Manual filter to account for extensions dynamically
+        // Manual filter to account for extensions dynamically (Engine-agnostic JS calculation)
         const lockedConsents = activeConsents.filter(c => {
+            if (!c.driver_share_consent_at) return false;
+            const hoursElapsed = (Date.now() - new Date(c.driver_share_consent_at).getTime()) / 3600000;
             const extension = c.exclusivity_extension_hours || 0;
             const limit = EXCLUSIVE_HOURS + extension;
-            return c.hours_elapsed < limit;
+            return hoursElapsed < limit;
         });
 
         if (lockedConsents && lockedConsents.length > 0) {
@@ -3417,7 +3414,7 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
         if (resolution === 'REJECTED') {
             await db.run(`UPDATE potential_matches SET status = 'CLOSED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
-            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE match_id = ? AND billing_status NOT IN ('invoiced', 'paid')`, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'void', updated_at = ? WHERE match_id = ? AND billing_status NOT IN ('invoiced', 'paid')`, now, matchId);
 
             // --- PUSH: Rechazo Real (CLOSED) ---
             if (req.user.type === 'empresa') {
@@ -3431,11 +3428,11 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
         if (resolution === 'HIRED') {
             await db.run(`UPDATE potential_matches SET status = 'HIRED', ${roleColumn} = ?, updated_at = ? WHERE id = ?`, resolution, now, matchId);
-            await db.run(`UPDATE tickets SET billing_status = 'unbilled' WHERE match_id = ?`, matchId);
-            await db.run(`UPDATE tickets SET billing_status = 'void' WHERE driver_id = (SELECT driver_id FROM potential_matches WHERE id = ?) AND match_id != ?`, matchId, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'unbilled', updated_at = ? WHERE match_id = ?`, now, matchId);
+            await db.run(`UPDATE tickets SET billing_status = 'void', updated_at = ? WHERE driver_id = (SELECT driver_id FROM potential_matches WHERE id = ?) AND match_id != ?`, now, matchId, matchId);
 
             // Turn off driver's search status
-            await db.run(`UPDATE drivers SET search_status = 'OFF' WHERE id = ?`, match.driver_id);
+            await db.run(`UPDATE drivers SET search_status = 'OFF', updated_at = ? WHERE id = ?`, now, match.driver_id);
 
             // Change all other pending matches for this driver to 'HIRED_ELSEWHERE'
             await db.run(`
@@ -3446,7 +3443,7 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
 
             // --- HOOK: Push Notification ---
             try {
-                await sendPush(match.company_id, 'empresa', "Driver Hired", "You have hired a new driver");
+                await sendPush(match.driver_id, 'driver', "You’ve been hired", "A company has selected you for a job");
             } catch (pushErr) {
                 console.error("[RESOLVE_MATCH] Push fail:", pushErr.message);
             }
@@ -3487,7 +3484,7 @@ app.get('/api/admin/pending-companies', requireAdmin, async (req, res) => {
 app.post('/api/admin/companies/:id/approve', requireAdmin, async (req, res) => {
     try {
         const companyId = req.params.id;
-        await db.run("UPDATE empresas SET verification_status = 'approved', verified_at = ? WHERE id = ?", nowIso(), companyId);
+        await db.run("UPDATE empresas SET verification_status = 'approved', verified_at = ?, updated_at = ? WHERE id = ?", nowIso(), nowIso(), companyId);
         await auditLog('admin_company_approved', 0, companyId, { company_id: companyId }, req);
         
         try { await sendPush(companyId, 'empresa', "¡Empresa Verificada!", "Tu empresa ha sido verificada. Ya puedes operar."); } catch(e) { console.error('[PushError] approve:', e.message); }
@@ -3501,7 +3498,7 @@ app.post('/api/admin/companies/:id/reject', requireAdmin, async (req, res) => {
         const { reason } = req.body;
         if (!reason) return res.status(400).json({ error: 'Rejection reason strictly required.' });
         
-        await db.run("UPDATE empresas SET verification_status = 'rejected', rejected_reason = ? WHERE id = ?", reason, companyId);
+        await db.run("UPDATE empresas SET verification_status = 'rejected', rejected_reason = ?, updated_at = ? WHERE id = ?", reason, nowIso(), companyId);
         await auditLog('admin_company_rejected', 0, companyId, { company_id: companyId, reason }, req);
         
         try { await sendPush(companyId, 'empresa', "Verificación Fallida", "Tu empresa no fue aprobada. Revisa la información enviada."); } catch(e) { console.error('[PushError] reject:', e.message); }
@@ -3579,7 +3576,7 @@ app.post('/api/admin/invoices/:id/retry', requireAdmin, async (req, res) => {
 app.post('/api/admin/companies/:id/unsuspend', requireAdmin, async (req, res) => {
     try {
         const companyId = req.params.id;
-        await db.run("UPDATE empresas SET billing_suspended = false, search_status = 'ON' WHERE id = ?", companyId);
+        await db.run("UPDATE empresas SET billing_suspended = false, search_status = 'ON', updated_at = ? WHERE id = ?", nowIso(), companyId);
         
         await auditLog('admin_unsuspend_company', 0, companyId, { source: 'admin_secret', action: 'admin_unsuspend_company', company_id: companyId }, req);
         res.json({ ok: true, message: 'Company billing unsuspended and search enabled' });

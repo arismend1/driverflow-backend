@@ -27,21 +27,41 @@ if (IS_POSTGRES) {
     }
 }
 
+const transformSql = (sql) => {
+    if (!sql) return sql;
+    let result = '';
+    let inString = false;
+    let counter = 1;
+    for (let i = 0; i < sql.length; i++) {
+        const char = sql[i];
+        if (char === "'") {
+            // Check for escaped single quote '' (SQL standard)
+            if (sql[i + 1] === "'") {
+                result += "''";
+                i++;
+                continue;
+            }
+            inString = !inString;
+        }
+        if (char === '?' && !inString) {
+            result += `$${counter++}`;
+        } else {
+            result += char;
+        }
+    }
+    return result;
+};
+
 module.exports = {
     IS_POSTGRES,
     run: async (sql, ...args) => {
         try {
             if (IS_POSTGRES) {
-                let pgSql = sql;
-                let counter = 1;
-                while (pgSql.includes('?')) {
-                    pgSql = pgSql.replace('?', `$${counter}`);
-                    counter++;
-                }
-                const res = await pool.query(pgSql, args);
-                // Map lastInsertRowid for compatibility if possible (PG uses RETURNING usually)
-                // But for simple INSERTs, we'll just return the result
-                return { lastInsertRowid: res.oid || (res.rows[0] ? res.rows[0].id : null), ...res };
+                const finalSql = transformSql(sql);
+                const res = await pool.query(finalSql, args);
+                // Unified access to the new ID if one exists (e.g. if caller added RETURNING id)
+                const pgId = (res.rows && res.rows[0]) ? res.rows[0].id : (res.oid || null);
+                return { lastInsertRowid: pgId, ...res };
             } else {
                 const info = sqliteDb.prepare(sql).run(args);
                 return { lastInsertRowid: info.lastInsertRowid, ...info };
@@ -53,13 +73,8 @@ module.exports = {
     all: async (sql, ...args) => {
         try {
             if (IS_POSTGRES) {
-                let pgSql = sql;
-                let counter = 1;
-                while (pgSql.includes('?')) {
-                    pgSql = pgSql.replace('?', `$${counter}`);
-                    counter++;
-                }
-                const res = await pool.query(pgSql, args);
+                const finalSql = transformSql(sql);
+                const res = await pool.query(finalSql, args);
                 return res.rows;
             } else {
                 return sqliteDb.prepare(sql).all(args);
@@ -71,13 +86,8 @@ module.exports = {
     get: async (sql, ...args) => {
         try {
             if (IS_POSTGRES) {
-                let pgSql = sql;
-                let counter = 1;
-                while (pgSql.includes('?')) {
-                    pgSql = pgSql.replace('?', `$${counter}`);
-                    counter++;
-                }
-                const res = await pool.query(pgSql, args);
+                const finalSql = transformSql(sql);
+                const res = await pool.query(finalSql, args);
                 return res.rows.length ? res.rows[0] : null;
             } else {
                 return sqliteDb.prepare(sql).get(args);
@@ -107,18 +117,19 @@ module.exports = {
             await client.query('BEGIN');
             return {
                 run: async (sql, ...args) => {
-                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
-                    const res = await client.query(pgSql, args);
-                    return { lastInsertRowid: res.oid || (res.rows[0] ? res.rows[0].id : null), ...res };
+                    const finalSql = transformSql(sql);
+                    const res = await client.query(finalSql, args);
+                    const pgId = (res.rows && res.rows[0]) ? res.rows[0].id : (res.oid || null);
+                    return { lastInsertRowid: pgId, ...res };
                 },
                 get: async (sql, ...args) => {
-                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
-                    const res = await client.query(pgSql, args);
+                    const finalSql = transformSql(sql);
+                    const res = await client.query(finalSql, args);
                     return res.rows.length ? res.rows[0] : null;
                 },
                 all: async (sql, ...args) => {
-                    let pgSql = sql; let c = 1; while(pgSql.includes('?')){ pgSql = pgSql.replace('?', `$${c++}`); }
-                    const res = await client.query(pgSql, args);
+                    const finalSql = transformSql(sql);
+                    const res = await client.query(finalSql, args);
                     return res.rows;
                 },
                 commit: async () => { await client.query('COMMIT'); client.release(); },
