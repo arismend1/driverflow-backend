@@ -232,8 +232,8 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
                     const piId = session.payment_intent || null;
                     const customerId = session.customer || null;
                     await tx.run(
-                        `UPDATE tickets SET billing_status='paid', paid_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
-                        nowIso(), piId, customerId, ticketId
+                        `UPDATE tickets SET billing_status='paid', paid_at=?, updated_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
+                        nowIso(), nowIso(), piId, customerId, ticketId
                     );
                     console.log(`[Stripe Webhook] ✅ Ticket #${ticketId} marked PAID (PI: ${piId}, amount: ${session.amount_total})`);
                 }
@@ -482,9 +482,12 @@ app.get('/sys/debug/email-status', async (req, res) => {
 
 app.post('/sys/debug/reset-jobs', async (req, res) => {
     try {
-        await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status IS NULL OR status IN ('processing', 'failed')");
+        const secret = req.headers['x-admin-secret'];
+        if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+
+        await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status = 'failed'");
         // Also reset stuck outbox events
-        await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status IS NULL OR queue_status='processing'");
+        await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status = 'failed'");
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });

@@ -464,35 +464,42 @@ const handlers = {
 
             // DUNNING LOGIC: Increment attempt, determine next status and backoff
             const newAttemptCount = (invoice.attempt_count || 0) + 1;
+            const MAX_ATTEMPTS = 3; 
             let nextStatus = 'failed';
-            let nextRetryAt = null;
-            let suspendedAt = null;
-
+            isDecline = (e.type === 'StripeCardError');
+            
             if (newAttemptCount >= MAX_ATTEMPTS) {
                 nextStatus = 'suspended';
-                suspendedAt = nowIso();
                 await notifyPaymentSuspended(invoice);
-                await db.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
             } else {
                 nextStatus = (isDecline || ['StripeConnectionError', 'StripeAPIError'].includes(e.type)) ? 'retrying' : 'failed';
-                // Backoff logic: +24h, +48h... (simplified to 24 * attempt hours for now)
-                const delayMs = 24 * 60 * 60 * 1000 * Math.pow(2, newAttemptCount - 1);
-                nextRetryAt = new Date(Date.now() + delayMs).toISOString();
                 await notifyPaymentFailed(invoice, newAttemptCount, MAX_ATTEMPTS, reason);
             }
 
-            await db.run(`
-                UPDATE invoices 
-                SET status=?, updated_at=? 
-                WHERE id=?
-            `, nextStatus, nowIso(), invoice.id);
+            const tx = await db.beginTransaction();
+            try {
+                await tx.run(`
+                    UPDATE invoices 
+                    SET status=?, updated_at=? 
+                    WHERE id=?
+                `, nextStatus, nowIso(), invoice.id);
 
-            // Audit
-            await db.run(`
-                INSERT INTO invoice_attempts 
-                (invoice_id, attempt_number, status, stripe_payment_intent_id, error_code, error_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            `, invoice.id, newAttemptCount, nextStatus, invoice.stripe_payment_intent_id, stripeCode, reason, nowIso());
+                if (nextStatus === 'suspended') {
+                    await tx.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
+                }
+
+                // Audit
+                await tx.run(`
+                    INSERT INTO invoice_attempts 
+                    (invoice_id, attempt_number, status, stripe_payment_intent_id, error_code, error_message, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `, invoice.id, newAttemptCount, nextStatus, invoice.stripe_payment_intent_id, stripeCode, reason, nowIso());
+
+                await tx.commit();
+            } catch (txErr) {
+                await tx.rollback();
+                throw txErr;
+            }
 
             return;
         }
