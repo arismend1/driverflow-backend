@@ -106,8 +106,9 @@ console.log("[SERVER] Starting Version: 1.4.0-atomic");
 
 // --- 4. WEBHOOKS (BEFORE BODY PARSER) ---
 
-// Unified Stripe Webhook
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Unified Stripe Webhook Handler
+const handleStripeWebhook = async (req, res) => {
+    console.log('[WEBHOOK HIT]', req.path);
     if (!checkRateLimit(req.ip, 'webhook')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const sig = req.headers['stripe-signature'];
@@ -277,19 +278,16 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         console.error('[Stripe Processing Error]', err);
         res.status(500).send('Internal Server Error');
     }
-});
+};
 
-// JSON & URL encoded body parsers (AFTER raw webhook)
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+// Internal Webhook Aliases (No HTTP Redirects - Must be before global body parsers)
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+app.post('/webhooks/payment', express.raw({ type: 'application/json' }), handleStripeWebhook);
+
+// JSON & URL encoded body parsers (AFTER raw webhooks)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Legacy Webhook Redirects
-const legacyWebhook = (req, res) => {
-    console.warn(`[Legacy Webhook] Hit on ${req.path}. Client needs update to /stripe/webhook`);
-    res.status(404).json({ error: 'Endpoint moved to /stripe/webhook' });
-};
-app.post('/api/stripe/webhook', legacyWebhook);
-app.post('/webhooks/payment', legacyWebhook);
 
 
 // --- 5. APP CONFIG & PUBLIC ROUTES ---
@@ -1695,6 +1693,13 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
                 invoice_id: invoice.id,
                 company_id: req.user.id,
                 type: 'weekly_invoice'
+            },
+            payment_intent_data: {
+                metadata: {
+                    invoice_id: invoice.id,
+                    company_id: req.user.id,
+                    type: 'weekly_invoice'
+                }
             },
             success_url: 'https://driverflow.app',
             cancel_url: 'https://driverflow.app',
