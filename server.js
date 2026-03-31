@@ -794,6 +794,8 @@ app.post('/register', async (req, res) => {
         const now = nowIso();
         const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString(); // 24h
 
+        console.log(`[Register] Generated new verify token (trace) for ${contacto}: ${token.substring(0,8)}... (len: ${token.length})`);
+
         let newId;
         if (type === 'driver') {
             // Drivers: Create UNVERIFIED (false/0) AND atomically insert legal consent
@@ -833,6 +835,7 @@ app.post('/register', async (req, res) => {
                 null, 'verification_email', now, newId, JSON.stringify({ token, email: contacto, name: nombre, user_type: 'empresa' }));
         }
 
+        console.log(`[Register] Saved verify token for ID ${newId} (type: ${type})`);
         res.json({ ok: true, message: 'Registered successfully.' });
     } catch (e) {
         // Unique constraint check (Fallback if SQL above missed it somehow)
@@ -905,6 +908,7 @@ app.post('/resend-verification', async (req, res) => {
             // Generate new token only if none exists or expired
             token = crypto.randomBytes(32).toString('hex');
             const expires = new Date(nowEpochMs() + 24 * 3600 * 1000).toISOString();
+            console.log(`[Resend] Generated new token (trace) for ${email}: ${token.substring(0,8)}... (len: ${token.length})`);
 
             if (db.IS_POSTGRES) {
                 await db.run(`UPDATE ${table} SET verify_token_hash=?, verify_token_expires_at=?, updated_at=? WHERE id=?`, token, expires, nowIso(), u.id);
@@ -926,11 +930,16 @@ app.post('/resend-verification', async (req, res) => {
 
 // VERIFY EMAIL
 app.all('/verify-email', async (req, res) => {
-    const token = req.query.token || req.body.token;
-    if (!token) return res.status(400).send('<h1>Error</h1><p>Token missing</p>');
+    const rawToken = req.query.token || req.body.token || '';
+    const token = rawToken.toString().trim();
+    
+    const safeTokenLog = token ? `${token.substring(0,8)}... (len: ${token.length})` : 'EMPTY';
+    console.log(`[Verify] Received token trace: ${safeTokenLog}`);
+    
+    if (!token) return res.status(400).json({ error: 'Token missing' });
 
     try {
-        // Search in both tables with expiration check
+        // Search in both tables with expiration check (plain-text comparison)
         const idCol = 'id';
         const typeCol = "'driver' as type";
         const expCol = db.IS_POSTGRES ? 'verify_token_expires_at' : 'verification_expires';
@@ -941,14 +950,16 @@ app.all('/verify-email', async (req, res) => {
             u = await db.get(`SELECT ${idCol}, 'empresa' as type, ${expCol} as expires FROM empresas WHERE ${tokenCol}=?`, token);
         }
 
+        console.log(`[Verify] Search result for token trace ${safeTokenLog}:`, u ? `Found ID ${u.id} (${u.type})` : 'NOT_FOUND');
+
         if (!u) {
-            console.warn(`[Verify] Token NOT_FOUND: ${token}`);
-            return res.status(404).send('<h1>Error</h1><p>Token invalido.</p>');
+            console.warn(`[Verify] Token NOT_FOUND: ${safeTokenLog}`);
+            return res.status(404).json({ error: 'Token invalido o no encontrado.' });
         }
 
         if (u.expires && new Date(u.expires) < new Date(nowEpochMs())) {
-            console.warn(`[Verify] Token EXPIRED: ${token} at ${u.expires}`);
-            return res.status(400).send('<h1>Error</h1><p>El token de verificacion ha expirado.</p>');
+            console.warn(`[Verify] Token EXPIRED: ${safeTokenLog} at ${u.expires}`);
+            return res.status(400).json({ error: 'El token de verificacion ha expirado.' });
         }
 
         const table = u.type === 'driver' ? 'drivers' : 'empresas';
@@ -957,11 +968,19 @@ app.all('/verify-email', async (req, res) => {
         } else {
             await db.run(`UPDATE ${table} SET verified=1, verification_token=NULL, verification_expires=NULL, updated_at=? WHERE id=?`, nowIso(), u.id);
         }
+        
+        console.log(`[Verify] Successfully verified ID ${u.id} (${u.type}). Token cleared.`);
 
-        res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.</p>');
+        // Determine if client expects HTML (like a browser click) or JSON (app API)
+        const acceptsHtml = req.accepts('html') && !req.accepts('json');
+        if (acceptsHtml) {
+            return res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.</p>');
+        } else {
+            return res.json({ ok: true, message: 'Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.' });
+        }
     } catch (e) {
         console.error('Verify Error', e);
-        res.status(500).send('<h1>Error</h1><p>Server Error</p>');
+        res.status(500).json({ error: 'Server Error' });
     }
 });
 
