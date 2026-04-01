@@ -466,6 +466,58 @@ app.get('/admin/analytics/funnel', async (req, res) => {
     }
 });
 
+// --- PUBLIC LEGAL PAGES (Google Play Requirements) ---
+app.get('/terms', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+            <meta charset="utf-8">
+            <title>Términos de Servicio - DriverFlow</title>
+            <style>body { font-family: sans-serif; padding: 40px 20px; line-height: 1.6; max-width: 800px; margin: auto; color: #333; }</style>
+        </head>
+        <body>
+            <h1>Términos de Servicio</h1>
+            <p><strong>DriverFlow</strong></p>
+            <p><strong>Última actualización:</strong> ${new Date().toLocaleDateString('es-ES', { month: 'long', year: 'numeric' })}</p>
+            <p>Bienvenido a DriverFlow, una plataforma digital diseñada para conectar directamente a conductores comerciales con empresas de transporte que buscan sus servicios.</p>
+            <h2>1. Sobre la Plataforma</h2>
+            <p>DriverFlow opera exclusivamente como un servicio tecnológico de emparejamiento (matching). No somos una agencia de empleo. La plataforma utiliza servicios de terceros como Google Play Services para asegurar el envío rápido de notificaciones.</p>
+            <h2>2. Obligaciones y Uso</h2>
+            <p>El usuario acepta usar la aplicación bajo fines legales, introduciendo datos verídicos al registrarse. La plataforma conecta partes pero la negociación y contratación se realiza directamente entre conductor y empresa.</p>
+            <h2>3. Contacto</h2>
+            <p>Para dudas legales o consultas: <a href="mailto:support@driverflow.app">support@driverflow.app</a>.</p>
+        </body>
+        </html>
+    `);
+});
+
+app.get('/privacy', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+            <meta charset="utf-8">
+            <title>Política de Privacidad - DriverFlow</title>
+            <style>body { font-family: sans-serif; padding: 40px 20px; line-height: 1.6; max-width: 800px; margin: auto; color: #333; }</style>
+        </head>
+        <body>
+            <h1>Política de Privacidad</h1>
+            <p><strong>DriverFlow</strong></p>
+            <p>En DriverFlow, la privacidad de tus datos es fundamental. Esta política explica la información que requerimos para que nuestra plataforma funcione y cómo la protegemos.</p>
+            <h2>1. Datos Recopilados</h2>
+            <p>Únicamente recopilamos los datos estrictamente necesarios para el registro y conexión laboral: información de contacto básica (nombre, email y/o teléfono celular para login) y tipo de licencia o detalles de la empresa.</p>
+            <h2>2. Uso de la Información</h2>
+            <p>Tus datos se utilizan con los siguientes propósitos exclusivos: autenticación segura en la app, buscar sugerencias de trabajo o conductores que encajen con el perfil (matching), y utilizar notificaciones push apoyadas por Google Play Services para avisos inmediatos de solicitudes.</p>
+            <h2>3. Privacidad y Partes Terceras</h2>
+            <p>Solo se comparte el contacto telefónico/email con otra empresa o conductor una vez que ambas partes han aprobado expresamente un Match. No vendemos datos a agencias externas de publicidad.</p>
+            <h2>4. Contacto de Privacidad</h2>
+            <p>Para ejercitar derechos sobre tus datos, solicitar su eliminación o aclarar dudas, escríbenos a: <a href="mailto:support@driverflow.app">support@driverflow.app</a></p>
+        </body>
+        </html>
+    `);
+});
+
 // Debug Endpoints (Production Diagnosis)
 app.get('/sys/debug/email-status', async (req, res) => {
     try {
