@@ -705,6 +705,8 @@ app.post('/login', async (req, res) => {
                 console.warn(`[Login] Needs legal acceptance: ${contacto}`);
                 return res.status(403).json({ 
                     requires_legal_acceptance: true, 
+                    name: row.nombre,
+                    search_status: row.search_status || 'ON',
                     token, 
                     type, 
                     id: row.id, 
