@@ -470,23 +470,62 @@ app.get('/admin/analytics/funnel', async (req, res) => {
 app.get('/terms', (req, res) => {
     res.send(`
         <!DOCTYPE html>
-        <html lang="es">
+        <html lang="en">
         <head>
             <meta charset="utf-8">
-            <title>Términos de Servicio - DriverFlow</title>
+            <title>Terms of Service - DriverFlow</title>
             <style>body { font-family: sans-serif; padding: 40px 20px; line-height: 1.6; max-width: 800px; margin: auto; color: #333; }</style>
         </head>
         <body>
-            <h1>Términos de Servicio</h1>
+            <h1>Terms of Service</h1>
             <p><strong>DriverFlow</strong></p>
-            <p><strong>Última actualización:</strong> ${new Date().toLocaleDateString('es-ES', { month: 'long', year: 'numeric' })}</p>
-            <p>Bienvenido a DriverFlow, una plataforma digital diseñada para conectar directamente a conductores comerciales con empresas de transporte que buscan sus servicios.</p>
-            <h2>1. Sobre la Plataforma</h2>
-            <p>DriverFlow opera exclusivamente como un servicio tecnológico de emparejamiento (matching). No somos una agencia de empleo. La plataforma utiliza servicios de terceros como Google Play Services para asegurar el envío rápido de notificaciones.</p>
-            <h2>2. Obligaciones y Uso</h2>
-            <p>El usuario acepta usar la aplicación bajo fines legales, introduciendo datos verídicos al registrarse. La plataforma conecta partes pero la negociación y contratación se realiza directamente entre conductor y empresa.</p>
-            <h2>3. Contacto</h2>
-            <p>Para dudas legales o consultas: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a>.</p>
+            <p><strong>Last Updated:</strong> ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</p>
+
+            <h2>1. ACCEPTANCE OF TERMS</h2>
+            <p>By registering as a "Company" or "Driver" on the DriverFlow platform ("Service"), you agree to be bound by these Terms of Service. If you do not agree, you may not use the Service.</p>
+
+            <h2>2. SERVICE DESCRIPTION</h2>
+            <p>DriverFlow is a marketplace connection platform.</p>
+            <ul>
+                <li><strong>The Product:</strong> We sell <strong>Contact Access</strong> ("Matches").</li>
+                <li><strong>Not an Employment Agency:</strong> We do not hire, screen for employment suitability, or employ drivers. We provide the technical ability to connect two interested parties.</li>
+                <li><strong>Scope:</strong> Our obligation is fulfilled completely at the moment Driver contact information is revealed to the Company.</li>
+            </ul>
+
+            <h2>3. ACCOUNT STATUS & ELIGIBILITY</h2>
+            <h3>3.1 Company States</h3>
+            <ul>
+                <li><strong>REGISTERED:</strong> You have created an account.</li>
+                <li><strong>ACTIVE:</strong> You have verified credentials and may search for drivers.</li>
+                <li><strong>BLOCKED:</strong> Your access is revoked due to non-payment or violation of terms.</li>
+            </ul>
+
+            <h2>4. MATCHING & FEES</h2>
+            <h3>4.1 The Match Process</h3>
+            <ol>
+                <li><strong>Discovery:</strong> Companies view anonymous driver profiles (Experience, Location, etc.).</li>
+                <li><strong>Request:</strong> Identifying information is hidden until a Match is confirmed and paid for.</li>
+                <li><strong>Approval:</strong> When a Company selects "Approve" on a Driver application, a <strong>Ticket</strong> is strictly generated.</li>
+            </ol>
+
+            <h3>4.2 Payment Obligation</h3>
+            <p>Trigger: The payment obligation generally arises immediately upon Company Approval. Unlock: Driver contact details (Name, Phone, Email) are LOCKED until the specific Ticket associated with that match is PAID.</p>
+
+            <h2>5. NO REFUNDS OR GUARANTEES</h2>
+            <h3>5.1 No Hiring Guarantee</h3>
+            <p>We do not guarantee that a Driver will answer your phone call, accept your job offer, or pass your internal background checks.</p>
+
+            <h3>5.2 Refund Policy</h3>
+            <p><strong>ALL SALES ARE FINAL.</strong> DriverFlow does not issue refunds for "unsuccessful hires" or "unresponsive drivers". The fee pays for the connection, which is delivered instantly upon unlocking.</p>
+
+            <h2>8. LIMITATION OF LIABILITY</h2>
+            <p>TO THE MAXIMUM EXTENT PERMITTED BY LAW, DRIVERFLOW SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES. OUR TOTAL LIABILITY IS LIMITED TO THE AMOUNT PAID BY YOU FOR THE SPECIFIC MATCH GIVING RISE TO THE CLAIM.</p>
+
+            <h2>9. GOVERNING LAW</h2>
+            <p>These Terms are governed by the laws of the United States, without regard to conflict of law principles.</p>
+
+            <h2>10. CONTACT</h2>
+            <p>For legal inquiries or support, please contact: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a>.</p>
         </body>
         </html>
     `);
@@ -495,24 +534,44 @@ app.get('/terms', (req, res) => {
 app.get('/privacy', (req, res) => {
     res.send(`
         <!DOCTYPE html>
-        <html lang="es">
+        <html lang="en">
         <head>
             <meta charset="utf-8">
-            <title>Política de Privacidad - DriverFlow</title>
+            <title>Privacy Policy - DriverFlow</title>
             <style>body { font-family: sans-serif; padding: 40px 20px; line-height: 1.6; max-width: 800px; margin: auto; color: #333; }</style>
         </head>
         <body>
-            <h1>Política de Privacidad</h1>
+            <h1>Privacy Policy</h1>
             <p><strong>DriverFlow</strong></p>
-            <p>En DriverFlow, la privacidad de tus datos es fundamental. Esta política explica la información que requerimos para que nuestra plataforma funcione y cómo la protegemos.</p>
-            <h2>1. Datos Recopilados</h2>
-            <p>Únicamente recopilamos los datos estrictamente necesarios para el registro y conexión laboral: información de contacto básica (nombre, email y/o teléfono celular para login) y tipo de licencia o detalles de la empresa.</p>
-            <h2>2. Uso de la Información</h2>
-            <p>Tus datos se utilizan con los siguientes propósitos exclusivos: autenticación segura en la app, buscar sugerencias de trabajo o conductores que encajen con el perfil (matching), y utilizar notificaciones push apoyadas por Google Play Services para avisos inmediatos de solicitudes.</p>
-            <h2>3. Privacidad y Partes Terceras</h2>
-            <p>Solo se comparte el contacto telefónico/email con otra empresa o conductor una vez que ambas partes han aprobado expresamente un Match. No vendemos datos a agencias externas de publicidad.</p>
-            <h2>4. Contacto de Privacidad</h2>
-            <p>Para ejercitar derechos sobre tus datos, solicitar su eliminación o aclarar dudas, escríbenos a: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a></p>
+            <p><strong>Last Updated:</strong> ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</p>
+
+            <h2>1. DATA COLLECTION</h2>
+            <p>We collect:</p>
+            <ul>
+                <li><strong>Registration Data:</strong> Name, Email, Phone, Company Details.</li>
+                <li><strong>Match Data:</strong> Interaction history, Match Approvals, Ticket generation.</li>
+                <li><strong>Financial Data:</strong> Processed securely via our payment provider (we do not store full card numbers).</li>
+            </ul>
+
+            <h2>2. THE "CONTACT REVEAL" MECHANISM</h2>
+            <p>A core feature of DriverFlow is the conditional sharing of Personal Information.</p>
+            <ul>
+                <li><strong>Drivers:</strong> Your Contact Information (Name, Phone, Email) is <strong>HIDDEN</strong> by default.</li>
+                <li><strong>Companies:</strong> You cannot view Driver Contact Information during the SEARCH or MATCH phase.</li>
+            </ul>
+            <p>Driver Contact Information is shared with a Company ONLY when Mutual Interest exists AND the Ticket is PAID.</p>
+
+            <h2>3. DATA RETENTION</h2>
+            <p>We retain transaction records (Tickets) for tax and legal compliance (minimum 7 years).</p>
+
+            <h2>4. USER RIGHTS & DELETION</h2>
+            <p>You may request deletion of your account. However, we cannot delete Ticket records for completed transactions where service was rendered (i.e., Contact Information was already revealed to a commercial party).</p>
+
+            <h2>5. SECURITY</h2>
+            <p>We use industry-standard encryption. Access to "Locked" data is restricted at the database level and cleared only by verified payment events.</p>
+
+            <h2>6. CONTACT</h2>
+            <p>To exercise your privacy rights, request data deletion, or clarify doubts, write to us at: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a>.</p>
         </body>
         </html>
     `);
