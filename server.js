@@ -933,10 +933,16 @@ app.all('/verify-email', async (req, res) => {
     const rawToken = req.query.token || req.body.token || '';
     const token = rawToken.toString().trim();
     
+    // Detección robusta: Click desde email es un GET con token en la URL
+    const isBrowserGet = req.method === 'GET' && !!req.query.token;
+
     const safeTokenLog = token ? `${token.substring(0,8)}... (len: ${token.length})` : 'EMPTY';
     console.log(`[Verify] Received token trace: ${safeTokenLog}`);
     
-    if (!token) return res.status(400).json({ error: 'Token missing' });
+    if (!token) {
+        if (isBrowserGet) return res.status(400).send('<h1>Error</h1><p>Token missing</p>');
+        return res.status(400).json({ error: 'Token missing' });
+    }
 
     try {
         // Search in both tables with expiration check (plain-text comparison)
@@ -954,11 +960,13 @@ app.all('/verify-email', async (req, res) => {
 
         if (!u) {
             console.warn(`[Verify] Token NOT_FOUND: ${safeTokenLog}`);
+            if (isBrowserGet) return res.status(404).send('<div style="font-family: sans-serif; text-align: center; padding: 40px;"><h1 style="color: #dc3545;">❌ Error</h1><p style="font-size: 18px;">Token inválido o no encontrado.</p></div>');
             return res.status(404).json({ error: 'Token invalido o no encontrado.' });
         }
 
         if (u.expires && new Date(u.expires) < new Date(nowEpochMs())) {
             console.warn(`[Verify] Token EXPIRED: ${safeTokenLog} at ${u.expires}`);
+            if (isBrowserGet) return res.status(400).send('<div style="font-family: sans-serif; text-align: center; padding: 40px;"><h1 style="color: #dc3545;">❌ Error</h1><p style="font-size: 18px;">Token inválido o expirado.</p></div>');
             return res.status(400).json({ error: 'El token de verificacion ha expirado.' });
         }
 
@@ -971,15 +979,19 @@ app.all('/verify-email', async (req, res) => {
         
         console.log(`[Verify] Successfully verified ID ${u.id} (${u.type}). Token cleared.`);
 
-        // Determine if client expects HTML (like a browser click) or JSON (app API)
-        const acceptsHtml = req.accepts('html') && !req.accepts('json');
-        if (acceptsHtml) {
-            return res.send('<h1>Cuenta Verificada</h1><p>Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.</p>');
+        if (isBrowserGet) {
+            return res.send(`
+                <div style="font-family: sans-serif; text-align: center; padding: 40px;">
+                    <h1 style="color: #28a745;">✅ Cuenta verificada</h1>
+                    <p style="font-size: 18px; color: #555;">Tu correo ha sido verificado exitosamente. Ya puedes cerrar esta ventana e iniciar sesión en la aplicación.</p>
+                </div>
+            `);
         } else {
             return res.json({ ok: true, message: 'Tu correo ha sido verificado exitosamente. Ya puedes iniciar sesion.' });
         }
     } catch (e) {
         console.error('Verify Error', e);
+        if (isBrowserGet) return res.status(500).send('<h1>Error</h1><p>Server Error</p>');
         res.status(500).json({ error: 'Server Error' });
     }
 });
