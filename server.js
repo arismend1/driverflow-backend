@@ -486,7 +486,7 @@ app.get('/terms', (req, res) => {
             <h2>2. Obligaciones y Uso</h2>
             <p>El usuario acepta usar la aplicación bajo fines legales, introduciendo datos verídicos al registrarse. La plataforma conecta partes pero la negociación y contratación se realiza directamente entre conductor y empresa.</p>
             <h2>3. Contacto</h2>
-            <p>Para dudas legales o consultas: <a href="mailto:support@driverflow.app">support@driverflow.app</a>.</p>
+            <p>Para dudas legales o consultas: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a>.</p>
         </body>
         </html>
     `);
@@ -512,7 +512,7 @@ app.get('/privacy', (req, res) => {
             <h2>3. Privacidad y Partes Terceras</h2>
             <p>Solo se comparte el contacto telefónico/email con otra empresa o conductor una vez que ambas partes han aprobado expresamente un Match. No vendemos datos a agencias externas de publicidad.</p>
             <h2>4. Contacto de Privacidad</h2>
-            <p>Para ejercitar derechos sobre tus datos, solicitar su eliminación o aclarar dudas, escríbenos a: <a href="mailto:support@driverflow.app">support@driverflow.app</a></p>
+            <p>Para ejercitar derechos sobre tus datos, solicitar su eliminación o aclarar dudas, escríbenos a: <a href="mailto:admindriverflow@gmail.com">admindriverflow@gmail.com</a></p>
         </body>
         </html>
     `);
