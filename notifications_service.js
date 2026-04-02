@@ -32,7 +32,10 @@ async function sendPush(userId, userType, title, body, data = {}) {
         if (!userId || !userType || !admin.apps.length) return;
 
         const tokens = await db.all('SELECT token FROM push_tokens WHERE user_id = ? AND user_type = ?', userId, userType);
-        if (!tokens || tokens.length === 0) return;
+        if (!tokens || tokens.length === 0) {
+            console.log(`[PUSH_MISS] No tokens for user #${userId} (${userType})`);
+            return;
+        }
 
         console.log(`[PUSH] User #${userId} (${userType}): "${title}" (${tokens.length} devices)`);
 

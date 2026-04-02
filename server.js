@@ -668,6 +668,13 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
              ON CONFLICT (user_id, user_type, token) DO UPDATE SET platform = EXCLUDED.platform`,
             req.user.id, userType, token, platform || 'android'
         );
+        
+        // Clean up legacy push tokens that had "unknown" user_type to prevent duplicates
+        await db.run(
+            `DELETE FROM push_tokens WHERE user_id = ? AND token = ? AND user_type = 'unknown'`,
+            req.user.id, token
+        );
+        
         console.log(`[PUSH_REG] After INSERT: success`);
         res.json({ ok: true });
     } catch (e) {
