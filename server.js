@@ -131,25 +131,17 @@ const handleStripeWebhook = async (req, res) => {
 
     const tx = await db.beginTransaction();
     try {
-        // 1. Safe insertion mapped as lock (PostgreSQL ON CONFLICT)
-        try {
-            await tx.run(
-                `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES (?, ?, CURRENT_TIMESTAMP, 'pending')`,
-                event.id, event.type
-            );
-        } catch (err) {
-            // Error code 23505 in PostgreSQL represents a unique_violation. Event is duplicate.
-            if (err.code === '23505' || err.message.includes('UNIQUE')) {
-                const existing = await tx.get(`SELECT status FROM stripe_webhook_events WHERE stripe_event_id=?`, event.id);
-                if (existing && existing.status === 'processed') {
-                    await tx.rollback();
-                    return res.json({ received: true });
-                }
-                // If pending/failed from a previous crash, fall through and retry processing
-            } else {
-                await tx.rollback();
-                throw err;
-            }
+        // 1. Idempotent lock: INSERT ... ON CONFLICT DO NOTHING avoids 23505/25P02
+        const insertResult = await tx.run(
+            `INSERT INTO stripe_webhook_events (stripe_event_id, type, created_at, status) VALUES (?, ?, CURRENT_TIMESTAMP, 'pending') ON CONFLICT (stripe_event_id) DO NOTHING`,
+            event.id, event.type
+        );
+
+        // If no row was inserted, event is a known duplicate
+        if (insertResult.rowCount === 0) {
+            console.log(`[Stripe Webhook] Duplicate event ${event.id} (${event.type}) — skipping`);
+            await tx.commit();
+            return res.json({ received: true });
         }
 
         // 3. Invoice Payment Interception
@@ -3767,7 +3759,8 @@ if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1')
             'migrate_phase6_driver_profile.js',
             'migrate_phase6_production_fix.js',
             'migrate_fix_duplicate_tickets.js',
-            'scripts/migrate_driver_banner.js'
+            'scripts/migrate_driver_banner.js',
+            'migrate_empresas_updated_at.js'
         ];
 
         for (const m of featureMigrations) {
