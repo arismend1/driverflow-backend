@@ -1880,13 +1880,15 @@ const getCompanyRequirements = async (req, res) => {
             company_bio: null,
             requires_travel_interview: false,
             home_time: 'Flexible',
-            offered_freight_types: ''
+            offered_freight_types: '',
+            contact_person: '',
+            contact_phone: ''
         };
 
         const row = await db.get(`
             SELECT cr.*, 
                    COALESCE(cr.requires_travel_interview, ${db.IS_POSTGRES ? 'FALSE' : '0'}) AS requires_travel_interview, 
-                   e.company_logo, e.company_bio 
+                   e.company_logo, e.company_bio, e.contact_person, e.contact_phone 
             FROM empresas e
             LEFT JOIN company_requirements cr ON e.id = cr.company_id 
             WHERE e.id = ?`, req.user.id);
