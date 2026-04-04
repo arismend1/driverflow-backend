@@ -1,0 +1,34 @@
+﻿diff --git a/notifications_service.js b/notifications_service.js
+index 82c26ea..0d1250c 100644
+--- a/notifications_service.js
++++ b/notifications_service.js
+@@ -32,7 +32,10 @@ async function sendPush(userId, userType, title, body, data = {}) {
+         if (!userId || !userType || !admin.apps.length) return;
+ 
+         const tokens = await db.all('SELECT token FROM push_tokens WHERE user_id = ? AND user_type = ?', userId, userType);
+-        if (!tokens || tokens.length === 0) return;
++        if (!tokens || tokens.length === 0) {
++            console.log(`[PUSH_MISS] No tokens for user #${userId} (${userType})`);
++            return;
++        }
+ 
+         console.log(`[PUSH] User #${userId} (${userType}): "${title}" (${tokens.length} devices)`);
+ 
+diff --git a/server.js b/server.js
+index 0754886..14d01df 100644
+--- a/server.js
++++ b/server.js
+@@ -668,6 +668,13 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
+              ON CONFLICT (user_id, user_type, token) DO UPDATE SET platform = EXCLUDED.platform`,
+             req.user.id, userType, token, platform || 'android'
+         );
++        
++        // Clean up legacy push tokens that had "unknown" user_type to prevent duplicates
++        await db.run(
++            `DELETE FROM push_tokens WHERE user_id = ? AND token = ? AND user_type = 'unknown'`,
++            req.user.id, token
++        );
++        
+         console.log(`[PUSH_REG] After INSERT: success`);
+         res.json({ ok: true });
+     } catch (e) {

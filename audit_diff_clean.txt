@@ -1,0 +1,22 @@
+﻿diff --git a/server.js b/server.js
+index c54baa0..0754886 100644
+--- a/server.js
++++ b/server.js
+@@ -100,7 +100,7 @@ app.get('/', (req, res) => {
+     });
+ });
+ 
+-app.get('/health', (req, res) => res.sendStatus(200));
++app.get('/health', (req, res) => res.json({ status: 'ok' }));
+ 
+ console.log("[SERVER] Starting Version: 1.4.0-atomic");
+ 
+@@ -289,7 +289,7 @@ app.use(express.static('public'));
+ 
+ // Health Check
+ app.get('/', (req, res) => res.json({ status: 'ok', time: nowIso(), mode: process.env.NODE_ENV }));
+-app.get('/health', (req, res) => res.json({ ok: true }));
++
+ 
+ // --- 5.1 LEGAL PUBLIC ENDPOINTS ---
+ app.get('/legal/privacy', (req, res) => {
