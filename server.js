@@ -1870,7 +1870,7 @@ const getCompanyRequirements = async (req, res) => {
             req_truck: false,
             offered_payment_methods: [],
             req_relationships: [],
-            availability: 'Inmediata',
+            availability: 'Immediate',
             req_experience_years: 0,
             pay_per_mile_min: null,
             pay_per_mile_max: null,
@@ -1895,22 +1895,46 @@ const getCompanyRequirements = async (req, res) => {
 
         if (!row) return res.json(defaults);
 
-        // Map and parse JSON fields if SQLite
-        const result = { ...row };
-        const jsonFields = [
-            'req_license_types', 'req_endorsements', 'req_operation_types',
-            'req_modalities', 'offered_payment_methods', 'req_relationships'
-        ];
-
-        if (!db.IS_POSTGRES) {
-            jsonFields.forEach(field => {
+        const parseArrayField = (value) => {
+            if (Array.isArray(value)) return value;
+            if (typeof value === 'string' && value.trim()) {
                 try {
-                    result[field] = typeof row[field] === 'string' ? JSON.parse(row[field]) : (row[field] || []);
-                } catch (e) {
-                    result[field] = [];
+                    const parsed = JSON.parse(value);
+                    return Array.isArray(parsed) ? parsed : [];
+                } catch {
+                    return [];
                 }
-            });
-        }
+            }
+            return [];
+        };
+
+        const normalizeAvailability = (value) =>
+            value === 'Inmediata' ? 'Immediate' : (value || defaults.availability);
+
+        const readDbBoolean = (value) =>
+            db.IS_POSTGRES ? !!value : Number(value) === 1;
+
+        const result = {
+            ...defaults,
+            ...row,
+            req_license_types: parseArrayField(row.req_license_types),
+            req_endorsements: parseArrayField(row.req_endorsements),
+            req_operation_types: parseArrayField(row.req_operation_types),
+            req_modalities: parseArrayField(row.req_modalities),
+            offered_payment_methods: parseArrayField(row.offered_payment_methods),
+            req_relationships: parseArrayField(row.req_relationships),
+            availability: normalizeAvailability(row.availability),
+            req_experience_years: row.req_experience_years ?? defaults.req_experience_years,
+            pay_per_mile_min: row.pay_per_mile_min ?? defaults.pay_per_mile_min,
+            pay_per_mile_max: row.pay_per_mile_max ?? defaults.pay_per_mile_max,
+            requires_travel_interview: readDbBoolean(row.requires_travel_interview),
+            home_time: row.home_time || defaults.home_time,
+            offered_freight_types: row.offered_freight_types || defaults.offered_freight_types,
+            company_logo: row.company_logo || defaults.company_logo,
+            company_bio: row.company_bio || defaults.company_bio,
+            contact_person: row.contact_person || defaults.contact_person,
+            contact_phone: row.contact_phone || defaults.contact_phone
+        };
 
         res.json(result);
     } catch (e) {
@@ -1931,19 +1955,83 @@ const updateCompanyRequirements = async (req, res) => {
         home_time, offered_freight_types, contact_person, contact_phone
     } = req.body;
 
-    const safeJson = (val) => Array.isArray(val) ? JSON.stringify(val) : (typeof val === 'string' ? val : JSON.stringify(val || []));
+    const parseArrayField = (value) => {
+        if (Array.isArray(value)) return value;
+        if (typeof value === 'string' && value.trim()) {
+            try {
+                const parsed = JSON.parse(value);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch {
+                return [];
+            }
+        }
+        return [];
+    };
 
-    const p_req_license_types = safeJson(req_license_types);
-    const p_req_endorsements = safeJson(req_endorsements);
-    const p_req_operation_types = safeJson(req_operation_types);
-    const p_req_modalities = safeJson(req_modalities);
-    const p_offered_payment_methods = safeJson(offered_payment_methods);
-    const p_req_relationships = safeJson(req_relationships);
+    const serializeArrayField = (value) => JSON.stringify(parseArrayField(value));
+    const normalizeAvailability = (value) =>
+        value === 'Inmediata' ? 'Immediate' : value;
+    const readDbBoolean = (value) =>
+        db.IS_POSTGRES ? !!value : Number(value) === 1;
+    const toDbBoolean = (value) =>
+        db.IS_POSTGRES ? !!value : (!!value ? 1 : 0);
+    const toIntOr = (value, fallback) => {
+        if (value === undefined || value === null || value === '') return fallback;
+        const num = Number(value);
+        return Number.isFinite(num) ? Math.trunc(num) : fallback;
+    };
+    const toNullableNumber = (value, fallback) => {
+        if (value === undefined) return fallback;
+        if (value === null || value === '') return null;
+        const num = Number(value);
+        return Number.isFinite(num) ? num : fallback;
+    };
 
     console.log(`[COMPANY_PROFILE][SAVE] updating fields for company ${companyId}`);
     console.log(`[COMPANY_REQUIREMENTS][PUT] RECEIVED PAYLOAD for company ${companyId}:`, Object.keys(req.body));
 
     try {
+        const current = await db.get(
+            `SELECT * FROM company_requirements WHERE company_id = ?`,
+            companyId
+        );
+
+        const nextReqCdl =
+            req_cdl !== undefined ? !!req_cdl :
+            current ? readDbBoolean(current.req_cdl) : true;
+        const nextReqLicenseTypes =
+            req_license_types !== undefined ? parseArrayField(req_license_types) : parseArrayField(current?.req_license_types);
+        const nextReqEndorsements =
+            req_endorsements !== undefined ? parseArrayField(req_endorsements) : parseArrayField(current?.req_endorsements);
+        const nextReqOperationTypes =
+            req_operation_types !== undefined ? parseArrayField(req_operation_types) : parseArrayField(current?.req_operation_types);
+        const nextReqModalities =
+            req_modalities !== undefined ? parseArrayField(req_modalities) : parseArrayField(current?.req_modalities);
+        const nextReqTruck =
+            req_truck !== undefined ? !!req_truck :
+            current ? readDbBoolean(current.req_truck) : false;
+        const nextOfferedPaymentMethods =
+            offered_payment_methods !== undefined ? parseArrayField(offered_payment_methods) : parseArrayField(current?.offered_payment_methods);
+        const nextReqRelationships =
+            req_relationships !== undefined ? parseArrayField(req_relationships) : parseArrayField(current?.req_relationships);
+        const nextAvailability =
+            normalizeAvailability(
+                availability !== undefined ? availability : current?.availability
+            ) || 'Immediate';
+        const nextReqExperienceYears =
+            toIntOr(req_experience_years, current?.req_experience_years ?? 0);
+        const nextPayPerMileMin =
+            toNullableNumber(pay_per_mile_min, current?.pay_per_mile_min ?? null);
+        const nextPayPerMileMax =
+            toNullableNumber(pay_per_mile_max, current?.pay_per_mile_max ?? null);
+        const nextRequiresTravelInterview =
+            requires_travel_interview !== undefined ? !!requires_travel_interview :
+            current ? readDbBoolean(current.requires_travel_interview) : false;
+        const nextHomeTime =
+            home_time !== undefined ? home_time : (current?.home_time ?? 'Flexible');
+        const nextOfferedFreightTypes =
+            offered_freight_types !== undefined ? offered_freight_types : (current?.offered_freight_types ?? '');
+
         const sql = db.IS_POSTGRES
             ? `INSERT INTO company_requirements (
                 company_id, req_cdl, req_license_types, req_endorsements, req_operation_types, 
@@ -1979,21 +2067,21 @@ const updateCompanyRequirements = async (req, res) => {
 
         const params = [
             companyId,
-            (req_cdl ?? true) ? 1 : 0,
-            JSON.stringify(req_license_types || []),
-            JSON.stringify(req_endorsements || []),
-            JSON.stringify(req_operation_types || []),
-            JSON.stringify(req_modalities || []),
-            (req_truck ?? false) ? 1 : 0,
-            JSON.stringify(offered_payment_methods || []),
-            JSON.stringify(req_relationships || []),
-            availability || 'Inmediata',
-            req_experience_years || 0,
-            pay_per_mile_min || null,
-            pay_per_mile_max || null,
-            (requires_travel_interview ?? false) ? 1 : 0,
-            home_time || null,
-            offered_freight_types || null
+            toDbBoolean(nextReqCdl),
+            serializeArrayField(nextReqLicenseTypes),
+            serializeArrayField(nextReqEndorsements),
+            serializeArrayField(nextReqOperationTypes),
+            serializeArrayField(nextReqModalities),
+            toDbBoolean(nextReqTruck),
+            serializeArrayField(nextOfferedPaymentMethods),
+            serializeArrayField(nextReqRelationships),
+            nextAvailability,
+            nextReqExperienceYears,
+            nextPayPerMileMin,
+            nextPayPerMileMax,
+            toDbBoolean(nextRequiresTravelInterview),
+            nextHomeTime,
+            nextOfferedFreightTypes
         ];
 
         if (!db.IS_POSTGRES) {
@@ -2035,7 +2123,7 @@ const updateCompanyRequirements = async (req, res) => {
         await db.run('DELETE FROM company_req_license_types WHERE company_id = ?', companyId);
 
         // 2. Insert new operation_types
-        const arrOpTypes = Array.isArray(req_operation_types) ? req_operation_types : [];
+        const arrOpTypes = nextReqOperationTypes;
         if (arrOpTypes.length > 0) {
             console.log(`[COMPANY_REQUIREMENTS] INSERT operation_types: ${arrOpTypes.length}`);
             for (const v of arrOpTypes) {
@@ -2046,7 +2134,7 @@ const updateCompanyRequirements = async (req, res) => {
         }
 
         // 3. Insert new license_types
-        const arrLicTypes = Array.isArray(req_license_types) ? req_license_types : [];
+        const arrLicTypes = nextReqLicenseTypes;
         if (arrLicTypes.length > 0) {
             console.log(`[COMPANY_REQUIREMENTS] INSERT license_types: ${arrLicTypes.length}`);
             for (const v of arrLicTypes) {
