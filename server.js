@@ -278,13 +278,11 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handl
 app.post('/webhooks/payment', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
 // JSON & URL encoded body parsers (AFTER raw webhooks)
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
 
 
 // --- 5. APP CONFIG & PUBLIC ROUTES ---
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ limit: '15mb', extended: true }));
 app.use(express.static('public'));
 
 // Health Check
