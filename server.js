@@ -47,6 +47,443 @@ async function ensureStripeCustomerForCompany(company) {
     return customer.id;
 }
 
+const schemaColumnsCache = new Map();
+
+async function getTableColumns(tableName) {
+    if (schemaColumnsCache.has(tableName)) {
+        return schemaColumnsCache.get(tableName);
+    }
+
+    let columns = {};
+
+    if (db.IS_POSTGRES) {
+        const rows = await db.all(`
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+        `, tableName);
+
+        columns = (rows || []).reduce((acc, row) => {
+            acc[row.column_name] = { notNull: row.is_nullable === 'NO' };
+            return acc;
+        }, {});
+    } else {
+        const safeTables = new Set(['invoices', 'invoice_items', 'tickets', 'empresas']);
+        if (!safeTables.has(tableName)) {
+            throw new Error(`Unsafe table lookup: ${tableName}`);
+        }
+
+        const rows = await db.all(`PRAGMA table_info(${tableName})`);
+        columns = (rows || []).reduce((acc, row) => {
+            acc[row.name] = { notNull: !!row.notnull };
+            return acc;
+        }, {});
+    }
+
+    schemaColumnsCache.set(tableName, columns);
+    return columns;
+}
+
+function buildBillingHttpError(httpStatus, code, message, extras = {}) {
+    const err = new Error(message);
+    err.httpStatus = httpStatus;
+    err.code = code;
+    Object.assign(err, extras);
+    return err;
+}
+
+function buildStripeMetadata(metadata = {}) {
+    return Object.entries(metadata).reduce((acc, [key, value]) => {
+        if (value !== undefined && value !== null) {
+            acc[key] = String(value);
+        }
+        return acc;
+    }, {});
+}
+
+function getInstantInvoiceDateRange() {
+    const today = nowIso().slice(0, 10);
+    return {
+        weekStart: today,
+        weekEnd: today,
+        billingWeek: `${today} to ${today}`
+    };
+}
+
+async function fetchInvoiceByTicket(ticketId, runner = db) {
+    if (!ticketId) return null;
+    return runner.get(`
+        SELECT i.*
+        FROM invoices i
+        JOIN invoice_items ii ON ii.invoice_id = i.id
+        WHERE ii.ticket_id = ?
+        ORDER BY i.id DESC
+    `, ticketId);
+}
+
+async function resolvePaymentIntentCharge(stripe, paymentIntent) {
+    if (!paymentIntent) return { chargeId: null, receiptUrl: null };
+
+    if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge === 'object') {
+        return {
+            chargeId: paymentIntent.latest_charge.id || null,
+            receiptUrl: paymentIntent.latest_charge.receipt_url || null
+        };
+    }
+
+    if (typeof paymentIntent.latest_charge === 'string') {
+        try {
+            const charge = await stripe.charges.retrieve(paymentIntent.latest_charge);
+            return {
+                chargeId: paymentIntent.latest_charge,
+                receiptUrl: charge.receipt_url || null
+            };
+        } catch (_) {
+            return {
+                chargeId: paymentIntent.latest_charge,
+                receiptUrl: null
+            };
+        }
+    }
+
+    if (paymentIntent.charges && Array.isArray(paymentIntent.charges.data) && paymentIntent.charges.data.length > 0) {
+        return {
+            chargeId: paymentIntent.charges.data[0].id || null,
+            receiptUrl: paymentIntent.charges.data[0].receipt_url || null
+        };
+    }
+
+    return { chargeId: null, receiptUrl: null };
+}
+
+async function markInvoiceFailed(invoiceId, message, paymentIntentId = null) {
+    if (!invoiceId) return;
+
+    const invoiceColumns = await getTableColumns('invoices');
+    const assignments = ['status = ?'];
+    const params = ['failed'];
+
+    if (invoiceColumns.failure_reason) {
+        assignments.push('failure_reason = ?');
+        params.push(message || 'Billing failed');
+    }
+    if (paymentIntentId && invoiceColumns.stripe_payment_intent_id) {
+        assignments.push('stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, ?)');
+        params.push(paymentIntentId);
+    }
+    if (invoiceColumns.updated_at) {
+        assignments.push('updated_at = ?');
+        params.push(nowIso());
+    }
+
+    params.push(invoiceId);
+    await db.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ?`, ...params);
+}
+
+function normalizeChargeError(error, invoiceId = null) {
+    if (error.httpStatus) return error;
+
+    const paymentIntentId = error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null;
+    const paymentIntentStatus = error.raw && error.raw.payment_intent ? error.raw.payment_intent.status : null;
+
+    if (paymentIntentStatus === 'requires_payment_method' || error.code === 'requires_payment_method') {
+        return buildBillingHttpError(402, 'requires_payment_method', error.message || 'A saved payment method is required.', {
+            invoiceId,
+            paymentIntentId
+        });
+    }
+
+    if (error.type === 'StripeCardError') {
+        return buildBillingHttpError(402, error.code || 'card_declined', error.message || 'Card declined.', {
+            invoiceId,
+            paymentIntentId
+        });
+    }
+
+    return buildBillingHttpError(500, 'billing_error', error.message || 'Billing failed.', {
+        invoiceId,
+        paymentIntentId
+    });
+}
+
+async function markTicketPaid(ticketId, paymentInfo = {}) {
+    if (!ticketId) return;
+
+    const ticketColumns = await getTableColumns('tickets');
+    const assignments = ['billing_status = ?'];
+    const params = ['paid'];
+
+    if (ticketColumns.paid_at) {
+        assignments.push('paid_at = ?');
+        params.push(nowIso());
+    }
+    if (ticketColumns.updated_at) {
+        assignments.push('updated_at = ?');
+        params.push(nowIso());
+    }
+    if (paymentInfo.paymentIntentId && ticketColumns.stripe_payment_intent_id) {
+        assignments.push('stripe_payment_intent_id = ?');
+        params.push(paymentInfo.paymentIntentId);
+    }
+    if (paymentInfo.customerId && ticketColumns.stripe_customer_id) {
+        assignments.push('stripe_customer_id = ?');
+        params.push(paymentInfo.customerId);
+    }
+
+    params.push(ticketId);
+    await db.run(`UPDATE tickets SET ${assignments.join(', ')} WHERE id = ? AND billing_status <> 'paid'`, ...params);
+}
+
+async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
+    const stripe = getStripe();
+    if (!stripe) {
+        throw buildBillingHttpError(500, 'stripe_unavailable', 'Stripe unavailable.');
+    }
+
+    const normalizedAmount = parseInt(amountCents, 10);
+    if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+        throw buildBillingHttpError(500, 'invalid_amount', 'Invalid billing amount.');
+    }
+
+    const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
+    const empresaColumns = await getTableColumns('empresas');
+    const emailExpr = empresaColumns.email ? 'email' : 'NULL';
+    const billingEmailExpr = empresaColumns.email ? 'COALESCE(email, contacto)' : 'contacto';
+    const company = await db.get(`
+        SELECT id, nombre, contacto, stripe_customer_id, ${billingEmailExpr} AS billing_email, ${emailExpr} AS email
+        FROM empresas
+        WHERE id = ?
+    `, companyId);
+
+    if (!company) {
+        throw buildBillingHttpError(500, 'company_not_found', 'Company not found for billing.');
+    }
+
+    const customerId = await ensureStripeCustomerForCompany(company);
+    let invoice = ticketId ? await fetchInvoiceByTicket(ticketId) : null;
+    const invoiceColumns = await getTableColumns('invoices');
+    const invoiceItemColumns = await getTableColumns('invoice_items');
+
+    if (invoice && invoice.status === 'charged') {
+        await markTicketPaid(ticketId, {
+            paymentIntentId: invoice.stripe_payment_intent_id || null,
+            customerId
+        });
+        return invoice;
+    }
+
+    if (!invoice) {
+        const tx = await db.beginTransaction();
+        try {
+            const existing = ticketId ? await fetchInvoiceByTicket(ticketId, tx) : null;
+            if (existing) {
+                invoice = existing;
+            } else {
+                const createdAt = nowIso();
+                const instantDateRange = getInstantInvoiceDateRange();
+                const insertColumns = ['company_id', 'total_cents', 'status'];
+                const insertValues = [companyId, normalizedAmount, 'pending'];
+
+                if (invoiceColumns.currency) {
+                    insertColumns.push('currency');
+                    insertValues.push('USD');
+                }
+                if (invoiceColumns.subtotal_cents) {
+                    insertColumns.push('subtotal_cents');
+                    insertValues.push(normalizedAmount);
+                }
+                if (invoiceColumns.issue_date) {
+                    insertColumns.push('issue_date');
+                    insertValues.push(createdAt);
+                }
+                if (invoiceColumns.due_date) {
+                    insertColumns.push('due_date');
+                    insertValues.push(createdAt);
+                }
+                if (invoiceColumns.billing_week) {
+                    insertColumns.push('billing_week');
+                    insertValues.push(instantDateRange.billingWeek);
+                }
+                if (invoiceColumns.week_start) {
+                    insertColumns.push('week_start');
+                    insertValues.push(instantDateRange.weekStart);
+                }
+                if (invoiceColumns.week_end) {
+                    insertColumns.push('week_end');
+                    insertValues.push(instantDateRange.weekEnd);
+                }
+                if (invoiceColumns.created_at) {
+                    insertColumns.push('created_at');
+                    insertValues.push(createdAt);
+                }
+                if (invoiceColumns.updated_at) {
+                    insertColumns.push('updated_at');
+                    insertValues.push(createdAt);
+                }
+
+                const placeholders = insertColumns.map(() => '?').join(', ');
+                const result = await tx.run(
+                    `INSERT INTO invoices (${insertColumns.join(', ')}) VALUES (${placeholders})` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
+                    ...insertValues
+                );
+
+                const invoiceId = (result.rows && result.rows[0]) ? result.rows[0].id : result.lastInsertRowid;
+                invoice = await tx.get('SELECT * FROM invoices WHERE id = ?', invoiceId);
+
+                if (ticketId) {
+                    const itemColumns = ['invoice_id', 'ticket_id'];
+                    const itemValues = [invoiceId, ticketId];
+
+                    if (invoiceItemColumns.price_cents) {
+                        itemColumns.push('price_cents');
+                        itemValues.push(normalizedAmount);
+                    }
+                    if (invoiceItemColumns.description) {
+                        itemColumns.push('description');
+                        itemValues.push(metadata.matchId ? `Match #${metadata.matchId}` : `Ticket #${ticketId}`);
+                    }
+                    if (invoiceItemColumns.created_at) {
+                        itemColumns.push('created_at');
+                        itemValues.push(createdAt);
+                    }
+
+                    await tx.run(
+                        `INSERT INTO invoice_items (${itemColumns.join(', ')}) VALUES (${itemColumns.map(() => '?').join(', ')})`,
+                        ...itemValues
+                    );
+                }
+            }
+
+            await tx.commit();
+        } catch (error) {
+            await tx.rollback();
+
+            if (ticketId && (error.code === '23505' || (error.message && (error.message.includes('UNIQUE') || error.message.includes('duplicate'))))) {
+                invoice = await fetchInvoiceByTicket(ticketId);
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    if (!invoice) {
+        throw buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.');
+    }
+
+    const idempotencyKey = ticketId
+        ? `instant_ticket_${ticketId}_charge`
+        : `instant_invoice_${invoice.id}_charge`;
+    const stripeMetadata = buildStripeMetadata({
+        invoice_id: invoice.id,
+        company_id: companyId,
+        ticket_id: ticketId,
+        match_id: metadata.matchId,
+        driver_id: metadata.driverId,
+        source: metadata.source || 'share_information'
+    });
+
+    let paymentIntent = null;
+
+    try {
+        if (invoice.stripe_payment_intent_id) {
+            paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id, {
+                expand: ['latest_charge']
+            });
+        } else {
+            paymentIntent = await stripe.paymentIntents.create({
+                amount: normalizedAmount,
+                currency: (invoice.currency || 'USD').toLowerCase(),
+                customer: customerId,
+                confirm: true,
+                off_session: true,
+                expand: ['latest_charge'],
+                description: ticketId ? `Instant share charge for ticket #${ticketId}` : `Instant charge for company #${companyId}`,
+                metadata: stripeMetadata
+            }, { idempotencyKey });
+
+            if (paymentIntent.id && invoiceColumns.stripe_payment_intent_id) {
+                const updateParts = ['stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, ?)'];
+                const updateParams = [paymentIntent.id];
+                if (invoiceColumns.updated_at) {
+                    updateParts.push('updated_at = ?');
+                    updateParams.push(nowIso());
+                }
+                updateParams.push(invoice.id);
+                await db.run(`UPDATE invoices SET ${updateParts.join(', ')} WHERE id = ?`, ...updateParams);
+                invoice.stripe_payment_intent_id = paymentIntent.id;
+            }
+        }
+
+        if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
+            paymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
+                off_session: true,
+                expand: ['latest_charge']
+            });
+        }
+
+        if (paymentIntent.status === 'requires_payment_method') {
+            throw buildBillingHttpError(402, 'requires_payment_method', 'A saved payment method is required.', {
+                invoiceId: invoice.id,
+                paymentIntentId: paymentIntent.id
+            });
+        }
+
+        if (paymentIntent.status !== 'succeeded') {
+            throw buildBillingHttpError(500, 'payment_not_completed', `Unexpected payment status: ${paymentIntent.status}`, {
+                invoiceId: invoice.id,
+                paymentIntentId: paymentIntent.id
+            });
+        }
+    } catch (error) {
+        const normalizedError = normalizeChargeError(error, invoice.id);
+        const paymentIntentId = normalizedError.paymentIntentId || (error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null);
+        await markInvoiceFailed(invoice.id, normalizedError.message, paymentIntentId);
+        throw normalizedError;
+    }
+
+    const { chargeId, receiptUrl } = await resolvePaymentIntentCharge(stripe, paymentIntent);
+    const invoiceAssignments = ['status = ?'];
+    const invoiceParams = ['charged'];
+
+    if (invoiceColumns.stripe_payment_intent_id) {
+        invoiceAssignments.push('stripe_payment_intent_id = ?');
+        invoiceParams.push(paymentIntent.id);
+    }
+    if (invoiceColumns.stripe_charge_id) {
+        invoiceAssignments.push('stripe_charge_id = ?');
+        invoiceParams.push(chargeId);
+    }
+    if (invoiceColumns.paid_at) {
+        invoiceAssignments.push('paid_at = ?');
+        invoiceParams.push(nowIso());
+    }
+    if (invoiceColumns.paid_method) {
+        invoiceAssignments.push('paid_method = ?');
+        invoiceParams.push('stripe');
+    }
+    if (receiptUrl && invoiceColumns.receipt_url) {
+        invoiceAssignments.push('receipt_url = ?');
+        invoiceParams.push(receiptUrl);
+    }
+    if (invoiceColumns.failure_reason) {
+        invoiceAssignments.push('failure_reason = NULL');
+    }
+    if (invoiceColumns.updated_at) {
+        invoiceAssignments.push('updated_at = ?');
+        invoiceParams.push(nowIso());
+    }
+
+    invoiceParams.push(invoice.id);
+    await db.run(`UPDATE invoices SET ${invoiceAssignments.join(', ')} WHERE id = ?`, ...invoiceParams);
+
+    await markTicketPaid(ticketId, {
+        paymentIntentId: paymentIntent.id,
+        customerId
+    });
+
+    return db.get('SELECT * FROM invoices WHERE id = ?', invoice.id);
+}
+
 // Trust Proxy (Render/Load Balancer)
 app.set('trust proxy', 1);
 
@@ -3446,6 +3883,18 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
 
         if (updated.company_share_consent_at) {
             ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
+            const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+            await createInvoiceAndCharge({
+                companyId: updated.company_id,
+                amountCents: ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10),
+                metadata: {
+                    ticketId,
+                    matchId,
+                    driverId: updated.driver_id,
+                    companyId: updated.company_id,
+                    source: 'driver_confirm_share'
+                }
+            });
             await finalizeShare(matchId);
             finalStatus = 'INFO_SHARED';
             console.log(`[ConsentFlow] status changed to INFO_SHARED`);
@@ -3467,6 +3916,13 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] driver confirm-share error:', e);
+        if (e.httpStatus) {
+            return res.status(e.httpStatus).json({
+                error: e.code || 'billing_error',
+                message: e.message,
+                invoice_id: e.invoiceId || null
+            });
+        }
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -3539,6 +3995,18 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
 
             if (updated.driver_share_consent_at) {
                 ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
+                const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+                await createInvoiceAndCharge({
+                    companyId: updated.company_id,
+                    amountCents: ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10),
+                    metadata: {
+                        ticketId,
+                        matchId,
+                        driverId: updated.driver_id,
+                        companyId: updated.company_id,
+                        source: 'company_confirm_share'
+                    }
+                });
                 await finalizeShare(matchId);
                 finalStatus = 'INFO_SHARED';
                 console.log(`[ConsentFlow] status changed to INFO_SHARED`);
@@ -3564,6 +4032,13 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
         }
     } catch (e) {
         console.error('[Matches] company confirm-share error:', e);
+        if (e.httpStatus) {
+            return res.status(e.httpStatus).json({
+                error: e.code || 'billing_error',
+                message: e.message,
+                invoice_id: e.invoiceId || null
+            });
+        }
         res.status(500).json({ error: 'Server error' });
     }
 });
