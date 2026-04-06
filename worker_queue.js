@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const db = require('./db_adapter'); // Async Adapter
 const logger = require('./logger');
 const time = require('./time_contract');
+const { getStripe } = require('./stripe_client');
 
 const WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 const POLL_INTERVAL = 2000;
@@ -249,11 +250,11 @@ const handlers = {
                 let activeTx = true;
 
                 try {
-                    const insertInvoiceParams = [ company_id, billing_week, issueDate.toISOString(), dueDate.toISOString(), amount, amount, nowIso(), nowIso() ];
+                    const insertInvoiceParams = [ company_id, week_start, week_end, billing_week, issueDate.toISOString(), dueDate.toISOString(), amount, amount, nowIso(), nowIso() ];
                     const insertResult = await tx.run(`
                         INSERT INTO invoices (
-                            company_id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'pending', ?, ?)
+                            company_id, week_start, week_end, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USD', 'pending', ?, ?)
                     ` + (db.IS_POSTGRES ? ' RETURNING id' : ''), ...insertInvoiceParams);
 
                     const newInvoiceId = (insertResult.rows && insertResult.rows[0]) ? insertResult.rows[0].id : insertResult.lastInsertRowid;
@@ -342,10 +343,11 @@ const handlers = {
         // 2. Fetch Invoice
         // Support payload flexibility if rescheduled
         let invoice;
+        const companyEmailExpr = db.IS_POSTGRES ? "COALESCE(c.email, c.contacto)" : "c.contacto";
         if (invoice_id) {
-            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.id = ?", invoice_id);
+            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.id = ?`, invoice_id);
         } else if (payload.company_id && payload.week_start) {
-            invoice = await db.get("SELECT w.*, c.stripe_customer_id FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?", payload.company_id, payload.week_start);
+            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?`, payload.company_id, payload.week_start);
         }
 
         if (!invoice) {
@@ -378,12 +380,25 @@ const handlers = {
             return;
         }
 
-        // 4. Validate Data
+        const stripe = getStripe();
+        if (!stripe) {
+            throw new Error("FATAL: Stripe client unavailable in job execution");
+        }
+        const isLive = stripeKey.startsWith('sk_live_');
+        logger.info(`${logPrefix} Processing Charge: $${invoice.total_cents / 100} (Live: ${isLive})`);
+
         if (!invoice.stripe_customer_id) {
-            const err = "Missing stripe_customer_id";
-            logger.error(`${logPrefix} ${err}`);
-            await db.run("UPDATE invoices SET status='failed', failure_reason=?, updated_at=? WHERE id=?", err, nowIso(), invoice.id);
-            return;
+            const customer = await stripe.customers.create({
+                email: invoice.company_email || undefined,
+                name: invoice.company_name || `Company #${invoice.company_id}`,
+                metadata: { company_id: String(invoice.company_id), type: 'empresa' }
+            }, { idempotencyKey: `cust_company_${invoice.company_id}` });
+
+            await db.run(
+                "UPDATE empresas SET stripe_customer_id=?, updated_at=? WHERE id=? AND stripe_customer_id IS NULL",
+                customer.id, nowIso(), invoice.company_id
+            );
+            invoice.stripe_customer_id = customer.id;
         }
 
         if (invoice.total_cents <= 0) {
@@ -391,10 +406,6 @@ const handlers = {
             await db.run("UPDATE invoices SET status='charged', paid_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoice.id);
             return;
         }
-
-        const stripe = require('stripe')(stripeKey);
-        const isLive = stripeKey.startsWith('sk_live_');
-        logger.info(`${logPrefix} Processing Charge: $${invoice.total_cents / 100} (Live: ${isLive})`);
 
         // 5. Idempotency Key & Create-or-Confirm Logic
         const idempotencyKey = `invoice_${invoice.id}_charge`;
@@ -479,14 +490,19 @@ const handlers = {
                 nextStatus = (isDecline || ['StripeConnectionError', 'StripeAPIError'].includes(e.type)) ? 'retrying' : 'failed';
                 await notifyPaymentFailed(invoice, newAttemptCount, MAX_ATTEMPTS, reason);
             }
+            const delaySec = 5 * Math.pow(2, newAttemptCount - 1);
+            const nowMs = time.nowMs({ ctx: 'invoice_retry_calc' });
+            const nextRetryAt = nextStatus === 'retrying'
+                ? new Date(nowMs + delaySec * 1000).toISOString()
+                : null;
 
             const tx = await db.beginTransaction();
             try {
                 await tx.run(`
                     UPDATE invoices 
-                    SET status=?, updated_at=? 
+                    SET status=?, failure_reason=?, attempt_count=?, last_attempt_at=?, next_retry_at=?, suspended_at=?, updated_at=? 
                     WHERE id=?
-                `, nextStatus, nowIso(), invoice.id);
+                `, nextStatus, reason, newAttemptCount, nowIso(), nextRetryAt, nextStatus === 'suspended' ? nowIso() : null, nowIso(), invoice.id);
 
                 if (nextStatus === 'suspended') {
                     await tx.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
@@ -527,18 +543,29 @@ const handlers = {
                 chargeId = paymentIntent.charges.data[0].id;
                 receiptUrl = paymentIntent.charges.data[0].receipt_url;
             }
+            const successAttempt = (invoice.attempt_count || 0) + 1;
 
             await db.run(`
                 UPDATE invoices 
-                SET status='charged', stripe_payment_intent_id=?, paid_at=?, failure_reason=NULL, 
-                    stripe_charge_id=COALESCE(stripe_charge_id, ?), receipt_url=COALESCE(receipt_url, ?), updated_at=? 
+                SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=COALESCE(stripe_charge_id, ?),
+                    receipt_url=COALESCE(receipt_url, ?), paid_at=?, paid_method='stripe',
+                    failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL,
+                    attempt_count=?, last_attempt_at=?, updated_at=? 
                 WHERE id=?
-            `, paymentIntent.id, chargeId, receiptUrl, nowIso(), nowIso(), invoice.id);
+            `, paymentIntent.id, chargeId, receiptUrl, nowIso(), successAttempt, nowIso(), nowIso(), invoice.id);
+
+            await db.run(`
+                UPDATE tickets
+                SET billing_status='paid', paid_at=?, updated_at=?
+                WHERE EXISTS (
+                    SELECT 1 FROM invoice_items ii
+                    WHERE ii.ticket_id = tickets.id AND ii.invoice_id = ?
+                )
+            `, nowIso(), nowIso(), invoice.id);
 
             logger.info(`${logPrefix} SUCCESS: Charged ${paymentIntent.id}`);
 
             // Audit Success
-            const successAttempt = (invoice.attempt_count || 0) + 1;
             await db.run(`
                 INSERT INTO invoice_attempts 
                 (invoice_id, attempt_number, status, stripe_payment_intent_id, created_at)
@@ -569,7 +596,8 @@ async function processJobs() {
         const retryingInvoices = await db.all(`
             SELECT id FROM invoices 
             WHERE status = 'retrying'
-        `);
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+        `, nowIso());
 
         for (const inv of retryingInvoices) {
             // Check if a job already exists to avoid duplicate flooding
@@ -710,7 +738,7 @@ async function startQueueWorker() {
     cron.schedule('0 14 * * 1', async () => {
         logger.info('[Scheduler] Starting Automatic Billing Execution...');
         try {
-            const invoices = await db.all("SELECT id FROM invoices WHERE status IN ('pending', 'failed') AND total_cents > 0");
+            const invoices = await db.all("SELECT id FROM invoices WHERE status = 'pending' AND total_cents > 0");
             for (const inv of invoices) {
                 await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id }, { idempotency_key: `charge_${inv.id}` });
             }
@@ -727,14 +755,15 @@ async function startQueueWorker() {
     cron.schedule('0 * * * *', async () => {
         logger.info('[Scheduler] Checking Dunning / Retries...');
         try {
-            // Reintentar 'retrying' o 'failed' (si se forzó) que ya hayan pasado la barrera de tiempo.
+            // Reintentar solo facturas en retrying cuya ventana ya venció.
             // SQLite/PG compatible timestamp string compare
             const querySelect = `
                 SELECT id FROM invoices 
-                WHERE status IN ('failed', 'retrying') 
+                WHERE status = 'retrying'
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
             `;
             console.log("[Scheduler][Dunning] Executing query:", querySelect);
-            const invoices = await db.all(querySelect);
+            const invoices = await db.all(querySelect, nowIso());
 
             for (const inv of invoices) {
                 logger.info(`[Dunning] Enqueuing retry for invoice ${inv.id}`);

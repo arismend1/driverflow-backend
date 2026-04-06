@@ -26,6 +26,27 @@ validateEnv({ role: 'api' }); // Checks env vars
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+async function ensureStripeCustomerForCompany(company) {
+    if (company.stripe_customer_id) return company.stripe_customer_id;
+    const stripe = getStripe();
+    if (!stripe) throw new Error('Stripe Unavailable');
+    const candidateEmail = [company.billing_email, company.email, company.contacto]
+        .find(value => typeof value === 'string' && /\S+@\S+\.\S+/.test(value));
+
+    const customer = await stripe.customers.create({
+        email: candidateEmail ? candidateEmail.trim().toLowerCase() : undefined,
+        name: company.nombre || `Company #${company.id}`,
+        metadata: { company_id: String(company.id), type: 'empresa' }
+    }, { idempotencyKey: `cust_company_${company.id}` });
+
+    await db.run(
+        "UPDATE empresas SET stripe_customer_id=?, updated_at=? WHERE id=? AND stripe_customer_id IS NULL",
+        customer.id, nowIso(), company.id
+    );
+
+    return customer.id;
+}
+
 // Trust Proxy (Render/Load Balancer)
 app.set('trust proxy', 1);
 
@@ -173,7 +194,9 @@ const handleStripeWebhook = async (req, res) => {
                 if (pre && pre.status !== 'charged') {
                     await tx.run(`
                         UPDATE invoices 
-                        SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
+                        SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=COALESCE(?, stripe_charge_id),
+                            receipt_url=COALESCE(?, receipt_url), paid_at=COALESCE(paid_at, ?), paid_method='stripe',
+                            failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
                         WHERE id=? AND status != 'charged'
                     `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
                     
@@ -193,7 +216,9 @@ const handleStripeWebhook = async (req, res) => {
                 if (pre && pre.status !== 'charged') {
                     await tx.run(`
                         UPDATE invoices 
-                        SET status='charged', stripe_charge_id=?, receipt_url=?, paid_at=?, updated_at=? 
+                        SET status='charged', stripe_charge_id=COALESCE(?, stripe_charge_id),
+                            receipt_url=COALESCE(?, receipt_url), paid_at=COALESCE(paid_at, ?), paid_method='stripe',
+                            failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
                         WHERE stripe_payment_intent_id=? AND status != 'charged'
                     `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
 
@@ -237,9 +262,11 @@ const handleStripeWebhook = async (req, res) => {
                 const piId = session.payment_intent || null;
                 await tx.run(`
                     UPDATE invoices 
-                    SET status='charged', paid_at=?, updated_at=? 
+                    SET status='charged', stripe_payment_intent_id=COALESCE(stripe_payment_intent_id, ?),
+                        paid_at=COALESCE(paid_at, ?), paid_method='stripe',
+                        failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
                     WHERE id=? AND status != 'charged'
-                `, nowIso(), nowIso(), invoiceId);
+                `, piId, nowIso(), nowIso(), invoiceId);
 
                 await tx.run(`
                     UPDATE tickets 
@@ -1754,13 +1781,16 @@ app.get('/api/billing/invoices/me', authenticateToken, async (req, res) => {
         const offset = parseInt(req.query.offset) || 0;
 
         const rows = await db.all(`
-            SELECT id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method 
+            SELECT id, week_start, week_end, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method, receipt_url
             FROM invoices 
             WHERE company_id=? 
             ORDER BY issue_date DESC 
             LIMIT ? OFFSET ?
         `, req.user.id, limit, offset);
-        res.json(rows || []);
+        res.json((rows || []).map(row => ({
+            ...row,
+            billing_week: row.billing_week || ((row.week_start && row.week_end) ? `${row.week_start} to ${row.week_end}` : null)
+        })));
     } catch (e) {
         console.error('Invoices List Error', e);
         res.status(500).json({ error: e.message });
@@ -1771,13 +1801,16 @@ app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
     if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
     try {
         const inv = await db.get(`
-            SELECT id, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method 
+            SELECT id, week_start, week_end, billing_week, issue_date, due_date, subtotal_cents, total_cents, currency, status, created_at, paid_at, paid_method, receipt_url
             FROM invoices 
             WHERE id=? AND company_id=?
         `, req.params.id, req.user.id);
 
         if (!inv) return res.status(404).json({ error: 'Not Found' });
-        res.json(inv);
+        res.json({
+            ...inv,
+            billing_week: inv.billing_week || ((inv.week_start && inv.week_end) ? `${inv.week_start} to ${inv.week_end}` : null)
+        });
     } catch (e) {
         console.error('Invoice Detail Error', e);
         res.status(500).json({ error: e.message });
@@ -1790,8 +1823,10 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
     const invId = req.params.id;
 
     try {
+        const companyEmailExpr = db.IS_POSTGRES ? "COALESCE(c.email, c.contacto)" : "c.contacto";
+        const companyRawEmailExpr = db.IS_POSTGRES ? "c.email" : "NULL";
         const invoice = await db.get(`
-            SELECT w.*, c.stripe_customer_id 
+            SELECT w.*, c.stripe_customer_id, ${companyEmailExpr} AS billing_email, ${companyRawEmailExpr} AS email, c.contacto, c.nombre
             FROM invoices w 
             JOIN empresas c ON w.company_id = c.id 
             WHERE w.id=? AND w.company_id=?
@@ -1811,13 +1846,21 @@ app.post('/api/billing/invoices/:id/checkout', authenticateToken, async (req, re
 
         const stripe = getStripe();
         if (!stripe) return res.status(503).json({ error: 'Stripe Unavailable' });
+        const customerId = await ensureStripeCustomerForCompany({
+            id: req.user.id,
+            stripe_customer_id: invoice.stripe_customer_id,
+            billing_email: invoice.billing_email,
+            email: invoice.email,
+            contacto: invoice.contacto,
+            nombre: invoice.nombre
+        });
 
         // Idempotency: avoid creating too many sessions for the same attempt
         const idempotencyKey = `inv_checkout_${invoice.id}_${Date.now()}`;
 
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            customer: invoice.stripe_customer_id || undefined,
+            customer: customerId,
             line_items: [{
                 price_data: {
                     currency: (invoice.currency || 'usd').toLowerCase(),

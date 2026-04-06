@@ -7,7 +7,128 @@ function getStripe() {
     const apiKey = process.env.STRIPE_SECRET_KEY;
     if (!apiKey) return null;
 
+    const toForm = (obj, prefix = '') => {
+        const pairs = [];
+        for (const key in obj) {
+            const val = obj[key];
+            if (val === undefined || val === null) continue;
+            const newKey = prefix ? `${prefix}[${key}]` : key;
+            if (typeof val === 'object') {
+                pairs.push(...toForm(val, newKey));
+            } else {
+                pairs.push(`${encodeURIComponent(newKey)}=${encodeURIComponent(val)}`);
+            }
+        }
+        return pairs;
+    };
+
     return {
+        customers: {
+            create: async (params, options = {}) => {
+                const body = toForm(params).join('&');
+
+                const res = await fetch('https://api.stripe.com/v1/customers', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Stripe-Version': API_VERSION,
+                        ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {})
+                    },
+                    body
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    console.error('Stripe Customer Error:', txt);
+                    throw new Error(`Stripe API Error: ${res.status}`);
+                }
+
+                return res.json();
+            }
+        },
+        charges: {
+            retrieve: async (chargeId) => {
+                const res = await fetch(`https://api.stripe.com/v1/charges/${chargeId}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Stripe-Version': API_VERSION,
+                    }
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    console.error('Stripe Charge Retrieve Error:', txt);
+                    throw new Error(`Stripe API Error: ${res.status}`);
+                }
+
+                return res.json();
+            }
+        },
+        paymentIntents: {
+            create: async (params, options = {}) => {
+                const body = toForm(params).join('&');
+
+                const res = await fetch('https://api.stripe.com/v1/payment_intents', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Stripe-Version': API_VERSION,
+                        ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {})
+                    },
+                    body
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    console.error('Stripe PaymentIntent Create Error:', txt);
+                    throw new Error(`Stripe API Error: ${res.status}`);
+                }
+
+                return res.json();
+            },
+            retrieve: async (paymentIntentId, params = {}) => {
+                const query = toForm(params).join('&');
+                const suffix = query ? `?${query}` : '';
+                const res = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}${suffix}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Stripe-Version': API_VERSION,
+                    }
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    console.error('Stripe PaymentIntent Retrieve Error:', txt);
+                    throw new Error(`Stripe API Error: ${res.status}`);
+                }
+
+                return res.json();
+            },
+            confirm: async (paymentIntentId, params = {}) => {
+                const body = toForm(params).join('&');
+                const res = await fetch(`https://api.stripe.com/v1/payment_intents/${paymentIntentId}/confirm`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Stripe-Version': API_VERSION,
+                    },
+                    body
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    console.error('Stripe PaymentIntent Confirm Error:', txt);
+                    throw new Error(`Stripe API Error: ${res.status}`);
+                }
+
+                return res.json();
+            }
+        },
         checkout: {
             sessions: {
                 create: async (params, options = {}) => {
@@ -22,22 +143,6 @@ function getStripe() {
                     // 
                     // Let's try to support JSON? Stripe DOES NOT support JSON.
                     //
-                    // Okay, simple form encoder:
-                    const toForm = (obj, prefix = '') => {
-                        const pairs = [];
-                        for (const key in obj) {
-                            const val = obj[key];
-                            if (val === undefined || val === null) continue;
-                            const newKey = prefix ? `${prefix}[${key}]` : key;
-                            if (typeof val === 'object') {
-                                pairs.push(...toForm(val, newKey));
-                            } else {
-                                pairs.push(`${encodeURIComponent(newKey)}=${encodeURIComponent(val)}`);
-                            }
-                        }
-                        return pairs;
-                    };
-
                     const body = toForm(params).join('&');
 
                     const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {

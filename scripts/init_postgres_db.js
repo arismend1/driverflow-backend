@@ -56,7 +56,10 @@ async function initDB() {
                     blocked_at TEXT,
                     failed_attempts INTEGER DEFAULT 0,
                     lockout_until TEXT,
-                    created_at TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    stripe_customer_id TEXT,
+                    billing_suspended BOOLEAN DEFAULT FALSE,
                     verified INTEGER DEFAULT 0,
                     verification_token TEXT,
                     verification_expires TEXT,
@@ -100,14 +103,29 @@ async function initDB() {
             await client.query(`
                 CREATE TABLE IF NOT EXISTS invoices (
                     id SERIAL PRIMARY KEY,
-                    company_id INTEGER,
-                    status TEXT DEFAULT 'open',
-                    total_cents INTEGER,
-                    issue_date TEXT,
-                    due_date TEXT,
-                    paid_at TEXT,
+                    company_id INTEGER NOT NULL,
+                    week_start DATE NOT NULL,
+                    week_end DATE NOT NULL,
+                    billing_week TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','charging','retrying','failed','suspended','charged')),
+                    currency TEXT NOT NULL DEFAULT 'USD',
+                    subtotal_cents INTEGER NOT NULL DEFAULT 0,
+                    total_cents INTEGER NOT NULL DEFAULT 0,
+                    issue_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    due_date TIMESTAMPTZ,
+                    paid_at TIMESTAMPTZ,
                     paid_method TEXT,
-                    currency TEXT DEFAULT 'USD'
+                    failure_reason TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TIMESTAMPTZ,
+                    next_retry_at TIMESTAMPTZ,
+                    suspended_at TIMESTAMPTZ,
+                    stripe_payment_intent_id TEXT,
+                    stripe_charge_id TEXT,
+                    receipt_url TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(company_id, week_start)
                 );
             `);
 
@@ -115,10 +133,34 @@ async function initDB() {
                 CREATE TABLE IF NOT EXISTS invoice_items (
                     id SERIAL PRIMARY KEY,
                     invoice_id INTEGER,
-                    ticket_id INTEGER,
+                    ticket_id INTEGER UNIQUE,
                     price_cents INTEGER,
                     description TEXT,
                     created_at TEXT
+                );
+            `);
+
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS invoice_attempts (
+                    id SERIAL PRIMARY KEY,
+                    invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+                    attempt_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    stripe_payment_intent_id TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            `);
+
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+                    stripe_event_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    processed_at TIMESTAMPTZ,
+                    last_error TEXT
                 );
             `);
 
@@ -190,6 +232,12 @@ async function initDB() {
                     received_at TEXT
                 );
             `);
+
+            await client.query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);`);
+            await client.query(`CREATE INDEX IF NOT EXISTS idx_invoices_next_retry ON invoices(next_retry_at);`);
+            await client.query(`CREATE INDEX IF NOT EXISTS idx_invoices_stripe_pi ON invoices(stripe_payment_intent_id);`);
+            await client.query(`CREATE INDEX IF NOT EXISTS idx_invoice_attempts_invoice_id ON invoice_attempts(invoice_id);`);
+            await client.query(`CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_status ON stripe_webhook_events(status);`);
 
             await client.query(`
                 CREATE TABLE IF NOT EXISTS audit_logs (
