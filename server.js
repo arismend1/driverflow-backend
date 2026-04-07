@@ -111,15 +111,21 @@ function getInstantInvoiceDateRange() {
     };
 }
 
-async function fetchInvoiceByTicket(ticketId, runner = db) {
+async function fetchInvoiceByTicket(ticketId, runner = db, companyId = null) {
     if (!ticketId) return null;
-    return runner.get(`
+    const params = [ticketId];
+    let sql = `
         SELECT i.*
         FROM invoices i
         JOIN invoice_items ii ON ii.invoice_id = i.id
         WHERE ii.ticket_id = ?
-        ORDER BY i.id DESC
-    `, ticketId);
+    `;
+    if (companyId !== null && companyId !== undefined) {
+        sql += ' AND i.company_id = ?';
+        params.push(companyId);
+    }
+    sql += ' ORDER BY i.id DESC';
+    return runner.get(sql, ...params);
 }
 
 async function resolvePaymentIntentCharge(stripe, paymentIntent) {
@@ -242,7 +248,12 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
     }
 
     const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
-    let invoice = ticketId ? await fetchInvoiceByTicket(ticketId, runner) : null;
+    if (!ticketId) {
+        throw buildBillingHttpError(500, 'missing_ticket_id', 'Ticket is required to ensure invoice.');
+    }
+
+    const lookupInvoice = async (readRunner) => fetchInvoiceByTicket(ticketId, readRunner, companyId);
+    let invoice = await lookupInvoice(runner);
     const invoiceColumns = await getTableColumns('invoices');
     const invoiceItemColumns = await getTableColumns('invoice_items');
 
@@ -250,11 +261,29 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
         return invoice;
     }
 
+    const ownsTransaction = runner === db;
+    const writeRunner = ownsTransaction ? await db.beginTransaction() : runner;
+    const savepointName = `sp_invoice_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+    const isUniqueLikeError = (error) => (
+        !!error && (
+            error.code === '23505' ||
+            (error.message && (error.message.includes('UNIQUE') || error.message.includes('duplicate')))
+        )
+    );
+    const rollbackSavepoint = async () => {
+        try { await writeRunner.run(`ROLLBACK TO SAVEPOINT ${savepointName}`); } catch (_) {}
+        try { await writeRunner.run(`RELEASE SAVEPOINT ${savepointName}`); } catch (_) {}
+    };
+
     try {
-        const existing = ticketId ? await fetchInvoiceByTicket(ticketId, runner) : null;
+        const existing = await lookupInvoice(writeRunner);
         if (existing) {
             invoice = existing;
         } else {
+            if (!ownsTransaction) {
+                await writeRunner.run(`SAVEPOINT ${savepointName}`);
+            }
+
             const createdAt = nowIso();
             const instantDateRange = getInstantInvoiceDateRange();
             const insertColumns = ['company_id', 'total_cents', 'status'];
@@ -298,13 +327,13 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
             }
 
             const placeholders = insertColumns.map(() => '?').join(', ');
-            const result = await runner.run(
+            const result = await writeRunner.run(
                 `INSERT INTO invoices (${insertColumns.join(', ')}) VALUES (${placeholders})` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
                 ...insertValues
             );
 
             const invoiceId = (result.rows && result.rows[0]) ? result.rows[0].id : result.lastInsertRowid;
-            invoice = await runner.get('SELECT * FROM invoices WHERE id = ?', invoiceId);
+            invoice = await writeRunner.get('SELECT * FROM invoices WHERE id = ?', invoiceId);
 
             if (ticketId) {
                 const itemColumns = ['invoice_id', 'ticket_id'];
@@ -323,22 +352,40 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
                     itemValues.push(createdAt);
                 }
 
-                await runner.run(
+                await writeRunner.run(
                     `INSERT INTO invoice_items (${itemColumns.join(', ')}) VALUES (${itemColumns.map(() => '?').join(', ')})`,
                     ...itemValues
                 );
             }
+
+            invoice = await lookupInvoice(writeRunner) || invoice;
+        }
+
+        if (!invoice) {
+            throw buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.');
+        }
+
+        if (ownsTransaction) {
+            await writeRunner.commit();
+        } else {
+            try { await writeRunner.run(`RELEASE SAVEPOINT ${savepointName}`); } catch (_) {}
         }
     } catch (error) {
-        if (ticketId && (error.code === '23505' || (error.message && (error.message.includes('UNIQUE') || error.message.includes('duplicate'))))) {
-            invoice = await fetchInvoiceByTicket(ticketId, runner);
+        if (ownsTransaction) {
+            await writeRunner.rollback().catch(() => {});
+            if (isUniqueLikeError(error)) {
+                invoice = await lookupInvoice(db);
+                if (invoice) return invoice;
+            }
         } else {
-            throw error;
+            await rollbackSavepoint();
+            if (isUniqueLikeError(error)) {
+                invoice = await lookupInvoice(writeRunner);
+                if (invoice) return invoice;
+            }
         }
-    }
 
-    if (!invoice) {
-        throw buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.');
+        throw error;
     }
 
     return invoice;
@@ -385,94 +432,94 @@ async function markInvoiceCharged(invoiceId, paymentInfo = {}, runner = db) {
 
 async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
     const stripe = getStripe();
-    if (!stripe) {
-        return {
-            status: 'failed',
-            paymentIntentId: null,
-            chargeId: null,
-            receiptUrl: null,
-            error: buildBillingHttpError(500, 'stripe_unavailable', 'Stripe unavailable.')
-        };
-    }
-
-    const normalizedAmount = parseInt(amountCents, 10);
-    if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
-        return {
-            status: 'failed',
-            paymentIntentId: null,
-            chargeId: null,
-            receiptUrl: null,
-            error: buildBillingHttpError(500, 'invalid_amount', 'Invalid billing amount.')
-        };
-    }
-
-    const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
-    const invoiceId = metadata.invoiceId ? parseInt(metadata.invoiceId, 10) : null;
-    const empresaColumns = await getTableColumns('empresas');
-    const emailExpr = empresaColumns.email ? 'email' : 'NULL';
-    const billingEmailExpr = empresaColumns.email ? 'COALESCE(email, contacto)' : 'contacto';
-    const company = await db.get(`
-        SELECT id, nombre, contacto, stripe_customer_id, ${billingEmailExpr} AS billing_email, ${emailExpr} AS email
-        FROM empresas
-        WHERE id = ?
-    `, companyId);
-
-    if (!company) {
-        return {
-            status: 'failed',
-            paymentIntentId: null,
-            chargeId: null,
-            receiptUrl: null,
-            error: buildBillingHttpError(500, 'company_not_found', 'Company not found for billing.')
-        };
-    }
-
-    const customerId = await ensureStripeCustomerForCompany(company);
-    company.stripe_customer_id = customerId;
-
     let invoice = null;
-    if (invoiceId) {
-        invoice = await db.get('SELECT * FROM invoices WHERE id = ? AND company_id = ?', invoiceId, companyId);
-    }
-    if (!invoice && ticketId) {
-        invoice = await fetchInvoiceByTicket(ticketId);
-    }
-
-    if (!invoice) {
-        return {
-            status: 'failed',
-            paymentIntentId: null,
-            chargeId: null,
-            receiptUrl: null,
-            error: buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.')
-        };
-    }
-
-    if (invoice.status === 'charged') {
-        return {
-            status: 'charged',
-            paymentIntentId: invoice.stripe_payment_intent_id || null,
-            chargeId: invoice.stripe_charge_id || null,
-            receiptUrl: invoice.receipt_url || null,
-            error: null
-        };
-    }
-
-    const idempotencyKey = ticketId
-        ? `instant_ticket_${ticketId}_charge`
-        : `instant_invoice_${invoice.id}_charge`;
-    const stripeMetadata = buildStripeMetadata({
-        invoice_id: invoice.id,
-        company_id: companyId,
-        ticket_id: ticketId,
-        match_id: metadata.matchId,
-        driver_id: metadata.driverId,
-        source: metadata.source || 'share_information'
-    });
-
     let paymentIntent = null;
 
     try {
+        if (!stripe) {
+            return {
+                status: 'failed',
+                paymentIntentId: null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(500, 'stripe_unavailable', 'Stripe unavailable.')
+            };
+        }
+
+        const normalizedAmount = parseInt(amountCents, 10);
+        if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+            return {
+                status: 'failed',
+                paymentIntentId: null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(500, 'invalid_amount', 'Invalid billing amount.')
+            };
+        }
+
+        const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
+        const invoiceId = metadata.invoiceId ? parseInt(metadata.invoiceId, 10) : null;
+        const empresaColumns = await getTableColumns('empresas');
+        const emailExpr = empresaColumns.email ? 'email' : 'NULL';
+        const billingEmailExpr = empresaColumns.email ? 'COALESCE(email, contacto)' : 'contacto';
+        const company = await db.get(`
+            SELECT id, nombre, contacto, stripe_customer_id, ${billingEmailExpr} AS billing_email, ${emailExpr} AS email
+            FROM empresas
+            WHERE id = ?
+        `, companyId);
+
+        if (!company) {
+            return {
+                status: 'failed',
+                paymentIntentId: null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(500, 'company_not_found', 'Company not found for billing.')
+            };
+        }
+
+        const customerId = await ensureStripeCustomerForCompany(company);
+        company.stripe_customer_id = customerId;
+
+        if (invoiceId) {
+            invoice = await db.get('SELECT * FROM invoices WHERE id = ? AND company_id = ?', invoiceId, companyId);
+        }
+        if (!invoice && ticketId) {
+            invoice = await fetchInvoiceByTicket(ticketId, db, companyId);
+        }
+
+        if (!invoice) {
+            return {
+                status: 'failed',
+                paymentIntentId: null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.')
+            };
+        }
+
+        if (invoice.status === 'charged') {
+            return {
+                status: 'charged',
+                paymentIntentId: invoice.stripe_payment_intent_id || null,
+                chargeId: invoice.stripe_charge_id || null,
+                receiptUrl: invoice.receipt_url || null,
+                error: null
+            };
+        }
+
+        const idempotencyKey = ticketId
+            ? `instant_ticket_${ticketId}_charge`
+            : `instant_invoice_${invoice.id}_charge`;
+        const stripeMetadata = buildStripeMetadata({
+            invoice_id: invoice.id,
+            company_id: companyId,
+            ticket_id: ticketId,
+            match_id: metadata.matchId,
+            driver_id: metadata.driverId,
+            source: metadata.source || 'share_information'
+        });
+
         if (invoice.stripe_payment_intent_id) {
             paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id, {
                 expand: ['latest_charge']
@@ -498,38 +545,52 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
         }
 
         if (paymentIntent.status === 'requires_payment_method') {
-            throw buildBillingHttpError(402, 'requires_payment_method', 'A saved payment method is required.', {
-                invoiceId: invoice.id,
-                paymentIntentId: paymentIntent.id
-            });
+            return {
+                status: 'failed',
+                paymentIntentId: paymentIntent.id || null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(402, 'requires_payment_method', 'A saved payment method is required.', {
+                    invoiceId: invoice.id,
+                    paymentIntentId: paymentIntent.id
+                })
+            };
         }
 
         if (paymentIntent.status !== 'succeeded') {
-            throw buildBillingHttpError(500, 'payment_not_completed', `Unexpected payment status: ${paymentIntent.status}`, {
-                invoiceId: invoice.id,
-                paymentIntentId: paymentIntent.id
-            });
+            return {
+                status: 'failed',
+                paymentIntentId: paymentIntent.id || null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildBillingHttpError(500, 'payment_not_completed', `Unexpected payment status: ${paymentIntent.status}`, {
+                    invoiceId: invoice.id,
+                    paymentIntentId: paymentIntent.id
+                })
+            };
         }
+
+        const { chargeId, receiptUrl } = await resolvePaymentIntentCharge(stripe, paymentIntent);
+        return {
+            status: 'charged',
+            paymentIntentId: paymentIntent.id,
+            chargeId,
+            receiptUrl,
+            error: null
+        };
     } catch (error) {
-        const normalizedError = normalizeChargeError(error, invoice.id);
-        const paymentIntentId = normalizedError.paymentIntentId || (error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null);
+        const normalizedError = normalizeChargeError(
+            error,
+            invoice ? invoice.id : (metadata.invoiceId ? parseInt(metadata.invoiceId, 10) || null : null)
+        );
         return {
             status: 'failed',
-            paymentIntentId,
+            paymentIntentId: (paymentIntent && paymentIntent.id) || normalizedError.paymentIntentId || (error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null),
             chargeId: null,
             receiptUrl: null,
             error: normalizedError
         };
     }
-
-    const { chargeId, receiptUrl } = await resolvePaymentIntentCharge(stripe, paymentIntent);
-    return {
-        status: 'charged',
-        paymentIntentId: paymentIntent.id,
-        chargeId,
-        receiptUrl,
-        error: null
-    };
 }
 
 // Trust Proxy (Render/Load Balancer)
@@ -3951,9 +4012,26 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
                 throw txErr;
             }
         } else {
-            const existingInvoice = await fetchInvoiceByTicket(ticketId);
+            let existingInvoice = await fetchInvoiceByTicket(ticketId, db, match.company_id);
             if (!existingInvoice) {
-                return res.status(500).json({ error: 'missing_invoice', ticket_id: ticketId });
+                try {
+                    const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+                    invoiceAmountCents = ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10);
+                    existingInvoice = await ensurePendingInvoice({
+                        companyId: match.company_id,
+                        amountCents: invoiceAmountCents,
+                        metadata: {
+                            ticketId,
+                            matchId,
+                            driverId: match.driver_id,
+                            companyId: match.company_id,
+                            source: 'driver_confirm_share'
+                        }
+                    });
+                } catch (invoiceRecoveryError) {
+                    console.error('[Matches] driver confirm-share invoice recovery error:', invoiceRecoveryError);
+                    return res.status(500).json({ error: 'invoice_recovery_failed', ticket_id: ticketId });
+                }
             }
             if (existingInvoice.status === 'charged') {
                 await markTicketPaid(ticketId, {
@@ -3962,7 +4040,7 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
                 return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
             }
             invoiceId = existingInvoice.id;
-            invoiceAmountCents = existingInvoice.total_cents;
+            invoiceAmountCents = existingInvoice.total_cents || invoiceAmountCents;
             shouldCharge = true;
         }
 
@@ -4083,9 +4161,26 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
         }
 
         if (match.status === 'INFO_SHARED' && ticketId) {
-            const existingInvoice = await fetchInvoiceByTicket(ticketId);
+            let existingInvoice = await fetchInvoiceByTicket(ticketId, db, match.company_id);
             if (!existingInvoice) {
-                return res.status(500).json({ error: 'missing_invoice', ticket_id: ticketId });
+                try {
+                    const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+                    invoiceAmountCents = ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10);
+                    existingInvoice = await ensurePendingInvoice({
+                        companyId: match.company_id,
+                        amountCents: invoiceAmountCents,
+                        metadata: {
+                            ticketId,
+                            matchId,
+                            driverId: match.driver_id,
+                            companyId: match.company_id,
+                            source: 'company_confirm_share'
+                        }
+                    });
+                } catch (invoiceRecoveryError) {
+                    console.error('[Matches] company confirm-share invoice recovery error:', invoiceRecoveryError);
+                    return res.status(500).json({ error: 'invoice_recovery_failed', ticket_id: ticketId });
+                }
             }
             if (existingInvoice.status === 'charged') {
                 await markTicketPaid(ticketId, {
@@ -4094,7 +4189,7 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
                 return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
             }
             invoiceId = existingInvoice.id;
-            invoiceAmountCents = existingInvoice.total_cents;
+            invoiceAmountCents = existingInvoice.total_cents || invoiceAmountCents;
             shouldCharge = true;
         }
 
