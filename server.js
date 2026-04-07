@@ -133,6 +133,24 @@ async function hasChargedInvoiceForTicket(ticketId, companyId, runner = db) {
     return !!(invoice && invoice.status === 'charged');
 }
 
+function buildLockedDriverPreviewName(row) {
+    let opTypes = row?.op_types;
+    if (typeof opTypes === 'string') {
+        try { opTypes = JSON.parse(opTypes); } catch (_) { opTypes = []; }
+    }
+    if (!Array.isArray(opTypes)) opTypes = [];
+
+    const years = parseInt(row?.experience_years, 10) || 0;
+    const yearLabel = years >= 5 ? '5+ years' : (years > 0 ? `${years}+ years` : null);
+    const hasOtr = opTypes.some(op => String(op || '').toUpperCase().includes('OTR'));
+
+    if (hasOtr && yearLabel) return `OTR Driver (${yearLabel})`;
+    if (row?.has_cdl && yearLabel) return `CDL Driver (${yearLabel})`;
+    if (row?.has_cdl) return 'Experienced CDL Driver';
+    if (yearLabel) return `Experienced Driver (${yearLabel})`;
+    return 'Experienced Driver';
+}
+
 async function resolvePaymentIntentCharge(stripe, paymentIntent) {
     if (!paymentIntent) return { chargeId: null, receiptUrl: null };
 
@@ -3236,12 +3254,14 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
                     return {
                         ...row,
                         driver_name: null,
-                        locked: true
+                        locked: true,
+                        preview: true
                     };
                 }
                 return {
                     ...row,
-                    locked: false
+                    locked: false,
+                    preview: false
                 };
             }));
             return res.json(sanitized);
@@ -3677,29 +3697,17 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
         `, ...scopeIds);
 
         const lockDriverRow = (row) => {
-            const dId = String(row.driver_id || row.id);
-            const shortId = dId.slice(-4).toUpperCase();
-
             return {
                 ...row,
                 locked: true,
-                display_name: `Driver #${shortId}`,
+                preview: true,
+                display_name: buildLockedDriverPreviewName(row),
                 driver_name: null,
                 driver_email: null,
                 driver_phone: null,
                 driver_city: null,
                 driver_state: null,
-                weekly_miles: null,
-                longest_otr: null,
-                trailer_experience: '[]',
-                accidents_3y: null,
-                tickets_3y: null,
-                home_time: null,
-                preferred_freight: null,
-                preferred_region: null,
-                willing_to_relocate: null,
                 driver_bio: null,
-                endorsements: '[]',
                 profile_photo_base64: null,
                 license_front_base64: null,
                 license_back_base64: null
@@ -3716,7 +3724,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 return lockDriverRow(r);
             }
 
-            return { ...r, locked: false };
+            return { ...r, locked: false, preview: false };
         }));
 
         res.json(sanitized);
