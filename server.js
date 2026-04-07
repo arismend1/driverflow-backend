@@ -19,6 +19,7 @@ const db = require('./db_adapter'); // NEW Unified Adapter
 const { trackLeadFunnelEvent } = require('./analytics');
 const { sendPush } = require('./notifications_service');
 const runPushMigration = require('./init_push_db');
+const { getDriverLockState } = require('./lazy_matching');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -156,7 +157,7 @@ async function resolvePaymentIntentCharge(stripe, paymentIntent) {
     return { chargeId: null, receiptUrl: null };
 }
 
-async function markInvoiceFailed(invoiceId, message, paymentIntentId = null) {
+async function markInvoiceFailed(invoiceId, message, paymentIntentId = null, runner = db) {
     if (!invoiceId) return;
 
     const invoiceColumns = await getTableColumns('invoices');
@@ -177,7 +178,7 @@ async function markInvoiceFailed(invoiceId, message, paymentIntentId = null) {
     }
 
     params.push(invoiceId);
-    await db.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ?`, ...params);
+    await runner.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ?`, ...params);
 }
 
 function normalizeChargeError(error, invoiceId = null) {
@@ -206,7 +207,7 @@ function normalizeChargeError(error, invoiceId = null) {
     });
 }
 
-async function markTicketPaid(ticketId, paymentInfo = {}) {
+async function markTicketPaid(ticketId, paymentInfo = {}, runner = db) {
     if (!ticketId) return;
 
     const ticketColumns = await getTableColumns('tickets');
@@ -231,21 +232,182 @@ async function markTicketPaid(ticketId, paymentInfo = {}) {
     }
 
     params.push(ticketId);
-    await db.run(`UPDATE tickets SET ${assignments.join(', ')} WHERE id = ? AND billing_status <> 'paid'`, ...params);
+    await runner.run(`UPDATE tickets SET ${assignments.join(', ')} WHERE id = ? AND billing_status <> 'paid'`, ...params);
 }
 
-async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
-    const stripe = getStripe();
-    if (!stripe) {
-        throw buildBillingHttpError(500, 'stripe_unavailable', 'Stripe unavailable.');
-    }
-
+async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, runner = db }) {
     const normalizedAmount = parseInt(amountCents, 10);
     if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
         throw buildBillingHttpError(500, 'invalid_amount', 'Invalid billing amount.');
     }
 
     const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
+    let invoice = ticketId ? await fetchInvoiceByTicket(ticketId, runner) : null;
+    const invoiceColumns = await getTableColumns('invoices');
+    const invoiceItemColumns = await getTableColumns('invoice_items');
+
+    if (invoice) {
+        return invoice;
+    }
+
+    try {
+        const existing = ticketId ? await fetchInvoiceByTicket(ticketId, runner) : null;
+        if (existing) {
+            invoice = existing;
+        } else {
+            const createdAt = nowIso();
+            const instantDateRange = getInstantInvoiceDateRange();
+            const insertColumns = ['company_id', 'total_cents', 'status'];
+            const insertValues = [companyId, normalizedAmount, 'pending'];
+
+            if (invoiceColumns.currency) {
+                insertColumns.push('currency');
+                insertValues.push('USD');
+            }
+            if (invoiceColumns.subtotal_cents) {
+                insertColumns.push('subtotal_cents');
+                insertValues.push(normalizedAmount);
+            }
+            if (invoiceColumns.issue_date) {
+                insertColumns.push('issue_date');
+                insertValues.push(createdAt);
+            }
+            if (invoiceColumns.due_date) {
+                insertColumns.push('due_date');
+                insertValues.push(createdAt);
+            }
+            if (invoiceColumns.billing_week) {
+                insertColumns.push('billing_week');
+                insertValues.push(instantDateRange.billingWeek);
+            }
+            if (invoiceColumns.week_start) {
+                insertColumns.push('week_start');
+                insertValues.push(instantDateRange.weekStart);
+            }
+            if (invoiceColumns.week_end) {
+                insertColumns.push('week_end');
+                insertValues.push(instantDateRange.weekEnd);
+            }
+            if (invoiceColumns.created_at) {
+                insertColumns.push('created_at');
+                insertValues.push(createdAt);
+            }
+            if (invoiceColumns.updated_at) {
+                insertColumns.push('updated_at');
+                insertValues.push(createdAt);
+            }
+
+            const placeholders = insertColumns.map(() => '?').join(', ');
+            const result = await runner.run(
+                `INSERT INTO invoices (${insertColumns.join(', ')}) VALUES (${placeholders})` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
+                ...insertValues
+            );
+
+            const invoiceId = (result.rows && result.rows[0]) ? result.rows[0].id : result.lastInsertRowid;
+            invoice = await runner.get('SELECT * FROM invoices WHERE id = ?', invoiceId);
+
+            if (ticketId) {
+                const itemColumns = ['invoice_id', 'ticket_id'];
+                const itemValues = [invoiceId, ticketId];
+
+                if (invoiceItemColumns.price_cents) {
+                    itemColumns.push('price_cents');
+                    itemValues.push(normalizedAmount);
+                }
+                if (invoiceItemColumns.description) {
+                    itemColumns.push('description');
+                    itemValues.push(metadata.matchId ? `Match #${metadata.matchId}` : `Ticket #${ticketId}`);
+                }
+                if (invoiceItemColumns.created_at) {
+                    itemColumns.push('created_at');
+                    itemValues.push(createdAt);
+                }
+
+                await runner.run(
+                    `INSERT INTO invoice_items (${itemColumns.join(', ')}) VALUES (${itemColumns.map(() => '?').join(', ')})`,
+                    ...itemValues
+                );
+            }
+        }
+    } catch (error) {
+        if (ticketId && (error.code === '23505' || (error.message && (error.message.includes('UNIQUE') || error.message.includes('duplicate'))))) {
+            invoice = await fetchInvoiceByTicket(ticketId, runner);
+        } else {
+            throw error;
+        }
+    }
+
+    if (!invoice) {
+        throw buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.');
+    }
+
+    return invoice;
+}
+
+async function markInvoiceCharged(invoiceId, paymentInfo = {}, runner = db) {
+    if (!invoiceId) return;
+
+    const invoiceColumns = await getTableColumns('invoices');
+    const assignments = ['status = ?'];
+    const params = ['charged'];
+
+    if (paymentInfo.paymentIntentId && invoiceColumns.stripe_payment_intent_id) {
+        assignments.push('stripe_payment_intent_id = ?');
+        params.push(paymentInfo.paymentIntentId);
+    }
+    if (paymentInfo.chargeId && invoiceColumns.stripe_charge_id) {
+        assignments.push('stripe_charge_id = ?');
+        params.push(paymentInfo.chargeId);
+    }
+    if (paymentInfo.receiptUrl && invoiceColumns.receipt_url) {
+        assignments.push('receipt_url = ?');
+        params.push(paymentInfo.receiptUrl);
+    }
+    if (invoiceColumns.paid_at) {
+        assignments.push('paid_at = ?');
+        params.push(nowIso());
+    }
+    if (invoiceColumns.paid_method) {
+        assignments.push('paid_method = ?');
+        params.push('stripe');
+    }
+    if (invoiceColumns.failure_reason) {
+        assignments.push('failure_reason = NULL');
+    }
+    if (invoiceColumns.updated_at) {
+        assignments.push('updated_at = ?');
+        params.push(nowIso());
+    }
+
+    params.push(invoiceId);
+    await runner.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ?`, ...params);
+}
+
+async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
+    const stripe = getStripe();
+    if (!stripe) {
+        return {
+            status: 'failed',
+            paymentIntentId: null,
+            chargeId: null,
+            receiptUrl: null,
+            error: buildBillingHttpError(500, 'stripe_unavailable', 'Stripe unavailable.')
+        };
+    }
+
+    const normalizedAmount = parseInt(amountCents, 10);
+    if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+        return {
+            status: 'failed',
+            paymentIntentId: null,
+            chargeId: null,
+            receiptUrl: null,
+            error: buildBillingHttpError(500, 'invalid_amount', 'Invalid billing amount.')
+        };
+    }
+
+    const ticketId = metadata.ticketId ? parseInt(metadata.ticketId, 10) : null;
+    const invoiceId = metadata.invoiceId ? parseInt(metadata.invoiceId, 10) : null;
     const empresaColumns = await getTableColumns('empresas');
     const emailExpr = empresaColumns.email ? 'email' : 'NULL';
     const billingEmailExpr = empresaColumns.email ? 'COALESCE(email, contacto)' : 'contacto';
@@ -256,118 +418,44 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
     `, companyId);
 
     if (!company) {
-        throw buildBillingHttpError(500, 'company_not_found', 'Company not found for billing.');
+        return {
+            status: 'failed',
+            paymentIntentId: null,
+            chargeId: null,
+            receiptUrl: null,
+            error: buildBillingHttpError(500, 'company_not_found', 'Company not found for billing.')
+        };
     }
 
     const customerId = await ensureStripeCustomerForCompany(company);
-    let invoice = ticketId ? await fetchInvoiceByTicket(ticketId) : null;
-    const invoiceColumns = await getTableColumns('invoices');
-    const invoiceItemColumns = await getTableColumns('invoice_items');
+    company.stripe_customer_id = customerId;
 
-    if (invoice && invoice.status === 'charged') {
-        await markTicketPaid(ticketId, {
+    let invoice = null;
+    if (invoiceId) {
+        invoice = await db.get('SELECT * FROM invoices WHERE id = ? AND company_id = ?', invoiceId, companyId);
+    }
+    if (!invoice && ticketId) {
+        invoice = await fetchInvoiceByTicket(ticketId);
+    }
+
+    if (!invoice) {
+        return {
+            status: 'failed',
+            paymentIntentId: null,
+            chargeId: null,
+            receiptUrl: null,
+            error: buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.')
+        };
+    }
+
+    if (invoice.status === 'charged') {
+        return {
+            status: 'charged',
             paymentIntentId: invoice.stripe_payment_intent_id || null,
-            customerId
-        });
-        return invoice;
-    }
-
-    if (!invoice) {
-        const tx = await db.beginTransaction();
-        try {
-            const existing = ticketId ? await fetchInvoiceByTicket(ticketId, tx) : null;
-            if (existing) {
-                invoice = existing;
-            } else {
-                const createdAt = nowIso();
-                const instantDateRange = getInstantInvoiceDateRange();
-                const insertColumns = ['company_id', 'total_cents', 'status'];
-                const insertValues = [companyId, normalizedAmount, 'pending'];
-
-                if (invoiceColumns.currency) {
-                    insertColumns.push('currency');
-                    insertValues.push('USD');
-                }
-                if (invoiceColumns.subtotal_cents) {
-                    insertColumns.push('subtotal_cents');
-                    insertValues.push(normalizedAmount);
-                }
-                if (invoiceColumns.issue_date) {
-                    insertColumns.push('issue_date');
-                    insertValues.push(createdAt);
-                }
-                if (invoiceColumns.due_date) {
-                    insertColumns.push('due_date');
-                    insertValues.push(createdAt);
-                }
-                if (invoiceColumns.billing_week) {
-                    insertColumns.push('billing_week');
-                    insertValues.push(instantDateRange.billingWeek);
-                }
-                if (invoiceColumns.week_start) {
-                    insertColumns.push('week_start');
-                    insertValues.push(instantDateRange.weekStart);
-                }
-                if (invoiceColumns.week_end) {
-                    insertColumns.push('week_end');
-                    insertValues.push(instantDateRange.weekEnd);
-                }
-                if (invoiceColumns.created_at) {
-                    insertColumns.push('created_at');
-                    insertValues.push(createdAt);
-                }
-                if (invoiceColumns.updated_at) {
-                    insertColumns.push('updated_at');
-                    insertValues.push(createdAt);
-                }
-
-                const placeholders = insertColumns.map(() => '?').join(', ');
-                const result = await tx.run(
-                    `INSERT INTO invoices (${insertColumns.join(', ')}) VALUES (${placeholders})` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
-                    ...insertValues
-                );
-
-                const invoiceId = (result.rows && result.rows[0]) ? result.rows[0].id : result.lastInsertRowid;
-                invoice = await tx.get('SELECT * FROM invoices WHERE id = ?', invoiceId);
-
-                if (ticketId) {
-                    const itemColumns = ['invoice_id', 'ticket_id'];
-                    const itemValues = [invoiceId, ticketId];
-
-                    if (invoiceItemColumns.price_cents) {
-                        itemColumns.push('price_cents');
-                        itemValues.push(normalizedAmount);
-                    }
-                    if (invoiceItemColumns.description) {
-                        itemColumns.push('description');
-                        itemValues.push(metadata.matchId ? `Match #${metadata.matchId}` : `Ticket #${ticketId}`);
-                    }
-                    if (invoiceItemColumns.created_at) {
-                        itemColumns.push('created_at');
-                        itemValues.push(createdAt);
-                    }
-
-                    await tx.run(
-                        `INSERT INTO invoice_items (${itemColumns.join(', ')}) VALUES (${itemColumns.map(() => '?').join(', ')})`,
-                        ...itemValues
-                    );
-                }
-            }
-
-            await tx.commit();
-        } catch (error) {
-            await tx.rollback();
-
-            if (ticketId && (error.code === '23505' || (error.message && (error.message.includes('UNIQUE') || error.message.includes('duplicate'))))) {
-                invoice = await fetchInvoiceByTicket(ticketId);
-            } else {
-                throw error;
-            }
-        }
-    }
-
-    if (!invoice) {
-        throw buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.');
+            chargeId: invoice.stripe_charge_id || null,
+            receiptUrl: invoice.receipt_url || null,
+            error: null
+        };
     }
 
     const idempotencyKey = ticketId
@@ -393,25 +481,13 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
             paymentIntent = await stripe.paymentIntents.create({
                 amount: normalizedAmount,
                 currency: (invoice.currency || 'USD').toLowerCase(),
-                customer: customerId,
+                customer: company.stripe_customer_id,
                 confirm: true,
                 off_session: true,
                 expand: ['latest_charge'],
                 description: ticketId ? `Instant share charge for ticket #${ticketId}` : `Instant charge for company #${companyId}`,
                 metadata: stripeMetadata
             }, { idempotencyKey });
-
-            if (paymentIntent.id && invoiceColumns.stripe_payment_intent_id) {
-                const updateParts = ['stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, ?)'];
-                const updateParams = [paymentIntent.id];
-                if (invoiceColumns.updated_at) {
-                    updateParts.push('updated_at = ?');
-                    updateParams.push(nowIso());
-                }
-                updateParams.push(invoice.id);
-                await db.run(`UPDATE invoices SET ${updateParts.join(', ')} WHERE id = ?`, ...updateParams);
-                invoice.stripe_payment_intent_id = paymentIntent.id;
-            }
         }
 
         if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
@@ -437,51 +513,23 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
     } catch (error) {
         const normalizedError = normalizeChargeError(error, invoice.id);
         const paymentIntentId = normalizedError.paymentIntentId || (error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null);
-        await markInvoiceFailed(invoice.id, normalizedError.message, paymentIntentId);
-        throw normalizedError;
+        return {
+            status: 'failed',
+            paymentIntentId,
+            chargeId: null,
+            receiptUrl: null,
+            error: normalizedError
+        };
     }
 
     const { chargeId, receiptUrl } = await resolvePaymentIntentCharge(stripe, paymentIntent);
-    const invoiceAssignments = ['status = ?'];
-    const invoiceParams = ['charged'];
-
-    if (invoiceColumns.stripe_payment_intent_id) {
-        invoiceAssignments.push('stripe_payment_intent_id = ?');
-        invoiceParams.push(paymentIntent.id);
-    }
-    if (invoiceColumns.stripe_charge_id) {
-        invoiceAssignments.push('stripe_charge_id = ?');
-        invoiceParams.push(chargeId);
-    }
-    if (invoiceColumns.paid_at) {
-        invoiceAssignments.push('paid_at = ?');
-        invoiceParams.push(nowIso());
-    }
-    if (invoiceColumns.paid_method) {
-        invoiceAssignments.push('paid_method = ?');
-        invoiceParams.push('stripe');
-    }
-    if (receiptUrl && invoiceColumns.receipt_url) {
-        invoiceAssignments.push('receipt_url = ?');
-        invoiceParams.push(receiptUrl);
-    }
-    if (invoiceColumns.failure_reason) {
-        invoiceAssignments.push('failure_reason = NULL');
-    }
-    if (invoiceColumns.updated_at) {
-        invoiceAssignments.push('updated_at = ?');
-        invoiceParams.push(nowIso());
-    }
-
-    invoiceParams.push(invoice.id);
-    await db.run(`UPDATE invoices SET ${invoiceAssignments.join(', ')} WHERE id = ?`, ...invoiceParams);
-
-    await markTicketPaid(ticketId, {
+    return {
+        status: 'charged',
         paymentIntentId: paymentIntent.id,
-        customerId
-    });
-
-    return db.get('SELECT * FROM invoices WHERE id = ?', invoice.id);
+        chargeId,
+        receiptUrl,
+        error: null
+    };
 }
 
 // Trust Proxy (Render/Load Balancer)
@@ -3764,27 +3812,27 @@ const updateMatchStatus = async (req, res, newStatus) => {
     }
 };
 
-const finalizeShare = async (matchId) => {
+const finalizeShare = async (matchId, runner = db) => {
     const now = new Date().toISOString();
-    const match = await db.get('SELECT driver_id FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
+    const match = await runner.get('SELECT driver_id FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
     if (!match) return;
 
     // 1. Mark winning match as shared
-    await db.run(
+    await runner.run(
         "UPDATE potential_matches SET status = 'INFO_SHARED', info_shared_at = ?, updated_at = ? WHERE id = ?",
         now, now, parseInt(matchId, 10)
     );
 
     // 2. Proactively close competing handshakes (Neutral terminal state: CLOSED)
-    await db.run(
+    await runner.run(
         "UPDATE potential_matches SET status = 'CLOSED', updated_at = ? WHERE driver_id = ? AND id <> ? AND status IN ('SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')",
         now, match.driver_id, parseInt(matchId, 10)
     );
 };
 
 // ─── TICKET GENERATION HELPER ───────────────────────────────────────────────
-async function ensureTicketGenerated(matchId, companyId, driverId, now) {
-    const existingTicket = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+async function ensureTicketGenerated(matchId, companyId, driverId, now, runner = db) {
+    const existingTicket = await runner.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
     let ticketId = existingTicket ? existingTicket.id : null;
     const price_cents = parseInt(process.env.WEEKLY_FEE_CENTS);
     if (isNaN(price_cents) || price_cents <= 0) {
@@ -3793,7 +3841,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
 
     if (!ticketId) {
         try {
-            const t = await db.run(
+            const t = await runner.run(
                 `INSERT INTO tickets (match_id, company_id, driver_id, price_cents, currency, created_at, billing_status, billing_notes)
                  VALUES (?,?,?,?,'USD',?,'hold',?)` + (db.IS_POSTGRES ? ' RETURNING id' : ''),
                 parseInt(matchId), companyId, driverId, price_cents, now, `Match ID: ${matchId}`
@@ -3801,7 +3849,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
             ticketId = (t.rows && t.rows[0]) ? t.rows[0].id : t.lastInsertRowid;
         } catch (insertErr) {
             if (insertErr.code === '23505' || (insertErr.message && (insertErr.message.includes('UNIQUE') || insertErr.message.includes('duplicate')))) {
-                const race = await db.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
+                const race = await runner.get('SELECT id FROM tickets WHERE match_id = ?', parseInt(matchId));
                 ticketId = race ? race.id : null;
             } else {
                 throw insertErr;
@@ -3810,7 +3858,7 @@ async function ensureTicketGenerated(matchId, companyId, driverId, now) {
     }
 
     if (ticketId) {
-        await db.run(
+        await runner.run(
             'UPDATE potential_matches SET ticket_id = ?, fee_cents = ?, fee_currency = ?, updated_at = ? WHERE id = ?',
             ticketId, price_cents, 'USD', now, matchId
         );
@@ -3830,82 +3878,137 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
 
         console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=driver action=confirm_share`);
 
-        // Idempotency guard: If already shared, just return current state
-        if (match.status === 'INFO_SHARED') {
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        let finalStatus = match.status;
+        let ticketId = match.ticket_id || null;
+        let invoiceId = null;
+        let invoiceAmountCents = null;
+        let shouldCharge = false;
+
+        if (match.status !== 'INFO_SHARED') {
+            const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
+            if (!validDriverStates.includes(match.status)) {
+                return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
+            }
+
+            const lockState = await getDriverLockState(parseInt(req.user.id, 10), parseInt(matchId, 10));
+            if (lockState.is_blocked) {
+                console.log(`[ConsentFlow] driver=${req.user.id} blocked by canonical lock match=${lockState.blocking_match_id} reason=${lockState.reason}`);
+                return res.status(409).json({
+                    error: 'driver_locked',
+                    blocking_match_id: lockState.blocking_match_id,
+                    exclusive_until: lockState.exclusive_until,
+                    reason: lockState.reason
+                });
+            }
+        } else if (!ticketId) {
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
         }
 
-        const validDriverStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
-        if (!validDriverStates.includes(match.status)) {
-            return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
+        if (match.status !== 'INFO_SHARED') {
+            const tx = await db.beginTransaction();
+
+            try {
+                await tx.run(
+                    'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
+                    now, now, parseInt(matchId, 10)
+                );
+                console.log(`[ConsentFlow] driver_share_consent_at set`);
+
+                const updated = await tx.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
+                finalStatus = updated.status;
+                ticketId = updated.ticket_id || null;
+
+                if (updated.company_share_consent_at) {
+                    ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now, tx);
+                    const ticket = await tx.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+                    invoiceAmountCents = ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10);
+                    await finalizeShare(matchId, tx);
+                    const invoice = await ensurePendingInvoice({
+                        companyId: updated.company_id,
+                        amountCents: invoiceAmountCents,
+                        metadata: {
+                            ticketId,
+                            matchId,
+                            driverId: updated.driver_id,
+                            companyId: updated.company_id,
+                            source: 'driver_confirm_share'
+                        },
+                        runner: tx
+                    });
+                    invoiceId = invoice.id;
+                    finalStatus = 'INFO_SHARED';
+                    shouldCharge = true;
+                    console.log(`[ConsentFlow] status changed to INFO_SHARED`);
+                } else {
+                    finalStatus = 'SHARE_PENDING_COMPANY';
+                    await tx.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
+                    console.log(`[ConsentFlow] status changed to SHARE_PENDING_COMPANY`);
+                }
+
+                await tx.commit();
+            } catch (txErr) {
+                await tx.rollback().catch(() => {});
+                throw txErr;
+            }
+        } else {
+            const existingInvoice = await fetchInvoiceByTicket(ticketId);
+            if (!existingInvoice) {
+                return res.status(500).json({ error: 'missing_invoice', ticket_id: ticketId });
+            }
+            if (existingInvoice.status === 'charged') {
+                await markTicketPaid(ticketId, {
+                    paymentIntentId: existingInvoice.stripe_payment_intent_id || null
+                });
+                return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+            }
+            invoiceId = existingInvoice.id;
+            invoiceAmountCents = existingInvoice.total_cents;
+            shouldCharge = true;
         }
 
-        // --- NEW EXCLUSIVITY CHECK (72 HOURS) ---
-        // Prevent driver from sharing info if they recently shared with ANY other company.
-        const EXCLUSIVE_HOURS = 72;
-
-        const existingConsentSql = `
-            SELECT id, driver_share_consent_at, exclusivity_extension_hours
-            FROM potential_matches 
-            WHERE driver_id = ? 
-              AND id <> ?
-              AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER') 
-        `;
-        const activeConsents = await db.all(existingConsentSql, parseInt(req.user.id, 10), parseInt(matchId, 10));
-
-        // Manual filter to account for extensions dynamically (Engine-agnostic JS calculation)
-        const lockedConsents = activeConsents.filter(c => {
-            if (!c.driver_share_consent_at) return false;
-            const hoursElapsed = (Date.now() - new Date(c.driver_share_consent_at).getTime()) / 3600000;
-            const extension = c.exclusivity_extension_hours || 0;
-            const limit = EXCLUSIVE_HOURS + extension;
-            return hoursElapsed < limit;
-        });
-
-        if (lockedConsents && lockedConsents.length > 0) {
-            console.log(`[ConsentFlow] driver=${req.user.id} blocked by exclusivity timer`);
-            return res.status(409).json({
-                error: `Error`,
-                message: `You recently shared your information with another company. Please wait until the ${EXCLUSIVE_HOURS}-hour exclusive evaluation period ends before accepting another offer.`
-            });
-        }
-        // --- END EXCLUSIVITY CHECK ---
-
-        await db.run(
-            'UPDATE potential_matches SET driver_share_consent_at = COALESCE(driver_share_consent_at, ?), updated_at = ? WHERE id = ?',
-            now, now, parseInt(matchId, 10)
-        );
-        console.log(`[ConsentFlow] driver_share_consent_at set`);
-
-        const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
-        let finalStatus = updated.status;
-        let ticketId = updated.ticket_id || null;
-
-        if (updated.company_share_consent_at) {
-            ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
-            const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
-            await createInvoiceAndCharge({
-                companyId: updated.company_id,
-                amountCents: ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10),
+        if (shouldCharge) {
+            const chargeResult = await createInvoiceAndCharge({
+                companyId: match.company_id,
+                amountCents: invoiceAmountCents,
                 metadata: {
+                    invoiceId,
                     ticketId,
                     matchId,
-                    driverId: updated.driver_id,
-                    companyId: updated.company_id,
+                    driverId: match.driver_id,
+                    companyId: match.company_id,
                     source: 'driver_confirm_share'
                 }
             });
-            await finalizeShare(matchId);
-            finalStatus = 'INFO_SHARED';
-            console.log(`[ConsentFlow] status changed to INFO_SHARED`);
-        } else {
-            finalStatus = 'SHARE_PENDING_COMPANY';
-            await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
-            console.log(`[ConsentFlow] status changed to SHARE_PENDING_COMPANY`);
+
+            if (chargeResult.status === 'charged') {
+                try {
+                    await markInvoiceCharged(invoiceId, {
+                        paymentIntentId: chargeResult.paymentIntentId,
+                        chargeId: chargeResult.chargeId,
+                        receiptUrl: chargeResult.receiptUrl
+                    });
+                    await markTicketPaid(ticketId, {
+                        paymentIntentId: chargeResult.paymentIntentId
+                    });
+                } catch (settleErr) {
+                    console.error('[Matches] driver confirm-share reconciliation error:', settleErr);
+                    return res.status(500).json({
+                        error: 'billing_reconciliation_failed',
+                        invoice_id: invoiceId,
+                        payment_intent_id: chargeResult.paymentIntentId,
+                        charge_id: chargeResult.chargeId || null
+                    });
+                }
+            } else {
+                await markInvoiceFailed(invoiceId, chargeResult.error ? chargeResult.error.message : 'Billing failed', chargeResult.paymentIntentId);
+                return res.status((chargeResult.error && chargeResult.error.httpStatus) || 500).json({
+                    error: (chargeResult.error && chargeResult.error.code) || 'billing_error',
+                    message: (chargeResult.error && chargeResult.error.message) || 'Billing failed',
+                    invoice_id: invoiceId
+                });
+            }
         }
-        
-        if (db.IS_POSTGRES) await db.run('COMMIT');
-        
+
         if (finalStatus === 'INFO_SHARED') {
             try { await sendPush(match.company_id, 'empresa', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
             try { await sendPush(match.driver_id, 'driver', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
@@ -3953,83 +4056,147 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
 
         console.log(`[ConsentFlow] match=${matchId} status_before=${match.status} actor=company action=confirm_share`);
 
-        // Idempotency guard: If already shared, just return current state
-        if (match.status === 'INFO_SHARED') {
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: match.ticket_id });
+        let finalStatus = match.status;
+        let ticketId = match.ticket_id || null;
+        let invoiceId = null;
+        let invoiceAmountCents = null;
+        let shouldCharge = false;
+
+        if (match.status !== 'INFO_SHARED') {
+            const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
+            if (!validCompanyStates.includes(match.status)) {
+                return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
+            }
+
+            const lockState = await getDriverLockState(parseInt(match.driver_id, 10), parseInt(matchId, 10));
+            if (lockState.is_blocked) {
+                console.log(`[ConsentFlow] company=${req.user.id} blocked by canonical lock driver=${match.driver_id} match=${lockState.blocking_match_id} reason=${lockState.reason}`);
+                return res.status(409).json({ 
+                    error: 'driver_locked',
+                    blocking_match_id: lockState.blocking_match_id,
+                    exclusive_until: lockState.exclusive_until,
+                    reason: lockState.reason
+                });
+            }
+        } else if (!ticketId) {
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
         }
 
-        const validCompanyStates = ['ACCEPTED', 'PREMATCH_READY', 'SHARE_PENDING_DRIVER', 'SHARE_PENDING_COMPANY'];
-        if (!validCompanyStates.includes(match.status)) {
-            return res.status(409).json({ error: 'Invalid match state for consent', current_status: match.status });
+        if (match.status === 'INFO_SHARED' && ticketId) {
+            const existingInvoice = await fetchInvoiceByTicket(ticketId);
+            if (!existingInvoice) {
+                return res.status(500).json({ error: 'missing_invoice', ticket_id: ticketId });
+            }
+            if (existingInvoice.status === 'charged') {
+                await markTicketPaid(ticketId, {
+                    paymentIntentId: existingInvoice.stripe_payment_intent_id || null
+                });
+                return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+            }
+            invoiceId = existingInvoice.id;
+            invoiceAmountCents = existingInvoice.total_cents;
+            shouldCharge = true;
         }
 
-        // --- CONSOLIDATED EXCLUSIVITY CHECK (ALL checks BEFORE any write) ---
-        // Block if driver is already "locked" by another company in any exclusivity-reserved state
-        const conflict = await db.get(`
-            SELECT id, status FROM potential_matches 
-            WHERE driver_id = ? AND id <> ? 
-              AND status IN ('INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')
-        `, parseInt(match.driver_id, 10), parseInt(matchId, 10));
-        
-        if (conflict) {
-            console.log(`[ConsentFlow] company=${req.user.id} blocked: driver=${match.driver_id} already locked by match=${conflict.id} (status=${conflict.status})`);
-            return res.status(409).json({ 
-                error: 'Conflict',
-                message: 'This driver is currently in exclusivity or review with another company.' 
-            });
-        }
-
-        // --- ALL CHECKS PASSED — BEGIN ATOMIC WRITE ---
-        if (db.IS_POSTGRES) await db.run('BEGIN');
+        if (match.status !== 'INFO_SHARED') {
+            const tx = await db.beginTransaction();
 
         try {
-            await db.run(
+            await tx.run(
                 'UPDATE potential_matches SET company_share_consent_at = COALESCE(company_share_consent_at, ?), updated_at = ? WHERE id = ?',
                 now, now, parseInt(matchId, 10)
             );
             console.log(`[ConsentFlow] company_share_consent_at set`);
 
-            const updated = await db.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
-            let finalStatus = updated.status;
-            let ticketId = updated.ticket_id || null;
+            const updated = await tx.get('SELECT * FROM potential_matches WHERE id = ?', parseInt(matchId, 10));
+            finalStatus = updated.status;
+            ticketId = updated.ticket_id || null;
 
             if (updated.driver_share_consent_at) {
-                ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now);
-                const ticket = await db.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
-                await createInvoiceAndCharge({
+                ticketId = await ensureTicketGenerated(matchId, updated.company_id, updated.driver_id, now, tx);
+                const ticket = await tx.get('SELECT id, price_cents FROM tickets WHERE id = ?', ticketId);
+                invoiceAmountCents = ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10);
+                await finalizeShare(matchId, tx);
+                const invoice = await ensurePendingInvoice({
                     companyId: updated.company_id,
-                    amountCents: ticket ? ticket.price_cents : parseInt(process.env.WEEKLY_FEE_CENTS, 10),
+                    amountCents: invoiceAmountCents,
                     metadata: {
                         ticketId,
                         matchId,
                         driverId: updated.driver_id,
                         companyId: updated.company_id,
                         source: 'company_confirm_share'
-                    }
+                    },
+                    runner: tx
                 });
-                await finalizeShare(matchId);
+                invoiceId = invoice.id;
                 finalStatus = 'INFO_SHARED';
+                shouldCharge = true;
                 console.log(`[ConsentFlow] status changed to INFO_SHARED`);
             } else {
                 finalStatus = 'SHARE_PENDING_DRIVER';
-                await db.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
+                await tx.run('UPDATE potential_matches SET status = ?, updated_at = ? WHERE id = ?', finalStatus, now, parseInt(matchId, 10));
                 console.log(`[ConsentFlow] status changed to SHARE_PENDING_DRIVER`);
             }
-            
-            if (db.IS_POSTGRES) await db.run('COMMIT');
-            
-            if (finalStatus === 'INFO_SHARED') {
-                try { await sendPush(match.company_id, 'empresa', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
-                try { await sendPush(match.driver_id, 'driver', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
-            } else {
-                try { await sendPush(match.driver_id, 'driver', "Consentimiento Recibido", "La empresa ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
-            }
-            
-            return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
+
+            await tx.commit();
+
         } catch (txErr) {
-            if (db.IS_POSTGRES) await db.run('ROLLBACK').catch(() => {});
+            await tx.rollback().catch(() => {});
             throw txErr;
         }
+        }
+
+        if (shouldCharge) {
+            const chargeResult = await createInvoiceAndCharge({
+                companyId: match.company_id,
+                amountCents: invoiceAmountCents,
+                metadata: {
+                    invoiceId,
+                    ticketId,
+                    matchId,
+                    driverId: match.driver_id,
+                    companyId: match.company_id,
+                    source: 'company_confirm_share'
+                }
+            });
+
+            if (chargeResult.status === 'charged') {
+                try {
+                    await markInvoiceCharged(invoiceId, {
+                        paymentIntentId: chargeResult.paymentIntentId,
+                        chargeId: chargeResult.chargeId,
+                        receiptUrl: chargeResult.receiptUrl
+                    });
+                    await markTicketPaid(ticketId, {
+                        paymentIntentId: chargeResult.paymentIntentId
+                    });
+                } catch (settleErr) {
+                    console.error('[Matches] company confirm-share reconciliation error:', settleErr);
+                    return res.status(500).json({
+                        error: 'billing_reconciliation_failed',
+                        invoice_id: invoiceId,
+                        payment_intent_id: chargeResult.paymentIntentId,
+                        charge_id: chargeResult.chargeId || null
+                    });
+                }
+            } else {
+                await markInvoiceFailed(invoiceId, chargeResult.error ? chargeResult.error.message : 'Billing failed', chargeResult.paymentIntentId);
+                return res.status((chargeResult.error && chargeResult.error.httpStatus) || 500).json({
+                    error: (chargeResult.error && chargeResult.error.code) || 'billing_error',
+                    message: (chargeResult.error && chargeResult.error.message) || 'Billing failed',
+                    invoice_id: invoiceId
+                });
+            }
+
+            try { await sendPush(match.company_id, 'empresa', "Â¡InformaciÃ³n Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+            try { await sendPush(match.driver_id, 'driver', "Â¡InformaciÃ³n Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
+
+            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+        }
+
+        try { await sendPush(match.driver_id, 'driver', "Consentimiento Recibido", "La empresa ha compartido su informaciÃ³n contigo."); } catch (pushErr) { console.error('[ConsentPush]', pushErr.message); }
+        return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] company confirm-share error:', e);
         if (e.httpStatus) {
