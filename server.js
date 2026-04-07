@@ -128,6 +128,11 @@ async function fetchInvoiceByTicket(ticketId, runner = db, companyId = null) {
     return runner.get(sql, ...params);
 }
 
+async function hasChargedInvoiceForTicket(ticketId, companyId, runner = db) {
+    const invoice = await fetchInvoiceByTicket(ticketId, runner, companyId);
+    return !!(invoice && invoice.status === 'charged');
+}
+
 async function resolvePaymentIntentCharge(stripe, paymentIntent) {
     if (!paymentIntent) return { chargeId: null, receiptUrl: null };
 
@@ -3223,6 +3228,25 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
 
         const rows = await db.all(sql, req.user.id);
         console.log(`[TicketScope] actor=${isDriver ? 'driver' : 'company'} count=${rows.length} visible=true`);
+
+        if (isEmpresa) {
+            const sanitized = await Promise.all((rows || []).map(async (row) => {
+                const unlocked = await hasChargedInvoiceForTicket(row.id, req.user.id, db);
+                if (!unlocked) {
+                    return {
+                        ...row,
+                        driver_name: null,
+                        locked: true
+                    };
+                }
+                return {
+                    ...row,
+                    locked: false
+                };
+            }));
+            return res.json(sanitized);
+        }
+
         res.json(rows || []);
     } catch (e) {
         console.error('Error fetching tickets:', e.message);
@@ -3612,6 +3636,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 pm.id           AS match_id,
                 pm.match_score,
                 pm.status,
+                pm.ticket_id,
                 pm.created_at,
                 pm.driver_step1_accepted_at,
                 pm.company_step1_accepted_at,
@@ -3651,38 +3676,48 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             ORDER BY pm.created_at DESC
         `, ...scopeIds);
 
-        const sanitized = rows.map(r => {
-            if (r.status !== 'INFO_SHARED' && r.status !== 'HIRED') {
-                const dId = String(r.driver_id || r.id);
-                const shortId = dId.slice(-4).toUpperCase();
+        const lockDriverRow = (row) => {
+            const dId = String(row.driver_id || row.id);
+            const shortId = dId.slice(-4).toUpperCase();
 
-                // Hide all contact + expanded profile info for non-shared matches
-                return {
-                    ...r,
-                    display_name: `Driver #${shortId}`,
-                    driver_name: null, // Hard block redundant real name
-                    driver_email: null,
-                    driver_phone: null,
-                    driver_city: null,
-                    driver_state: null,
-                    weekly_miles: null,
-                    longest_otr: null,
-                    trailer_experience: '[]',
-                    accidents_3y: null,
-                    tickets_3y: null,
-                    home_time: null,
-                    preferred_freight: null,
-                    preferred_region: null,
-                    willing_to_relocate: null,
-                    driver_bio: null,
-                    endorsements: '[]',
-                    profile_photo_base64: null,
-                    license_front_base64: null,
-                    license_back_base64: null
-                };
+            return {
+                ...row,
+                locked: true,
+                display_name: `Driver #${shortId}`,
+                driver_name: null,
+                driver_email: null,
+                driver_phone: null,
+                driver_city: null,
+                driver_state: null,
+                weekly_miles: null,
+                longest_otr: null,
+                trailer_experience: '[]',
+                accidents_3y: null,
+                tickets_3y: null,
+                home_time: null,
+                preferred_freight: null,
+                preferred_region: null,
+                willing_to_relocate: null,
+                driver_bio: null,
+                endorsements: '[]',
+                profile_photo_base64: null,
+                license_front_base64: null,
+                license_back_base64: null
+            };
+        };
+
+        const sanitized = await Promise.all(rows.map(async (r) => {
+            if (r.status !== 'INFO_SHARED' && r.status !== 'HIRED') {
+                return lockDriverRow(r);
             }
-            return r;
-        });
+
+            const unlocked = await hasChargedInvoiceForTicket(r.ticket_id, req.user.id, db);
+            if (!unlocked) {
+                return lockDriverRow(r);
+            }
+
+            return { ...r, locked: false };
+        }));
 
         res.json(sanitized);
     } catch (e) {
@@ -4021,7 +4056,11 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
                 });
             }
         } else if (!ticketId) {
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+            return res.status(402).json({
+                error: 'payment_required',
+                message: 'Payment must be completed before accessing driver information.',
+                invoice_id: null
+            });
         }
 
         if (match.status !== 'INFO_SHARED') {
@@ -4147,12 +4186,19 @@ app.post('/matches/:id/driver/confirm-share', authenticateToken, async (req, res
         }
 
         if (finalStatus === 'INFO_SHARED') {
+            const invoice = await fetchInvoiceByTicket(ticketId, db, match.company_id);
+            if (!invoice || invoice.status !== 'charged') {
+                return res.status(402).json({
+                    error: 'payment_required',
+                    message: 'Payment must be completed before accessing driver information.',
+                    invoice_id: invoice?.id || null
+                });
+            }
             try { await sendPush(match.company_id, 'empresa', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
             try { await sendPush(match.driver_id, 'driver', "¡Información Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
         } else {
             try { await sendPush(match.company_id, 'empresa', "Consentimiento Recibido", "El chofer ha compartido su información contigo."); } catch (e) { console.error('[ConsentPush]', e.message); }
         }
-        
         return res.json({ success: true, status: finalStatus, ticket_id: ticketId });
     } catch (e) {
         console.error('[Matches] driver confirm-share error:', e);
@@ -4216,7 +4262,11 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
                 });
             }
         } else if (!ticketId) {
-            return res.json({ success: true, status: 'INFO_SHARED', ticket_id: ticketId });
+            return res.status(402).json({
+                error: 'payment_required',
+                message: 'Payment must be completed before accessing driver information.',
+                invoice_id: null
+            });
         }
 
         if (match.status === 'INFO_SHARED' && ticketId) {
@@ -4343,6 +4393,14 @@ app.post('/matches/:id/company/confirm-share', authenticateToken, async (req, re
                 });
             }
 
+            const invoice = await fetchInvoiceByTicket(ticketId, db, match.company_id);
+            if (!invoice || invoice.status !== 'charged') {
+                return res.status(402).json({
+                    error: 'payment_required',
+                    message: 'Payment must be completed before accessing driver information.',
+                    invoice_id: invoice?.id || null
+                });
+            }
             try { await sendPush(match.company_id, 'empresa', "Â¡InformaciÃ³n Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
             try { await sendPush(match.driver_id, 'driver', "Â¡InformaciÃ³n Compartida!", "Ambas partes han aceptado. Ya pueden contactarse directamente."); } catch (e) { console.error('[ConsentPush]', e.message); }
 
@@ -4370,6 +4428,12 @@ app.post('/matches/:id/accept', authenticateToken, (req, res) => updateMatchStat
 // ──────────────────────────────────────────────────────────────────────────────
 
 app.post('/api/debug/sql', async (req, res) => {
+    if (process.env.NODE_ENV === 'production') {
+        return res.status(404).json({
+            error: 'not_found'
+        });
+    }
+    console.warn('[DEBUG_SQL] Accessed in non-production environment');
     // Only for diagnostic test purposes as specifically requested
     if (req.body.secret !== 'surgical_evidence_123') return res.status(403).json({ error: 'unauthorized' });
     try {
