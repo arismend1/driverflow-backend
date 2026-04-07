@@ -163,6 +163,36 @@ async function resolvePaymentIntentCharge(stripe, paymentIntent) {
     return { chargeId: null, receiptUrl: null };
 }
 
+function buildRequiresPaymentMethodError(invoiceId = null, paymentIntentId = null) {
+    return buildBillingHttpError(
+        402,
+        'requires_payment_method',
+        'This company must add a payment method before instant billing can continue.',
+        { invoiceId, paymentIntentId }
+    );
+}
+
+async function getUsablePaymentMethodForCustomer(stripe, customerId) {
+    if (!stripe || !customerId) return null;
+
+    const customer = await stripe.customers.retrieve(customerId, {
+        expand: ['invoice_settings.default_payment_method']
+    });
+
+    const defaultPm = customer?.invoice_settings?.default_payment_method;
+    if (defaultPm) {
+        return typeof defaultPm === 'string' ? defaultPm : defaultPm.id || null;
+    }
+
+    const paymentMethods = await stripe.paymentMethods.list({
+        customer: customerId,
+        type: 'card',
+        limit: 1
+    });
+
+    return paymentMethods?.data?.[0]?.id || null;
+}
+
 async function markInvoiceFailed(invoiceId, message, paymentIntentId = null, runner = db) {
     if (!invoiceId) return;
 
@@ -192,12 +222,31 @@ function normalizeChargeError(error, invoiceId = null) {
 
     const paymentIntentId = error.raw && error.raw.payment_intent ? error.raw.payment_intent.id : null;
     const paymentIntentStatus = error.raw && error.raw.payment_intent ? error.raw.payment_intent.status : null;
+    const errorMessage = (error.message || '').toLowerCase();
 
-    if (paymentIntentStatus === 'requires_payment_method' || error.code === 'requires_payment_method') {
-        return buildBillingHttpError(402, 'requires_payment_method', error.message || 'A saved payment method is required.', {
-            invoiceId,
-            paymentIntentId
-        });
+    if (
+        paymentIntentStatus === 'requires_payment_method' ||
+        error.code === 'requires_payment_method' ||
+        (error.code === 'payment_intent_unexpected_state' && errorMessage.includes('missing a payment method')) ||
+        errorMessage.includes('missing a payment method')
+    ) {
+        return buildRequiresPaymentMethodError(invoiceId, paymentIntentId);
+    }
+
+    if (
+        error.type === 'StripeAPIError' ||
+        error.type === 'StripeConnectionError' ||
+        error.code === 'rate_limit' ||
+        errorMessage.includes('timeout') ||
+        errorMessage.includes('temporarily') ||
+        errorMessage.includes('connection')
+    ) {
+        return buildBillingHttpError(
+            503,
+            'billing_retryable',
+            'Temporary billing issue. Please retry.',
+            { invoiceId, paymentIntentId }
+        );
     }
 
     if (error.type === 'StripeCardError') {
@@ -480,6 +529,7 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
 
         const customerId = await ensureStripeCustomerForCompany(company);
         company.stripe_customer_id = customerId;
+        const paymentMethodId = await getUsablePaymentMethodForCustomer(stripe, customerId);
 
         if (invoiceId) {
             invoice = await db.get('SELECT * FROM invoices WHERE id = ? AND company_id = ?', invoiceId, companyId);
@@ -495,6 +545,16 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
                 chargeId: null,
                 receiptUrl: null,
                 error: buildBillingHttpError(500, 'invoice_create_failed', 'Unable to create invoice.')
+            };
+        }
+
+        if (!paymentMethodId) {
+            return {
+                status: 'failed',
+                paymentIntentId: invoice.stripe_payment_intent_id || null,
+                chargeId: null,
+                receiptUrl: null,
+                error: buildRequiresPaymentMethodError(invoice.id, invoice.stripe_payment_intent_id || null)
             };
         }
 
@@ -529,6 +589,7 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
                 amount: normalizedAmount,
                 currency: (invoice.currency || 'USD').toLowerCase(),
                 customer: company.stripe_customer_id,
+                payment_method: paymentMethodId,
                 confirm: true,
                 off_session: true,
                 expand: ['latest_charge'],
@@ -540,6 +601,7 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
         if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
             paymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
                 off_session: true,
+                payment_method: paymentMethodId,
                 expand: ['latest_charge']
             });
         }
@@ -550,10 +612,7 @@ async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} })
                 paymentIntentId: paymentIntent.id || null,
                 chargeId: null,
                 receiptUrl: null,
-                error: buildBillingHttpError(402, 'requires_payment_method', 'A saved payment method is required.', {
-                    invoiceId: invoice.id,
-                    paymentIntentId: paymentIntent.id
-                })
+                error: buildRequiresPaymentMethodError(invoice.id, paymentIntent.id)
             };
         }
 
