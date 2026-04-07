@@ -22,12 +22,100 @@ const MATCH_FRESH_HOURS = parseInt(process.env.MATCH_FRESH_HOURS) || 24;
 const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
 const CANDIDATE_POOL_EXPAND = parseInt(process.env.CANDIDATE_POOL_EXPAND) || 400;
 const MIN_SCORE = 0.2;
+const EXCLUSIVE_HOURS = 72;
 
 // OTR eligibility config
 const OTR_POOL_REQUIRE_TRAVEL = (process.env.OTR_POOL_REQUIRE_TRAVEL || 'true') === 'true';
 const OTR_IMMEDIATE_DAYS = parseInt(process.env.OTR_IMMEDIATE_DAYS) || 7;
 
 const nowIso = () => new Date().toISOString();
+
+function addHoursToIso(baseValue, hours) {
+    const baseMs = new Date(baseValue).getTime();
+    if (!Number.isFinite(baseMs)) return null;
+    return new Date(baseMs + hours * 3600 * 1000).toISOString();
+}
+
+async function getDriverLockState(driverId, excludeMatchId = null) {
+    const params = [driverId];
+    let excludeSql = '';
+
+    if (excludeMatchId !== null && excludeMatchId !== undefined) {
+        excludeSql = 'AND id <> ?';
+        params.push(excludeMatchId);
+    }
+
+    const rows = await db.all(`
+        SELECT id, status, driver_share_consent_at, info_shared_at,
+               COALESCE(exclusivity_extension_hours, 0) AS exclusivity_extension_hours,
+               resolution_company, resolution_driver
+        FROM potential_matches
+        WHERE driver_id = ?
+          ${excludeSql}
+          AND status IN ('HIRED', 'INFO_SHARED', 'SHARE_PENDING_COMPANY', 'SHARE_PENDING_DRIVER')
+    `, ...params);
+
+    const nowMs = Date.now();
+    let blocking = null;
+
+    for (const row of rows) {
+        if (row.resolution_company === 'REJECTED' || row.resolution_driver === 'REJECTED') {
+            continue;
+        }
+
+        if (row.status === 'SHARE_PENDING_DRIVER') {
+            continue;
+        }
+
+        if (row.status === 'HIRED') {
+            return {
+                is_blocked: true,
+                blocking_match_id: row.id,
+                exclusive_until: null,
+                reason: 'hired'
+            };
+        }
+
+        let exclusiveUntil = null;
+        let reason = null;
+
+        if (row.status === 'INFO_SHARED' && row.info_shared_at) {
+            exclusiveUntil = addHoursToIso(
+                row.info_shared_at,
+                EXCLUSIVE_HOURS + (parseInt(row.exclusivity_extension_hours, 10) || 0)
+            );
+            reason = 'exclusive_evaluation';
+        } else if (row.status === 'SHARE_PENDING_COMPANY' && row.driver_share_consent_at) {
+            exclusiveUntil = addHoursToIso(row.driver_share_consent_at, EXCLUSIVE_HOURS);
+            reason = 'pending_company_confirmation';
+        }
+
+        if (!exclusiveUntil) {
+            continue;
+        }
+
+        const exclusiveUntilMs = new Date(exclusiveUntil).getTime();
+        if (!Number.isFinite(exclusiveUntilMs) || exclusiveUntilMs <= nowMs) {
+            continue;
+        }
+
+        if (!blocking || exclusiveUntilMs > new Date(blocking.exclusive_until).getTime()) {
+            blocking = {
+                is_blocked: true,
+                blocking_match_id: row.id,
+                exclusive_until: exclusiveUntil,
+                reason
+            };
+        }
+    }
+
+    return blocking || {
+        is_blocked: false,
+        blocking_match_id: null,
+        exclusive_until: null,
+        reason: null
+    };
+}
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -503,4 +591,4 @@ async function generateMatchesForCompany(companyId) {
     return inserted + updated;
 }
 
-module.exports = { generateMatchesForDriver, generateMatchesForCompany, computeScore, toArray };
+module.exports = { generateMatchesForDriver, generateMatchesForCompany, computeScore, toArray, getDriverLockState };
