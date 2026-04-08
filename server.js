@@ -493,13 +493,33 @@ async function markInvoiceCharged(invoiceId, paymentInfo = {}, runner = db) {
     if (invoiceColumns.failure_reason) {
         assignments.push('failure_reason = NULL');
     }
+    if (invoiceColumns.next_retry_at) {
+        assignments.push('next_retry_at = NULL');
+    }
+    if (invoiceColumns.suspended_at) {
+        assignments.push('suspended_at = NULL');
+    }
     if (invoiceColumns.updated_at) {
         assignments.push('updated_at = ?');
         params.push(nowIso());
     }
 
     params.push(invoiceId);
-    await runner.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ?`, ...params);
+    await runner.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ? AND status <> 'charged'`, ...params);
+}
+
+async function reconcileChargedInvoiceForTicket(ticketId, paymentInfo = {}, runner = db, companyId = null) {
+    if (!ticketId) return null;
+
+    const invoice = await fetchInvoiceByTicket(ticketId, runner, companyId);
+    if (!invoice) return null;
+
+    if (invoice.status !== 'charged') {
+        await markInvoiceCharged(invoice.id, paymentInfo, runner);
+        return runner.get('SELECT * FROM invoices WHERE id = ?', invoice.id);
+    }
+
+    return invoice;
 }
 
 async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
@@ -797,6 +817,8 @@ const handleStripeWebhook = async (req, res) => {
         if (event.type === 'payment_intent.succeeded') {
             const paymentIntent = event.data.object;
             const invoiceId = paymentIntent.metadata?.invoice_id || null;
+            const ticketId = paymentIntent.metadata?.ticket_id || null;
+            const companyId = paymentIntent.metadata?.company_id || null;
             const piId = paymentIntent.id;
 
             let chargeId = null;
@@ -827,7 +849,7 @@ const handleStripeWebhook = async (req, res) => {
                             failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
                         WHERE id=? AND status != 'charged'
                     `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
-                    
+
                     await tx.run(`
                         UPDATE tickets 
                         SET billing_status = 'paid'
@@ -837,6 +859,20 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, invoiceId);
                     console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
+                }
+            } else if (ticketId) {
+                const invoice = await reconcileChargedInvoiceForTicket(
+                    ticketId,
+                    { paymentIntentId: piId, chargeId, receiptUrl },
+                    tx,
+                    companyId
+                );
+
+                if (!invoice) {
+                    console.error(`[Stripe Webhook] Invoice anomaly: no invoice found for Ticket #${ticketId} during payment_intent.succeeded (PI: ${piId})`);
+                } else {
+                    await markTicketPaid(ticketId, { paymentIntentId: piId }, tx);
+                    console.log(`[Stripe Webhook] Reconciled PAID via Ticket Match: ticket=${ticketId}, invoice=${invoice.id}, PI=${piId}`);
                 }
             } else {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
@@ -869,7 +905,7 @@ const handleStripeWebhook = async (req, res) => {
             const ticketId = session.metadata?.ticket_id || session.client_reference_id;
             if (ticketId) {
                 // Load ticket from DB for amount validation
-                const ticket = await tx.get('SELECT id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
+                const ticket = await tx.get('SELECT id, company_id, price_cents, currency FROM tickets WHERE id = ?', ticketId);
                 if (!ticket) {
                     console.error(`[Stripe Webhook] Ticket #${ticketId} NOT FOUND in DB. Skipping.`);
                 } else if (session.amount_total !== ticket.price_cents) {
@@ -879,11 +915,38 @@ const handleStripeWebhook = async (req, res) => {
                 } else {
                     const piId = session.payment_intent || null;
                     const customerId = session.customer || null;
-                    await tx.run(
-                        `UPDATE tickets SET billing_status='paid', paid_at=?, updated_at=?, stripe_payment_intent_id=?, stripe_customer_id=? WHERE id=? AND billing_status <> 'paid'`,
-                        nowIso(), nowIso(), piId, customerId, ticketId
+                    let chargeId = null;
+                    let receiptUrl = null;
+
+                    if (piId) {
+                        try {
+                            const paymentIntent = await stripe.paymentIntents.retrieve(piId, {
+                                expand: ['latest_charge']
+                            });
+                            const chargeData = await resolvePaymentIntentCharge(stripe, paymentIntent);
+                            chargeId = chargeData.chargeId;
+                            receiptUrl = chargeData.receiptUrl;
+                        } catch (chargeErr) {
+                            console.error(`[Stripe Webhook] Charge resolution failed for Ticket #${ticketId} (PI: ${piId}): ${chargeErr.message}`);
+                        }
+                    }
+
+                    const invoice = await reconcileChargedInvoiceForTicket(
+                        ticketId,
+                        { paymentIntentId: piId, chargeId, receiptUrl },
+                        tx,
+                        ticket.company_id
                     );
+
+                    if (!invoice) {
+                        console.error(`[Stripe Webhook] Invoice anomaly: no invoice found for Ticket #${ticketId} during checkout.session.completed`);
+                    }
+
+                    await markTicketPaid(ticketId, { paymentIntentId: piId, customerId }, tx);
                     console.log(`[Stripe Webhook] ✅ Ticket #${ticketId} marked PAID (PI: ${piId}, amount: ${session.amount_total})`);
+                    if (invoice) {
+                        console.log(`[Stripe Webhook] ✅ Invoice #${invoice.id} marked CHARGED via ticket checkout (Ticket: ${ticketId}, PI: ${piId})`);
+                    }
                 }
             } else if (session.metadata?.type === 'weekly_invoice' && session.metadata?.invoice_id) {
                 const invoiceId = session.metadata.invoice_id;
