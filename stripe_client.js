@@ -7,6 +7,35 @@ function getStripe() {
     const apiKey = process.env.STRIPE_SECRET_KEY;
     if (!apiKey) return null;
 
+    const buildStripeError = async (res, label) => {
+        let payload = null;
+        let text = '';
+
+        try {
+            payload = await res.json();
+        } catch {
+            try {
+                text = await res.text();
+            } catch {
+                text = '';
+            }
+        }
+
+        const stripeErr = payload && payload.error ? payload.error : null;
+        const err = new Error(stripeErr?.message || text || `${label}: ${res.status}`);
+        err.statusCode = res.status;
+
+        if (stripeErr) {
+            err.type = stripeErr.type;
+            err.code = stripeErr.code;
+            err.decline_code = stripeErr.decline_code;
+            err.param = stripeErr.param;
+            err.raw = stripeErr;
+        }
+
+        return err;
+    };
+
     const toForm = (obj, prefix = '') => {
         const pairs = [];
         for (const key in obj) {
@@ -39,9 +68,43 @@ function getStripe() {
                 });
 
                 if (!res.ok) {
-                    const txt = await res.text();
-                    console.error('Stripe Customer Error:', txt);
-                    throw new Error(`Stripe API Error: ${res.status}`);
+                    throw await buildStripeError(res, 'Stripe Customer Error');
+                }
+
+                return res.json();
+            },
+            retrieve: async (customerId, params = {}) => {
+                const query = toForm(params).join('&');
+                const suffix = query ? `?${query}` : '';
+                const res = await fetch(`https://api.stripe.com/v1/customers/${customerId}${suffix}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Stripe-Version': API_VERSION,
+                    }
+                });
+
+                if (!res.ok) {
+                    throw await buildStripeError(res, 'Stripe Customer Retrieve Error');
+                }
+
+                return res.json();
+            }
+        },
+        paymentMethods: {
+            list: async (params = {}) => {
+                const query = toForm(params).join('&');
+                const suffix = query ? `?${query}` : '';
+                const res = await fetch(`https://api.stripe.com/v1/payment_methods${suffix}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Stripe-Version': API_VERSION,
+                    }
+                });
+
+                if (!res.ok) {
+                    throw await buildStripeError(res, 'Stripe PaymentMethods List Error');
                 }
 
                 return res.json();
@@ -58,9 +121,7 @@ function getStripe() {
                 });
 
                 if (!res.ok) {
-                    const txt = await res.text();
-                    console.error('Stripe Charge Retrieve Error:', txt);
-                    throw new Error(`Stripe API Error: ${res.status}`);
+                    throw await buildStripeError(res, 'Stripe Charge Retrieve Error');
                 }
 
                 return res.json();
@@ -82,9 +143,7 @@ function getStripe() {
                 });
 
                 if (!res.ok) {
-                    const txt = await res.text();
-                    console.error('Stripe PaymentIntent Create Error:', txt);
-                    throw new Error(`Stripe API Error: ${res.status}`);
+                    throw await buildStripeError(res, 'Stripe PaymentIntent Create Error');
                 }
 
                 return res.json();
@@ -101,9 +160,7 @@ function getStripe() {
                 });
 
                 if (!res.ok) {
-                    const txt = await res.text();
-                    console.error('Stripe PaymentIntent Retrieve Error:', txt);
-                    throw new Error(`Stripe API Error: ${res.status}`);
+                    throw await buildStripeError(res, 'Stripe PaymentIntent Retrieve Error');
                 }
 
                 return res.json();
@@ -121,9 +178,7 @@ function getStripe() {
                 });
 
                 if (!res.ok) {
-                    const txt = await res.text();
-                    console.error('Stripe PaymentIntent Confirm Error:', txt);
-                    throw new Error(`Stripe API Error: ${res.status}`);
+                    throw await buildStripeError(res, 'Stripe PaymentIntent Confirm Error');
                 }
 
                 return res.json();
@@ -157,9 +212,7 @@ function getStripe() {
                     });
 
                     if (!res.ok) {
-                        const txt = await res.text();
-                        console.error('Stripe API Error:', txt);
-                        throw new Error(`Stripe API Error: ${res.status}`);
+                        throw await buildStripeError(res, 'Stripe Checkout Create Error');
                     }
 
                     return res.json();
@@ -174,9 +227,7 @@ function getStripe() {
                     });
 
                     if (!res.ok) {
-                        const txt = await res.text();
-                        console.error('Stripe Retrieve Error:', txt);
-                        throw new Error(`Stripe API Error: ${res.status}`);
+                        throw await buildStripeError(res, 'Stripe Checkout Retrieve Error');
                     }
 
                     return res.json();
