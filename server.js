@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -483,12 +485,100 @@ async function renderInvoicePdf(html) {
     }
 }
 
+function getInvoicePdfFileName(invoiceId) {
+    return `invoice-DF-${String(invoiceId).padStart(6, '0')}.pdf`;
+}
+
+function getInvoicePdfStoragePath(invoiceId) {
+    return path.join(os.tmpdir(), 'driverflow-invoices', getInvoicePdfFileName(invoiceId));
+}
+
+function resolveInvoicePdfPath(invoiceId, pdfReference = null) {
+    if (typeof pdfReference === 'string' && pdfReference.trim()) {
+        const trimmed = pdfReference.trim();
+        if (/^file:\/\//i.test(trimmed)) {
+            return trimmed.replace(/^file:\/\//i, '');
+        }
+        if (!/^https?:\/\//i.test(trimmed)) {
+            return trimmed;
+        }
+    }
+    return getInvoicePdfStoragePath(invoiceId);
+}
+
+async function getStoredInvoicePdfAttachment(invoiceId, pdfReference = null) {
+    const pdfPath = resolveInvoicePdfPath(invoiceId, pdfReference);
+    if (!pdfPath) return undefined;
+
+    try {
+        const pdfBuffer = await fs.promises.readFile(pdfPath);
+        return [{
+            filename: getInvoicePdfFileName(invoiceId),
+            content: pdfBuffer,
+            content_type: 'application/pdf'
+        }];
+    } catch (pdfErr) {
+        if (pdfErr.code !== 'ENOENT') {
+            console.warn(`[InvoicePDF] Unable to read stored PDF for invoice #${invoiceId}: ${pdfErr.message}`);
+        }
+        return undefined;
+    }
+}
+
+async function generateAndStoreInvoicePdf(invoiceId) {
+    if (!invoiceId) return null;
+
+    const invoiceColumns = await getTableColumns('invoices');
+    const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
+    const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+    const pdfUrlSelect = invoiceColumns.pdf_url ? 'pdf_url' : 'NULL AS pdf_url';
+    const {
+        billingNameSelect,
+        billingEmailSelect,
+        billingPhoneSelect,
+        billingAddressLine1Select,
+        billingAddressLine2Select,
+        billingCitySelect,
+        billingStateSelect,
+        billingPostalCodeSelect,
+        billingCountrySelect
+    } = getInvoiceBillingSnapshotSelects(invoiceColumns);
+    const invoice = await db.get(`
+        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${pdfUrlSelect},
+               ${billingNameSelect}, ${billingEmailSelect}, ${billingPhoneSelect}, ${billingAddressLine1Select}, ${billingAddressLine2Select},
+               ${billingCitySelect}, ${billingStateSelect}, ${billingPostalCodeSelect}, ${billingCountrySelect}
+        FROM invoices
+        WHERE id = ?
+    `, invoiceId);
+
+    if (!invoice || invoice.status !== 'charged') return null;
+
+    let html = invoice.html_content || null;
+    if (!html) {
+        const company = await getCompanyBillingRecipient(invoice.company_id, db);
+        if (!company) return null;
+        html = buildInvoiceEmailHtml(invoice, company);
+    }
+
+    const pdfBuffer = await renderInvoicePdf(html);
+    const pdfPath = getInvoicePdfStoragePath(invoiceId);
+    await fs.promises.mkdir(path.dirname(pdfPath), { recursive: true });
+    await fs.promises.writeFile(pdfPath, pdfBuffer);
+
+    if (invoiceColumns.pdf_url) {
+        await db.run('UPDATE invoices SET pdf_url = ? WHERE id = ?', pdfPath, invoiceId);
+    }
+
+    return pdfPath;
+}
+
 async function sendInvoiceReceiptEmail(invoiceId) {
     if (!invoiceId) return false;
 
     const invoiceColumns = await getTableColumns('invoices');
     const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
     const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+    const pdfUrlSelect = invoiceColumns.pdf_url ? 'pdf_url' : 'NULL AS pdf_url';
     const emailSentAtSelect = invoiceColumns.email_sent_at ? 'email_sent_at' : 'NULL AS email_sent_at';
     const {
         billingNameSelect,
@@ -503,7 +593,7 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     } = getInvoiceBillingSnapshotSelects(invoiceColumns);
     const emailLockColumn = invoiceColumns.email_sent_at ? getInvoiceEmailLockColumn(invoiceColumns) : null;
     const invoice = await db.get(`
-        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${emailSentAtSelect},
+        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${pdfUrlSelect}, ${emailSentAtSelect},
                ${billingNameSelect}, ${billingEmailSelect}, ${billingPhoneSelect}, ${billingAddressLine1Select}, ${billingAddressLine2Select},
                ${billingCitySelect}, ${billingStateSelect}, ${billingPostalCodeSelect}, ${billingCountrySelect}
         FROM invoices
@@ -537,7 +627,6 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const paidDateValue = invoice.paid_at || invoice.charged_at;
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const html = buildInvoiceEmailHtml(invoice, company);
-    const pdfFileName = `invoice-${invoiceNumber}.pdf`;
     const billing = resolveInvoiceBillingContext(invoice, company);
     let emailLockClaimed = false;
     let emailSentSuccessfully = false;
@@ -586,17 +675,7 @@ async function sendInvoiceReceiptEmail(invoiceId) {
         console.log(`[InvoiceEmail] Send lock acquired for invoice #${invoiceId} via ${emailLockColumn}`);
     }
 
-    let attachments;
-    try {
-        const pdfBuffer = await renderInvoicePdf(html);
-        attachments = [{
-            filename: pdfFileName,
-            content: pdfBuffer,
-            content_type: 'application/pdf'
-        }];
-    } catch (pdfErr) {
-        console.error(`[InvoiceEmail] PDF generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
-    }
+    const attachments = await getStoredInvoicePdfAttachment(invoiceId, invoice.pdf_url);
 
     const textBody = [
         `DriverFlow Payment Receipt`,
@@ -1491,6 +1570,11 @@ const handleStripeWebhook = async (req, res) => {
         
         await tx.commit();
         for (const invoiceId of invoiceReceiptEmailQueue) {
+            try {
+                await generateAndStoreInvoicePdf(invoiceId);
+            } catch (pdfErr) {
+                console.warn(`[InvoicePDF] Async generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
+            }
             try {
                 await sendInvoiceReceiptEmail(invoiceId);
             } catch (emailErr) {
