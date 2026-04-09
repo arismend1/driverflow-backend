@@ -264,6 +264,17 @@ function chooseExistingColumn(columns, candidates = []) {
     return null;
 }
 
+function getMutationCount(result) {
+    if (!result) return 0;
+    if (typeof result.rowCount === 'number') return result.rowCount;
+    if (typeof result.changes === 'number') return result.changes;
+    return 0;
+}
+
+function getInvoiceEmailLockColumn(invoiceColumns) {
+    return chooseExistingColumn(invoiceColumns, ['email_sending_at', 'email_send_locked_at', 'receipt_sending_at']);
+}
+
 async function getCompanyBillingRecipient(companyId, runner = db) {
     if (!companyId) return null;
 
@@ -450,6 +461,7 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
     const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
     const emailSentAtSelect = invoiceColumns.email_sent_at ? 'email_sent_at' : 'NULL AS email_sent_at';
+    const emailLockColumn = invoiceColumns.email_sent_at ? getInvoiceEmailLockColumn(invoiceColumns) : null;
     const invoice = await db.get(`
         SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${emailSentAtSelect}
         FROM invoices
@@ -463,6 +475,8 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     }
     if (!invoiceColumns.email_sent_at) {
         console.warn(`[InvoiceEmail] email_sent_at column unavailable; duplicate receipt protection disabled for invoice #${invoiceId}`);
+    } else if (!emailLockColumn) {
+        console.warn(`[InvoiceEmail] Atomic duplicate protection unavailable for invoice #${invoiceId}; lock column missing`);
     }
 
     const company = await getCompanyBillingRecipient(invoice.company_id, db);
@@ -482,8 +496,52 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const html = buildInvoiceEmailHtml(invoice, company);
     const pdfFileName = `invoice-${invoiceNumber}.pdf`;
+    let emailLockClaimed = false;
+    let emailSentSuccessfully = false;
 
     await persistInvoiceHtmlContent(invoiceId, html, db);
+
+    const releaseEmailLockAfterFailure = async () => {
+        if (!emailLockColumn || !emailLockClaimed) return;
+        try {
+            await db.run(`UPDATE invoices SET ${emailLockColumn} = NULL WHERE id = ?`, invoiceId);
+            console.log(`[InvoiceEmail] Send lock released after failure for invoice #${invoiceId}`);
+        } catch (unlockErr) {
+            console.error(`[InvoiceEmail] Failed to release send lock for invoice #${invoiceId}: ${unlockErr.message}`);
+        } finally {
+            emailLockClaimed = false;
+        }
+    };
+
+    if (invoiceColumns.email_sent_at && emailLockColumn) {
+        const claimResult = await db.run(
+            `UPDATE invoices
+             SET ${emailLockColumn} = ?
+             WHERE id = ?
+               AND email_sent_at IS NULL
+               AND ${emailLockColumn} IS NULL`,
+            nowIso(),
+            invoiceId
+        );
+
+        if (getMutationCount(claimResult) !== 1) {
+            const claimState = await db.get(
+                `SELECT email_sent_at, ${emailLockColumn} AS sending_lock FROM invoices WHERE id = ?`,
+                invoiceId
+            );
+            if (claimState?.email_sent_at) {
+                console.log(`[InvoiceEmail] Receipt already sent for invoice #${invoiceId}`);
+            } else if (claimState?.sending_lock) {
+                console.log(`[InvoiceEmail] Receipt send already claimed by another process for invoice #${invoiceId}`);
+            } else {
+                console.log(`[InvoiceEmail] Receipt send claim unavailable for invoice #${invoiceId}`);
+            }
+            return false;
+        }
+
+        emailLockClaimed = true;
+        console.log(`[InvoiceEmail] Send lock acquired for invoice #${invoiceId} via ${emailLockColumn}`);
+    }
 
     let attachments;
     try {
@@ -515,24 +573,56 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const fromEmail = process.env.EMAIL_FROM || 'onboarding@resend.dev';
     const fromName = process.env.EMAIL_FROM_NAME || 'DriverFlow';
 
-    const { error } = await resend.emails.send({
-        from: `${fromName} <${fromEmail}>`,
-        to: [company.company_email],
-        subject: 'Payment Receipt – DriverFlow',
-        text: textBody,
-        html,
-        attachments
-    });
+    try {
+        if (invoiceColumns.email_sent_at && !emailLockColumn) {
+            const latest = await db.get('SELECT email_sent_at FROM invoices WHERE id = ?', invoiceId);
+            if (latest?.email_sent_at) {
+                console.log(`[InvoiceEmail] Receipt already sent for invoice #${invoiceId}`);
+                return false;
+            }
+        }
 
-    if (error) {
-        throw new Error(`Resend Error: ${error.message || JSON.stringify(error)}`);
+        const { error } = await resend.emails.send({
+            from: `${fromName} <${fromEmail}>`,
+            to: [company.company_email],
+            subject: 'Payment Receipt – DriverFlow',
+            text: textBody,
+            html,
+            attachments
+        });
+
+        if (error) {
+            throw new Error(`Resend Error: ${error.message || JSON.stringify(error)}`);
+        }
+
+        emailSentSuccessfully = true;
+
+        if (invoiceColumns.email_sent_at) {
+            if (emailLockColumn) {
+                await db.run(
+                    `UPDATE invoices
+                     SET email_sent_at = COALESCE(email_sent_at, ?),
+                         ${emailLockColumn} = NULL
+                     WHERE id = ?`,
+                    nowIso(),
+                    invoiceId
+                );
+                emailLockClaimed = false;
+            } else {
+                await db.run('UPDATE invoices SET email_sent_at = COALESCE(email_sent_at, ?) WHERE id = ?', nowIso(), invoiceId);
+            }
+        }
+
+        console.log(`[InvoiceEmail] Receipt sent successfully for invoice #${invoiceId}`);
+        return true;
+    } catch (sendErr) {
+        if (!emailSentSuccessfully) {
+            await releaseEmailLockAfterFailure();
+        } else if (emailLockColumn && emailLockClaimed) {
+            console.error(`[InvoiceEmail] Receipt sent but lock cleanup failed for invoice #${invoiceId}; lock retained`);
+        }
+        throw sendErr;
     }
-
-    if (invoiceColumns.email_sent_at) {
-        await db.run('UPDATE invoices SET email_sent_at = COALESCE(email_sent_at, ?) WHERE id = ?', nowIso(), invoiceId);
-    }
-
-    return true;
 }
 
 async function markInvoiceFailed(invoiceId, message, paymentIntentId = null, runner = db) {
