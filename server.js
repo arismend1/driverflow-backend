@@ -253,24 +253,68 @@ function escapeHtml(value) {
         .replace(/'/g, '&#39;');
 }
 
+function isValidEmail(value) {
+    return typeof value === 'string' && /\S+@\S+\.\S+/.test(value.trim());
+}
+
+function chooseExistingColumn(columns, candidates = []) {
+    for (const candidate of candidates) {
+        if (columns[candidate]) return candidate;
+    }
+    return null;
+}
+
 async function getCompanyBillingRecipient(companyId, runner = db) {
     if (!companyId) return null;
 
     const companyColumns = await getTableColumns('empresas');
-    const selectEmail = companyColumns.email ? ', email' : '';
+    const legalNameCol = chooseExistingColumn(companyColumns, ['legal_name']);
+    const billingEmailCol = chooseExistingColumn(companyColumns, ['billing_email']);
+    const emailCol = chooseExistingColumn(companyColumns, ['email']);
+    const phoneCol = chooseExistingColumn(companyColumns, ['contact_phone', 'telefono', 'phone']);
+    const addressLine1Col = chooseExistingColumn(companyColumns, ['address_line1']);
+    const addressLine2Col = chooseExistingColumn(companyColumns, ['address_line2']);
+    const cityCol = chooseExistingColumn(companyColumns, ['city', 'ciudad']);
+    const stateCol = chooseExistingColumn(companyColumns, ['address_state', 'estado', 'state']);
+    const postalCodeCol = chooseExistingColumn(companyColumns, ['postal_code', 'zip_code', 'zip', 'postal', 'postcode']);
+    const countryCol = chooseExistingColumn(companyColumns, ['country']);
+    const selectFields = [
+        'id',
+        'nombre',
+        'contacto',
+        legalNameCol ? `${legalNameCol} AS legal_name` : 'NULL AS legal_name',
+        billingEmailCol ? `${billingEmailCol} AS billing_email` : 'NULL AS billing_email',
+        emailCol ? `${emailCol} AS email` : 'NULL AS email',
+        phoneCol ? `${phoneCol} AS company_phone` : 'NULL AS company_phone',
+        addressLine1Col ? `${addressLine1Col} AS address_line1` : 'NULL AS address_line1',
+        addressLine2Col ? `${addressLine2Col} AS address_line2` : 'NULL AS address_line2',
+        cityCol ? `${cityCol} AS city` : 'NULL AS city',
+        stateCol ? `${stateCol} AS state` : 'NULL AS state',
+        postalCodeCol ? `${postalCodeCol} AS postal_code` : 'NULL AS postal_code',
+        countryCol ? `${countryCol} AS country` : 'NULL AS country'
+    ];
     const company = await runner.get(
-        `SELECT id, nombre, contacto${selectEmail} FROM empresas WHERE id = ?`,
+        `SELECT ${selectFields.join(', ')} FROM empresas WHERE id = ?`,
         companyId
     );
 
     if (!company) return null;
 
-    const companyEmail = [company.email, company.contacto]
-        .find(value => typeof value === 'string' && /\S+@\S+\.\S+/.test(value.trim()));
+    const companyEmail =
+        (isValidEmail(company.billing_email) ? company.billing_email.trim() : null) ||
+        (isValidEmail(company.email) ? company.email.trim() : null) ||
+        (isValidEmail(company.contacto) ? company.contacto.trim() : null) ||
+        null;
+    const companyEmailSource =
+        (isValidEmail(company.billing_email) && 'billing_email') ||
+        (isValidEmail(company.email) && 'email') ||
+        (isValidEmail(company.contacto) && 'contacto') ||
+        null;
 
     return {
         ...company,
-        company_email: companyEmail || null
+        company_email: companyEmail || null,
+        company_email_source: companyEmailSource
     };
 }
 
@@ -291,8 +335,13 @@ function buildInvoiceEmailHtml(invoice, company) {
     const paidDate = formatDate(paidDateValue);
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const supportEmail = escapeHtml(process.env.BILLING_CONTACT_EMAIL || process.env.EMAIL_FROM || 'support@driverflow.app');
-    const companyName = escapeHtml(company.nombre || `Company #${company.id}`);
+    const companyName = escapeHtml(company.legal_name || company.nombre || `Company #${company.id}`);
     const companyEmail = escapeHtml(company.company_email || 'N/A');
+    const companyPhone = company.company_phone ? escapeHtml(company.company_phone) : null;
+    const addressLine1 = company.address_line1 ? escapeHtml(company.address_line1) : null;
+    const addressLine2 = company.address_line2 ? escapeHtml(company.address_line2) : null;
+    const locationLine = [company.city, company.state, company.postal_code].filter(Boolean).map(escapeHtml).join(', ');
+    const countryLine = company.country ? escapeHtml(company.country) : null;
     const receiptUrl = invoice.receipt_url ? String(invoice.receipt_url) : '';
 
     return `<!DOCTYPE html>
@@ -309,6 +358,11 @@ function buildInvoiceEmailHtml(invoice, company) {
             <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Bill To</div>
             <div style="font-size:18px;font-weight:700;margin-top:8px;">${companyName}</div>
             <div style="font-size:14px;color:#4b5563;margin-top:4px;">${companyEmail}</div>
+            ${companyPhone ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${companyPhone}</div>` : ''}
+            ${addressLine1 ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${addressLine1}</div>` : ''}
+            ${addressLine2 ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${addressLine2}</div>` : ''}
+            ${locationLine ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${locationLine}</div>` : ''}
+            ${countryLine ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${countryLine}</div>` : ''}
           </div>
           <div>
             <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Invoice</div>
@@ -395,17 +449,25 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const invoiceColumns = await getTableColumns('invoices');
     const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
     const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+    const emailSentAtSelect = invoiceColumns.email_sent_at ? 'email_sent_at' : 'NULL AS email_sent_at';
     const invoice = await db.get(`
-        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}
+        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${emailSentAtSelect}
         FROM invoices
         WHERE id = ?
     `, invoiceId);
 
     if (!invoice || invoice.status !== 'charged') return false;
+    if (invoiceColumns.email_sent_at && invoice.email_sent_at) {
+        console.log(`[InvoiceEmail] Receipt already sent for invoice #${invoiceId}`);
+        return false;
+    }
+    if (!invoiceColumns.email_sent_at) {
+        console.warn(`[InvoiceEmail] email_sent_at column unavailable; duplicate receipt protection disabled for invoice #${invoiceId}`);
+    }
 
     const company = await getCompanyBillingRecipient(invoice.company_id, db);
     if (!company || !company.company_email) {
-        console.warn(`[InvoiceEmail] Missing billing email for company #${invoice?.company_id || 'unknown'} (invoice #${invoiceId})`);
+        console.warn(`[InvoiceEmail] Missing valid billing email for company #${invoice?.company_id || 'unknown'} (invoice #${invoiceId})`);
         return false;
     }
 
@@ -419,8 +481,21 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const paidDateValue = invoice.paid_at || invoice.charged_at;
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const html = buildInvoiceEmailHtml(invoice, company);
+    const pdfFileName = `invoice-${invoiceNumber}.pdf`;
 
     await persistInvoiceHtmlContent(invoiceId, html, db);
+
+    let attachments;
+    try {
+        const pdfBuffer = await renderInvoicePdf(html);
+        attachments = [{
+            filename: pdfFileName,
+            content: pdfBuffer,
+            content_type: 'application/pdf'
+        }];
+    } catch (pdfErr) {
+        console.error(`[InvoiceEmail] PDF generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
+    }
 
     const textBody = [
         `DriverFlow Payment Receipt`,
@@ -445,11 +520,16 @@ async function sendInvoiceReceiptEmail(invoiceId) {
         to: [company.company_email],
         subject: 'Payment Receipt – DriverFlow',
         text: textBody,
-        html
+        html,
+        attachments
     });
 
     if (error) {
         throw new Error(`Resend Error: ${error.message || JSON.stringify(error)}`);
+    }
+
+    if (invoiceColumns.email_sent_at) {
+        await db.run('UPDATE invoices SET email_sent_at = COALESCE(email_sent_at, ?) WHERE id = ?', nowIso(), invoiceId);
     }
 
     return true;
