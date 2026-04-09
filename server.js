@@ -216,6 +216,245 @@ async function getUsablePaymentMethodForCustomer(stripe, customerId) {
     return paymentMethods?.data?.[0]?.id || null;
 }
 
+let resendClient = null;
+
+function getResendClient() {
+    if (!resendClient) {
+        const { Resend } = require('resend');
+        resendClient = new Resend(process.env.RESEND_API_KEY);
+    }
+    return resendClient;
+}
+
+function formatCurrency(cents, currency = 'USD') {
+    return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: currency || 'USD'
+    }).format((Number(cents) || 0) / 100);
+}
+
+function formatDate(value) {
+    if (!value) return 'N/A';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return 'N/A';
+    return new Intl.DateTimeFormat('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric'
+    }).format(dt);
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+async function getCompanyBillingRecipient(companyId, runner = db) {
+    if (!companyId) return null;
+
+    const companyColumns = await getTableColumns('empresas');
+    const selectEmail = companyColumns.email ? ', email' : '';
+    const company = await runner.get(
+        `SELECT id, nombre, contacto${selectEmail} FROM empresas WHERE id = ?`,
+        companyId
+    );
+
+    if (!company) return null;
+
+    const companyEmail = [company.email, company.contacto]
+        .find(value => typeof value === 'string' && /\S+@\S+\.\S+/.test(value.trim()));
+
+    return {
+        ...company,
+        company_email: companyEmail || null
+    };
+}
+
+async function persistInvoiceHtmlContent(invoiceId, html, runner = db) {
+    if (!invoiceId || !html) return false;
+
+    const invoiceColumns = await getTableColumns('invoices');
+    if (!invoiceColumns.html_content) return false;
+
+    await runner.run('UPDATE invoices SET html_content = ? WHERE id = ?', html, invoiceId);
+    return true;
+}
+
+function buildInvoiceEmailHtml(invoice, company) {
+    const invoiceNumber = `DF-${String(invoice.id).padStart(6, '0')}`;
+    const invoiceDate = formatDate(invoice.created_at);
+    const paidDateValue = invoice.paid_at || invoice.charged_at;
+    const paidDate = formatDate(paidDateValue);
+    const amount = formatCurrency(invoice.total_cents, invoice.currency);
+    const supportEmail = escapeHtml(process.env.BILLING_CONTACT_EMAIL || process.env.EMAIL_FROM || 'support@driverflow.app');
+    const companyName = escapeHtml(company.nombre || `Company #${company.id}`);
+    const companyEmail = escapeHtml(company.company_email || 'N/A');
+    const receiptUrl = invoice.receipt_url ? String(invoice.receipt_url) : '';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+  <body style="margin:0;padding:0;background:#f5f7fb;font-family:Arial,sans-serif;color:#1f2937;">
+    <div style="max-width:720px;margin:0 auto;padding:24px;">
+      <div style="background:#111827;color:#ffffff;padding:24px 28px;border-radius:16px 16px 0 0;">
+        <div style="font-size:28px;font-weight:700;">DriverFlow</div>
+        <div style="font-size:14px;opacity:0.9;margin-top:6px;">${supportEmail}</div>
+      </div>
+      <div style="background:#ffffff;padding:28px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 16px 16px;">
+        <div style="display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:24px;">
+          <div>
+            <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Bill To</div>
+            <div style="font-size:18px;font-weight:700;margin-top:8px;">${companyName}</div>
+            <div style="font-size:14px;color:#4b5563;margin-top:4px;">${companyEmail}</div>
+          </div>
+          <div>
+            <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Invoice</div>
+            <div style="font-size:22px;font-weight:700;margin-top:8px;">${escapeHtml(invoiceNumber)}</div>
+            <div style="font-size:14px;color:#4b5563;margin-top:8px;">Invoice Date: ${escapeHtml(invoiceDate)}</div>
+            <div style="font-size:14px;color:#4b5563;margin-top:4px;">Paid Date: ${escapeHtml(paidDate)}</div>
+          </div>
+        </div>
+
+        <div style="border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;margin-bottom:24px;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr style="background:#f9fafb;">
+                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Description</th>
+                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Payment Method</th>
+                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Status</th>
+                <th align="right" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="padding:16px;border-top:1px solid #e5e7eb;">Driver contact unlock</td>
+                <td style="padding:16px;border-top:1px solid #e5e7eb;">Stripe</td>
+                <td style="padding:16px;border-top:1px solid #e5e7eb;color:#166534;font-weight:700;">Paid</td>
+                <td align="right" style="padding:16px;border-top:1px solid #e5e7eb;font-weight:700;">${escapeHtml(amount)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;margin-bottom:20px;">
+          <div style="min-width:220px;">
+            <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;">
+              <span style="color:#6b7280;">Total</span>
+              <span style="font-weight:700;">${escapeHtml(amount)}</span>
+            </div>
+          </div>
+        </div>
+
+        ${receiptUrl ? `<div style="margin-bottom:20px;"><a href="${escapeHtml(receiptUrl)}" style="color:#2563eb;text-decoration:none;">View Stripe receipt</a></div>` : ''}
+
+        <div style="font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb;padding-top:16px;">
+          This payment has been successfully processed. Keep this email for your accounting records.
+        </div>
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
+async function renderInvoicePdf(html) {
+    const puppeteer = require('puppeteer');
+    let browser = null;
+
+    try {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+
+        const page = await browser.newPage();
+        await page.setContent(html, { waitUntil: 'networkidle0' });
+        return await page.pdf({
+            format: 'A4',
+            printBackground: true,
+            preferCSSPageSize: true,
+            margin: {
+                top: '20px',
+                right: '20px',
+                bottom: '20px',
+                left: '20px'
+            }
+        });
+    } finally {
+        if (browser) {
+            await browser.close().catch(() => {});
+        }
+    }
+}
+
+async function sendInvoiceReceiptEmail(invoiceId) {
+    if (!invoiceId) return false;
+
+    const invoiceColumns = await getTableColumns('invoices');
+    const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
+    const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+    const invoice = await db.get(`
+        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}
+        FROM invoices
+        WHERE id = ?
+    `, invoiceId);
+
+    if (!invoice || invoice.status !== 'charged') return false;
+
+    const company = await getCompanyBillingRecipient(invoice.company_id, db);
+    if (!company || !company.company_email) {
+        console.warn(`[InvoiceEmail] Missing billing email for company #${invoice?.company_id || 'unknown'} (invoice #${invoiceId})`);
+        return false;
+    }
+
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) {
+        console.warn(`[InvoiceEmail] RESEND_API_KEY missing. Skipping invoice email for #${invoiceId}`);
+        return false;
+    }
+
+    const invoiceNumber = `DF-${String(invoice.id).padStart(6, '0')}`;
+    const paidDateValue = invoice.paid_at || invoice.charged_at;
+    const amount = formatCurrency(invoice.total_cents, invoice.currency);
+    const html = buildInvoiceEmailHtml(invoice, company);
+
+    await persistInvoiceHtmlContent(invoiceId, html, db);
+
+    const textBody = [
+        `DriverFlow Payment Receipt`,
+        ``,
+        `Invoice #: ${invoiceNumber}`,
+        `Invoice Date: ${formatDate(invoice.created_at)}`,
+        `Paid Date: ${formatDate(paidDateValue)}`,
+        `Company: ${company.nombre || `Company #${company.id}`}`,
+        `Company Email: ${company.company_email}`,
+        `Payment Method: Stripe`,
+        `Status: Paid`,
+        `Description: Driver contact unlock`,
+        `Amount: ${amount}`
+    ].join('\n');
+
+    const resend = getResendClient();
+    const fromEmail = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+    const fromName = process.env.EMAIL_FROM_NAME || 'DriverFlow';
+
+    const { error } = await resend.emails.send({
+        from: `${fromName} <${fromEmail}>`,
+        to: [company.company_email],
+        subject: 'Payment Receipt – DriverFlow',
+        text: textBody,
+        html
+    });
+
+    if (error) {
+        throw new Error(`Resend Error: ${error.message || JSON.stringify(error)}`);
+    }
+
+    return true;
+}
+
 async function markInvoiceFailed(invoiceId, message, paymentIntentId = null, runner = db) {
     if (!invoiceId) return;
 
@@ -509,17 +748,20 @@ async function markInvoiceCharged(invoiceId, paymentInfo = {}, runner = db) {
 }
 
 async function reconcileChargedInvoiceForTicket(ticketId, paymentInfo = {}, runner = db, companyId = null) {
-    if (!ticketId) return null;
+    if (!ticketId) return { invoice: null, changedToCharged: false };
 
     const invoice = await fetchInvoiceByTicket(ticketId, runner, companyId);
-    if (!invoice) return null;
+    if (!invoice) return { invoice: null, changedToCharged: false };
 
     if (invoice.status !== 'charged') {
         await markInvoiceCharged(invoice.id, paymentInfo, runner);
-        return runner.get('SELECT * FROM invoices WHERE id = ?', invoice.id);
+        return {
+            invoice: await runner.get('SELECT * FROM invoices WHERE id = ?', invoice.id),
+            changedToCharged: true
+        };
     }
 
-    return invoice;
+    return { invoice, changedToCharged: false };
 }
 
 async function createInvoiceAndCharge({ companyId, amountCents, metadata = {} }) {
@@ -799,6 +1041,7 @@ const handleStripeWebhook = async (req, res) => {
     }
 
     const tx = await db.beginTransaction();
+    const invoiceReceiptEmailQueue = new Set();
     try {
         // 1. Idempotent lock: INSERT ... ON CONFLICT DO NOTHING avoids 23505/25P02
         const insertResult = await tx.run(
@@ -859,9 +1102,10 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, invoiceId);
                     console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
+                    invoiceReceiptEmailQueue.add(String(invoiceId));
                 }
             } else if (ticketId) {
-                const invoice = await reconcileChargedInvoiceForTicket(
+                const { invoice, changedToCharged } = await reconcileChargedInvoiceForTicket(
                     ticketId,
                     { paymentIntentId: piId, chargeId, receiptUrl },
                     tx,
@@ -873,6 +1117,9 @@ const handleStripeWebhook = async (req, res) => {
                 } else {
                     await markTicketPaid(ticketId, { paymentIntentId: piId }, tx);
                     console.log(`[Stripe Webhook] Reconciled PAID via Ticket Match: ticket=${ticketId}, invoice=${invoice.id}, PI=${piId}`);
+                    if (changedToCharged) {
+                        invoiceReceiptEmailQueue.add(String(invoice.id));
+                    }
                 }
             } else {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
@@ -895,6 +1142,7 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, pre.id);
                     console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
+                    invoiceReceiptEmailQueue.add(String(pre.id));
                 }
             }
         }
@@ -931,7 +1179,7 @@ const handleStripeWebhook = async (req, res) => {
                         }
                     }
 
-                    const invoice = await reconcileChargedInvoiceForTicket(
+                    const { invoice, changedToCharged } = await reconcileChargedInvoiceForTicket(
                         ticketId,
                         { paymentIntentId: piId, chargeId, receiptUrl },
                         tx,
@@ -947,10 +1195,14 @@ const handleStripeWebhook = async (req, res) => {
                     if (invoice) {
                         console.log(`[Stripe Webhook] ✅ Invoice #${invoice.id} marked CHARGED via ticket checkout (Ticket: ${ticketId}, PI: ${piId})`);
                     }
+                    if (changedToCharged && invoice) {
+                        invoiceReceiptEmailQueue.add(String(invoice.id));
+                    }
                 }
             } else if (session.metadata?.type === 'weekly_invoice' && session.metadata?.invoice_id) {
                 const invoiceId = session.metadata.invoice_id;
                 const piId = session.payment_intent || null;
+                const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
                 await tx.run(`
                     UPDATE invoices 
                     SET status='charged', stripe_payment_intent_id=COALESCE(stripe_payment_intent_id, ?),
@@ -968,7 +1220,10 @@ const handleStripeWebhook = async (req, res) => {
                     )
                 `, invoiceId);
                 console.log(`[Stripe Webhook] ✅ Invoice #${invoiceId} marked CHARGED via checkout.session.completed (PI: ${piId})`);
-                
+                if (pre && pre.status !== 'charged') {
+                    invoiceReceiptEmailQueue.add(String(invoiceId));
+                }
+
                 // --- HOOK: Push Notification ---
                 try {
                     await sendPush(session.metadata.company_id, 'empresa', "Payment Received", "Payment received successfully");
@@ -982,6 +1237,13 @@ const handleStripeWebhook = async (req, res) => {
         await tx.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=?`, event.id);
         
         await tx.commit();
+        for (const invoiceId of invoiceReceiptEmailQueue) {
+            try {
+                await sendInvoiceReceiptEmail(invoiceId);
+            } catch (emailErr) {
+                console.error(`[InvoiceEmail] Failed for invoice #${invoiceId}: ${emailErr.message}`);
+            }
+        }
         res.json({ received: true });
     } catch (err) {
         await tx.rollback();
@@ -2504,6 +2766,64 @@ app.get('/api/billing/invoices/:id', authenticateToken, async (req, res) => {
         });
     } catch (e) {
         console.error('Invoice Detail Error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/billing/invoice/:id', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const invoiceColumns = await getTableColumns('invoices');
+        const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
+        const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+        const invoice = await db.get(`
+            SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}
+            FROM invoices
+            WHERE id = ?
+        `, req.params.id);
+
+        if (!invoice) return res.status(404).json({ error: 'Not Found' });
+        if (String(invoice.company_id) !== String(req.user.id)) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (invoice.status !== 'charged') {
+            return res.status(400).json({ error: 'Invoice not paid' });
+        }
+
+        const format = String(req.query.format || 'html').toLowerCase();
+        console.log(`[InvoiceAccess] company=${req.user.id} invoice=${invoice.id} format=${format}`);
+
+        let html = invoice.html_content || null;
+        if (!html) {
+            const company = await getCompanyBillingRecipient(invoice.company_id, db);
+            if (!company) return res.status(404).json({ error: 'Company Not Found' });
+
+            html = buildInvoiceEmailHtml(invoice, company);
+        }
+
+        const extension = format === 'pdf' ? 'pdf' : 'html';
+        const invoiceFileName = `invoice-DF-${String(invoice.id).padStart(6, '0')}.${extension}`;
+        if (format === 'pdf') {
+            try {
+                const pdfBuffer = await renderInvoicePdf(html);
+                res.setHeader('Content-Type', 'application/pdf');
+                if (req.query.download === 'true') {
+                    res.setHeader('Content-Disposition', `attachment; filename=${invoiceFileName}`);
+                }
+                return res.send(pdfBuffer);
+            } catch (pdfErr) {
+                console.error(`[InvoicePDF] Failed for invoice #${invoice.id}: ${pdfErr.message}`);
+                return res.status(500).json({ error: 'Failed to generate PDF invoice' });
+            }
+        }
+
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        if (req.query.download === 'true') {
+            res.setHeader('Content-Disposition', `attachment; filename=${invoiceFileName}`);
+        }
+        return res.send(html);
+    } catch (e) {
+        console.error('Invoice HTML Error', e);
         res.status(500).json({ error: e.message });
     }
 });
