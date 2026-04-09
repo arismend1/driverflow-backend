@@ -489,8 +489,66 @@ function getInvoicePdfFileName(invoiceId) {
     return `invoice-DF-${String(invoiceId).padStart(6, '0')}.pdf`;
 }
 
+const invoicePdfJobTimers = new Map();
+const invoicePdfJobsInFlight = new Set();
+const INVOICE_PDF_JOB_MAX_ATTEMPTS = 3;
+const INVOICE_PDF_JOB_BASE_DELAY_MS = 2000;
+
+function getInvoiceStorageRoot() {
+    return process.env.INVOICE_STORAGE_DIR || process.env.PERSISTENT_STORAGE_DIR || os.tmpdir();
+}
+
+function getInvoicePdfStorageDir() {
+    return path.join(getInvoiceStorageRoot(), 'driverflow-invoices', 'pdf');
+}
+
 function getInvoicePdfStoragePath(invoiceId) {
-    return path.join(os.tmpdir(), 'driverflow-invoices', getInvoicePdfFileName(invoiceId));
+    return path.join(getInvoicePdfStorageDir(), getInvoicePdfFileName(invoiceId));
+}
+
+function getInvoicePdfJobStorageDir() {
+    return path.join(getInvoiceStorageRoot(), 'driverflow-invoices', 'jobs');
+}
+
+function getInvoicePdfJobPath(invoiceId) {
+    return path.join(getInvoicePdfJobStorageDir(), `invoice-${invoiceId}.json`);
+}
+
+async function readInvoicePdfJob(invoiceId) {
+    try {
+        const raw = await fs.promises.readFile(getInvoicePdfJobPath(invoiceId), 'utf8');
+        return JSON.parse(raw);
+    } catch (jobErr) {
+        if (jobErr.code !== 'ENOENT') {
+            console.warn(`[InvoicePDF] Unable to read job for invoice #${invoiceId}: ${jobErr.message}`);
+        }
+        return null;
+    }
+}
+
+async function writeInvoicePdfJob(invoiceId, job) {
+    await fs.promises.mkdir(getInvoicePdfJobStorageDir(), { recursive: true });
+    await fs.promises.writeFile(getInvoicePdfJobPath(invoiceId), JSON.stringify(job, null, 2), 'utf8');
+}
+
+async function deleteInvoicePdfJob(invoiceId) {
+    try {
+        await fs.promises.unlink(getInvoicePdfJobPath(invoiceId));
+    } catch (jobErr) {
+        if (jobErr.code !== 'ENOENT') {
+            console.warn(`[InvoicePDF] Unable to delete job for invoice #${invoiceId}: ${jobErr.message}`);
+        }
+    }
+}
+
+async function fileExists(filePath) {
+    if (!filePath) return false;
+    try {
+        await fs.promises.access(filePath, fs.constants.F_OK);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function resolveInvoicePdfPath(invoiceId, pdfReference = null) {
@@ -553,10 +611,17 @@ async function generateAndStoreInvoicePdf(invoiceId) {
 
     if (!invoice || invoice.status !== 'charged') return null;
 
+    const existingPdfPath = resolveInvoicePdfPath(invoiceId, invoice.pdf_url);
+    if (await fileExists(existingPdfPath)) {
+        if (invoiceColumns.pdf_url && invoice.pdf_url !== existingPdfPath) {
+            await db.run('UPDATE invoices SET pdf_url = ? WHERE id = ?', existingPdfPath, invoiceId);
+        }
+        return existingPdfPath;
+    }
+
     let html = invoice.html_content || null;
     if (!html) {
-        const company = await getCompanyBillingRecipient(invoice.company_id, db);
-        if (!company) return null;
+        const company = await getCompanyBillingRecipient(invoice.company_id, db) || {};
         html = buildInvoiceEmailHtml(invoice, company);
     }
 
@@ -570,6 +635,116 @@ async function generateAndStoreInvoicePdf(invoiceId) {
     }
 
     return pdfPath;
+}
+
+function scheduleInvoicePdfGeneration(invoiceId, delayMs = 0) {
+    if (!invoiceId) return;
+
+    const existingTimer = invoicePdfJobTimers.get(String(invoiceId));
+    if (existingTimer) {
+        clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+        invoicePdfJobTimers.delete(String(invoiceId));
+        processInvoicePdfGenerationJob(invoiceId).catch((jobErr) => {
+            console.warn(`[InvoicePDF] Job runner failed for invoice #${invoiceId}: ${jobErr.message}`);
+        });
+    }, Math.max(0, delayMs));
+
+    invoicePdfJobTimers.set(String(invoiceId), timer);
+}
+
+async function processInvoicePdfGenerationJob(invoiceId) {
+    const jobKey = String(invoiceId);
+    if (invoicePdfJobsInFlight.has(jobKey)) return false;
+
+    const job = await readInvoicePdfJob(invoiceId);
+    if (!job) return false;
+
+    const nowMs = nowEpochMs();
+    const nextRunAtMs = Number(job.nextRunAt || 0);
+    if (nextRunAtMs > nowMs) {
+        scheduleInvoicePdfGeneration(invoiceId, nextRunAtMs - nowMs);
+        return false;
+    }
+
+    invoicePdfJobsInFlight.add(jobKey);
+    try {
+        await generateAndStoreInvoicePdf(invoiceId);
+        await deleteInvoicePdfJob(invoiceId);
+        console.log(`[InvoicePDF] Job completed for invoice #${invoiceId}`);
+        return true;
+    } catch (pdfErr) {
+        const attempts = Number(job.attempts || 0) + 1;
+        if (attempts >= INVOICE_PDF_JOB_MAX_ATTEMPTS) {
+            await writeInvoicePdfJob(invoiceId, {
+                ...job,
+                invoiceId,
+                attempts,
+                status: 'failed',
+                lastError: pdfErr.message,
+                updatedAt: nowIso()
+            });
+            console.warn(`[InvoicePDF] Job failed permanently for invoice #${invoiceId}: ${pdfErr.message}`);
+            return false;
+        }
+
+        const delayMs = INVOICE_PDF_JOB_BASE_DELAY_MS * Math.pow(2, attempts - 1);
+        const nextRunAt = nowEpochMs() + delayMs;
+        await writeInvoicePdfJob(invoiceId, {
+            ...job,
+            invoiceId,
+            attempts,
+            status: 'queued',
+            lastError: pdfErr.message,
+            nextRunAt,
+            updatedAt: nowIso()
+        });
+        console.warn(`[InvoicePDF] Job retry ${attempts}/${INVOICE_PDF_JOB_MAX_ATTEMPTS} scheduled for invoice #${invoiceId} in ${delayMs}ms`);
+        scheduleInvoicePdfGeneration(invoiceId, delayMs);
+        return false;
+    } finally {
+        invoicePdfJobsInFlight.delete(jobKey);
+    }
+}
+
+async function enqueueInvoicePdfGeneration(invoiceId) {
+    if (!invoiceId) return false;
+
+    const existingJob = await readInvoicePdfJob(invoiceId);
+    const nowMs = nowEpochMs();
+    const job = {
+        invoiceId: String(invoiceId),
+        attempts: existingJob && existingJob.status === 'failed' ? 0 : Number(existingJob?.attempts || 0),
+        status: 'queued',
+        nextRunAt: nowMs,
+        createdAt: existingJob?.createdAt || nowIso(),
+        updatedAt: nowIso()
+    };
+
+    await writeInvoicePdfJob(invoiceId, job);
+    scheduleInvoicePdfGeneration(invoiceId, 0);
+    return true;
+}
+
+async function resumeInvoicePdfGenerationJobs() {
+    try {
+        await fs.promises.mkdir(getInvoicePdfJobStorageDir(), { recursive: true });
+        const entries = await fs.promises.readdir(getInvoicePdfJobStorageDir());
+        for (const entry of entries) {
+            if (!entry.endsWith('.json')) continue;
+            const match = entry.match(/^invoice-(.+)\.json$/);
+            if (!match) continue;
+            const invoiceId = match[1];
+            const job = await readInvoicePdfJob(invoiceId);
+            if (!job || job.status === 'failed') continue;
+            const delayMs = Math.max(0, Number(job.nextRunAt || 0) - nowEpochMs());
+            scheduleInvoicePdfGeneration(invoiceId, delayMs);
+        }
+    } catch (jobErr) {
+        console.warn(`[InvoicePDF] Unable to resume queued jobs: ${jobErr.message}`);
+    }
 }
 
 async function sendInvoiceReceiptEmail(invoiceId) {
@@ -1573,7 +1748,12 @@ const handleStripeWebhook = async (req, res) => {
             try {
                 await generateAndStoreInvoicePdf(invoiceId);
             } catch (pdfErr) {
-                console.warn(`[InvoicePDF] Async generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
+                console.warn(`[InvoicePDF] Immediate generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
+                try {
+                    await enqueueInvoicePdfGeneration(invoiceId);
+                } catch (enqueueErr) {
+                    console.warn(`[InvoicePDF] Failed to enqueue PDF generation for invoice #${invoiceId}: ${enqueueErr.message}`);
+                }
             }
             try {
                 await sendInvoiceReceiptEmail(invoiceId);
@@ -5530,6 +5710,7 @@ async function startServer() {
     await runPushMigration().catch(err => {
       console.error("⚠️ Migration warning:", err.message);
     });
+    await resumeInvoicePdfGenerationJobs();
     console.log("✅ Migration step finished.");
 
     app.listen(PORT, () => {
