@@ -275,6 +275,34 @@ function getInvoiceEmailLockColumn(invoiceColumns) {
     return chooseExistingColumn(invoiceColumns, ['email_sending_at', 'email_send_locked_at', 'receipt_sending_at']);
 }
 
+function getInvoiceBillingSnapshotSelects(invoiceColumns) {
+    return {
+        billingNameSelect: invoiceColumns.billing_name ? 'billing_name' : 'NULL AS billing_name',
+        billingEmailSelect: invoiceColumns.billing_email ? 'billing_email' : 'NULL AS billing_email',
+        billingPhoneSelect: invoiceColumns.billing_phone ? 'billing_phone' : 'NULL AS billing_phone',
+        billingAddressLine1Select: invoiceColumns.billing_address_line1 ? 'billing_address_line1' : 'NULL AS billing_address_line1',
+        billingAddressLine2Select: invoiceColumns.billing_address_line2 ? 'billing_address_line2' : 'NULL AS billing_address_line2',
+        billingCitySelect: invoiceColumns.billing_city ? 'billing_city' : 'NULL AS billing_city',
+        billingStateSelect: invoiceColumns.billing_state ? 'billing_state' : 'NULL AS billing_state',
+        billingPostalCodeSelect: invoiceColumns.billing_postal_code ? 'billing_postal_code' : 'NULL AS billing_postal_code',
+        billingCountrySelect: invoiceColumns.billing_country ? 'billing_country' : 'NULL AS billing_country'
+    };
+}
+
+function resolveInvoiceBillingContext(invoice, company = {}) {
+    return {
+        name: invoice.billing_name || company.legal_name || company.nombre || `Company #${invoice.company_id || company.id || 'unknown'}`,
+        email: invoice.billing_email || company.company_email || null,
+        phone: invoice.billing_phone || company.company_phone || null,
+        addressLine1: invoice.billing_address_line1 || company.address_line1 || null,
+        addressLine2: invoice.billing_address_line2 || company.address_line2 || null,
+        city: invoice.billing_city || company.city || null,
+        state: invoice.billing_state || company.state || null,
+        postalCode: invoice.billing_postal_code || company.postal_code || null,
+        country: invoice.billing_country || company.country || null
+    };
+}
+
 async function getCompanyBillingRecipient(companyId, runner = db) {
     if (!companyId) return null;
 
@@ -346,13 +374,14 @@ function buildInvoiceEmailHtml(invoice, company) {
     const paidDate = formatDate(paidDateValue);
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const supportEmail = escapeHtml(process.env.BILLING_CONTACT_EMAIL || process.env.EMAIL_FROM || 'support@driverflow.app');
-    const companyName = escapeHtml(company.legal_name || company.nombre || `Company #${company.id}`);
-    const companyEmail = escapeHtml(company.company_email || 'N/A');
-    const companyPhone = company.company_phone ? escapeHtml(company.company_phone) : null;
-    const addressLine1 = company.address_line1 ? escapeHtml(company.address_line1) : null;
-    const addressLine2 = company.address_line2 ? escapeHtml(company.address_line2) : null;
-    const locationLine = [company.city, company.state, company.postal_code].filter(Boolean).map(escapeHtml).join(', ');
-    const countryLine = company.country ? escapeHtml(company.country) : null;
+    const billing = resolveInvoiceBillingContext(invoice, company);
+    const companyName = escapeHtml(billing.name);
+    const companyEmail = escapeHtml(billing.email || 'N/A');
+    const companyPhone = billing.phone ? escapeHtml(billing.phone) : null;
+    const addressLine1 = billing.addressLine1 ? escapeHtml(billing.addressLine1) : null;
+    const addressLine2 = billing.addressLine2 ? escapeHtml(billing.addressLine2) : null;
+    const locationLine = [billing.city, billing.state, billing.postalCode].filter(Boolean).map(escapeHtml).join(', ');
+    const countryLine = billing.country ? escapeHtml(billing.country) : null;
     const receiptUrl = invoice.receipt_url ? String(invoice.receipt_url) : '';
 
     return `<!DOCTYPE html>
@@ -461,9 +490,22 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
     const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
     const emailSentAtSelect = invoiceColumns.email_sent_at ? 'email_sent_at' : 'NULL AS email_sent_at';
+    const {
+        billingNameSelect,
+        billingEmailSelect,
+        billingPhoneSelect,
+        billingAddressLine1Select,
+        billingAddressLine2Select,
+        billingCitySelect,
+        billingStateSelect,
+        billingPostalCodeSelect,
+        billingCountrySelect
+    } = getInvoiceBillingSnapshotSelects(invoiceColumns);
     const emailLockColumn = invoiceColumns.email_sent_at ? getInvoiceEmailLockColumn(invoiceColumns) : null;
     const invoice = await db.get(`
-        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${emailSentAtSelect}
+        SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}, ${emailSentAtSelect},
+               ${billingNameSelect}, ${billingEmailSelect}, ${billingPhoneSelect}, ${billingAddressLine1Select}, ${billingAddressLine2Select},
+               ${billingCitySelect}, ${billingStateSelect}, ${billingPostalCodeSelect}, ${billingCountrySelect}
         FROM invoices
         WHERE id = ?
     `, invoiceId);
@@ -496,6 +538,7 @@ async function sendInvoiceReceiptEmail(invoiceId) {
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
     const html = buildInvoiceEmailHtml(invoice, company);
     const pdfFileName = `invoice-${invoiceNumber}.pdf`;
+    const billing = resolveInvoiceBillingContext(invoice, company);
     let emailLockClaimed = false;
     let emailSentSuccessfully = false;
 
@@ -561,8 +604,8 @@ async function sendInvoiceReceiptEmail(invoiceId) {
         `Invoice #: ${invoiceNumber}`,
         `Invoice Date: ${formatDate(invoice.created_at)}`,
         `Paid Date: ${formatDate(paidDateValue)}`,
-        `Company: ${company.nombre || `Company #${company.id}`}`,
-        `Company Email: ${company.company_email}`,
+        `Company: ${billing.name}`,
+        `Company Email: ${billing.email || 'N/A'}`,
         `Payment Method: Stripe`,
         `Status: Paid`,
         `Description: Driver contact unlock`,
@@ -769,6 +812,8 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
             const instantDateRange = getInstantInvoiceDateRange();
             const insertColumns = ['company_id', 'total_cents', 'status'];
             const insertValues = [companyId, normalizedAmount, 'pending'];
+            const companyBilling = await getCompanyBillingRecipient(companyId, writeRunner);
+            const billingSnapshot = companyBilling ? resolveInvoiceBillingContext({ company_id: companyId }, companyBilling) : null;
 
             if (invoiceColumns.currency) {
                 insertColumns.push('currency');
@@ -805,6 +850,44 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
             if (invoiceColumns.updated_at) {
                 insertColumns.push('updated_at');
                 insertValues.push(createdAt);
+            }
+            if (billingSnapshot) {
+                if (invoiceColumns.billing_name) {
+                    insertColumns.push('billing_name');
+                    insertValues.push(billingSnapshot.name || null);
+                }
+                if (invoiceColumns.billing_email) {
+                    insertColumns.push('billing_email');
+                    insertValues.push(billingSnapshot.email || null);
+                }
+                if (invoiceColumns.billing_phone) {
+                    insertColumns.push('billing_phone');
+                    insertValues.push(billingSnapshot.phone || null);
+                }
+                if (invoiceColumns.billing_address_line1) {
+                    insertColumns.push('billing_address_line1');
+                    insertValues.push(billingSnapshot.addressLine1 || null);
+                }
+                if (invoiceColumns.billing_address_line2) {
+                    insertColumns.push('billing_address_line2');
+                    insertValues.push(billingSnapshot.addressLine2 || null);
+                }
+                if (invoiceColumns.billing_city) {
+                    insertColumns.push('billing_city');
+                    insertValues.push(billingSnapshot.city || null);
+                }
+                if (invoiceColumns.billing_state) {
+                    insertColumns.push('billing_state');
+                    insertValues.push(billingSnapshot.state || null);
+                }
+                if (invoiceColumns.billing_postal_code) {
+                    insertColumns.push('billing_postal_code');
+                    insertValues.push(billingSnapshot.postalCode || null);
+                }
+                if (invoiceColumns.billing_country) {
+                    insertColumns.push('billing_country');
+                    insertValues.push(billingSnapshot.country || null);
+                }
             }
 
             const placeholders = insertColumns.map(() => '?').join(', ');
@@ -2946,8 +3029,21 @@ app.get('/api/billing/invoice/:id', authenticateToken, async (req, res) => {
         const invoiceColumns = await getTableColumns('invoices');
         const chargedAtSelect = invoiceColumns.charged_at ? 'charged_at' : 'NULL AS charged_at';
         const htmlContentSelect = invoiceColumns.html_content ? 'html_content' : 'NULL AS html_content';
+        const {
+            billingNameSelect,
+            billingEmailSelect,
+            billingPhoneSelect,
+            billingAddressLine1Select,
+            billingAddressLine2Select,
+            billingCitySelect,
+            billingStateSelect,
+            billingPostalCodeSelect,
+            billingCountrySelect
+        } = getInvoiceBillingSnapshotSelects(invoiceColumns);
         const invoice = await db.get(`
-            SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect}
+            SELECT id, company_id, total_cents, currency, created_at, paid_at, ${chargedAtSelect}, receipt_url, status, ${htmlContentSelect},
+                   ${billingNameSelect}, ${billingEmailSelect}, ${billingPhoneSelect}, ${billingAddressLine1Select}, ${billingAddressLine2Select},
+                   ${billingCitySelect}, ${billingStateSelect}, ${billingPostalCodeSelect}, ${billingCountrySelect}
             FROM invoices
             WHERE id = ?
         `, req.params.id);
