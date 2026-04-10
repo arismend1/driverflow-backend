@@ -3,6 +3,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const axios = require('axios');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -498,6 +499,72 @@ function getInvoiceStorageRoot() {
     return process.env.INVOICE_STORAGE_DIR || process.env.PERSISTENT_STORAGE_DIR || os.tmpdir();
 }
 
+function isHttpUrl(value) {
+    return typeof value === 'string' && /^https?:\/\//i.test(value.trim());
+}
+
+function getS3StorageConfig() {
+    if ((process.env.STORAGE_PROVIDER || '').toLowerCase() !== 's3') return null;
+
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+    const region = process.env.AWS_REGION;
+    const bucket = process.env.AWS_S3_BUCKET;
+    if (!accessKeyId || !secretAccessKey || !region || !bucket) return null;
+
+    return {
+        accessKeyId,
+        secretAccessKey,
+        region,
+        bucket,
+        publicBaseUrl: process.env.AWS_S3_PUBLIC_BASE_URL || null
+    };
+}
+
+let s3Sdk = null;
+let s3Client = null;
+
+function getS3Sdk() {
+    if (!s3Sdk) {
+        const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+        s3Sdk = { S3Client, PutObjectCommand, GetObjectCommand };
+    }
+    return s3Sdk;
+}
+
+function getS3Client() {
+    const s3Config = getS3StorageConfig();
+    if (!s3Config) throw new Error('S3 storage not configured');
+
+    if (!s3Client) {
+        const { S3Client } = getS3Sdk();
+        s3Client = new S3Client({
+            region: s3Config.region,
+            credentials: {
+                accessKeyId: s3Config.accessKeyId,
+                secretAccessKey: s3Config.secretAccessKey
+            }
+        });
+    }
+
+    return s3Client;
+}
+
+function getInvoicePdfObjectKey(invoiceId) {
+    return `invoices/${invoiceId}/${getInvoicePdfFileName(invoiceId)}`;
+}
+
+function getS3Host(bucket, region) {
+    return region === 'us-east-1' ? `${bucket}.s3.amazonaws.com` : `${bucket}.s3.${region}.amazonaws.com`;
+}
+
+function getS3ObjectUrl(bucket, region, key, publicBaseUrl = null) {
+    if (publicBaseUrl) {
+        return `${publicBaseUrl.replace(/\/+$/, '')}/${key}`;
+    }
+    return `https://${getS3Host(bucket, region)}/${String(key).split('/').map(encodeURIComponent).join('/')}`;
+}
+
 function getInvoicePdfStorageDir() {
     return path.join(getInvoiceStorageRoot(), 'driverflow-invoices', 'pdf');
 }
@@ -551,6 +618,72 @@ async function fileExists(filePath) {
     }
 }
 
+async function storeInvoicePdfToFilesystem(invoiceId, pdfBuffer) {
+    const pdfPath = getInvoicePdfStoragePath(invoiceId);
+    await fs.promises.mkdir(path.dirname(pdfPath), { recursive: true });
+    await fs.promises.writeFile(pdfPath, pdfBuffer);
+    return pdfPath;
+}
+
+async function uploadInvoicePdfToS3(invoiceId, pdfBuffer) {
+    const s3Config = getS3StorageConfig();
+    if (!s3Config) return null;
+
+    const objectKey = getInvoicePdfObjectKey(invoiceId);
+    const { PutObjectCommand } = getS3Sdk();
+    const client = getS3Client();
+
+    await client.send(new PutObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: objectKey,
+        Body: pdfBuffer,
+        ContentType: 'application/pdf',
+        ContentDisposition: `inline; filename="${getInvoicePdfFileName(invoiceId)}"`,
+        Metadata: {
+            filename: getInvoicePdfFileName(invoiceId)
+        }
+    }));
+
+    return getS3ObjectUrl(s3Config.bucket, s3Config.region, objectKey, s3Config.publicBaseUrl);
+}
+
+async function streamToBuffer(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+}
+
+async function downloadInvoicePdfFromS3(invoiceId) {
+    const s3Config = getS3StorageConfig();
+    if (!s3Config) return null;
+
+    const objectKey = getInvoicePdfObjectKey(invoiceId);
+    const { GetObjectCommand } = getS3Sdk();
+    const client = getS3Client();
+    const response = await client.send(new GetObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: objectKey
+    }));
+
+    if (!response.Body) return null;
+    return streamToBuffer(response.Body);
+}
+
+async function storeInvoicePdf(invoiceId, pdfBuffer) {
+    const s3Config = getS3StorageConfig();
+    if (s3Config) {
+        try {
+            return await uploadInvoicePdfToS3(invoiceId, pdfBuffer);
+        } catch (s3Err) {
+            console.warn(`[InvoicePDF] S3 upload failed for invoice #${invoiceId}: ${s3Err.message}. Falling back to filesystem.`);
+        }
+    }
+
+    return storeInvoicePdfToFilesystem(invoiceId, pdfBuffer);
+}
+
 function resolveInvoicePdfPath(invoiceId, pdfReference = null) {
     if (typeof pdfReference === 'string' && pdfReference.trim()) {
         const trimmed = pdfReference.trim();
@@ -569,14 +702,39 @@ async function getStoredInvoicePdfAttachment(invoiceId, pdfReference = null) {
     if (!pdfPath) return undefined;
 
     try {
-        const pdfBuffer = await fs.promises.readFile(pdfPath);
+        let pdfBuffer;
+        if (isHttpUrl(pdfPath)) {
+            const response = await axios.get(pdfPath, {
+                responseType: 'arraybuffer',
+                timeout: 30000,
+                validateStatus: (status) => status >= 200 && status < 300
+            });
+            pdfBuffer = Buffer.from(response.data);
+        } else {
+            pdfBuffer = await fs.promises.readFile(pdfPath);
+        }
+
         return [{
             filename: getInvoicePdfFileName(invoiceId),
             content: pdfBuffer,
             content_type: 'application/pdf'
         }];
     } catch (pdfErr) {
-        if (pdfErr.code !== 'ENOENT') {
+        if (isHttpUrl(pdfPath)) {
+            try {
+                const s3PdfBuffer = await downloadInvoicePdfFromS3(invoiceId);
+                if (s3PdfBuffer) {
+                    return [{
+                        filename: getInvoicePdfFileName(invoiceId),
+                        content: s3PdfBuffer,
+                        content_type: 'application/pdf'
+                    }];
+                }
+            } catch (s3Err) {
+                console.warn(`[InvoicePDF] Unable to fetch remote PDF for invoice #${invoiceId}: ${s3Err.message}`);
+                return undefined;
+            }
+        } else if (pdfErr.code !== 'ENOENT') {
             console.warn(`[InvoicePDF] Unable to read stored PDF for invoice #${invoiceId}: ${pdfErr.message}`);
         }
         return undefined;
@@ -611,12 +769,13 @@ async function generateAndStoreInvoicePdf(invoiceId) {
 
     if (!invoice || invoice.status !== 'charged') return null;
 
-    const existingPdfPath = resolveInvoicePdfPath(invoiceId, invoice.pdf_url);
-    if (await fileExists(existingPdfPath)) {
-        if (invoiceColumns.pdf_url && invoice.pdf_url !== existingPdfPath) {
-            await db.run('UPDATE invoices SET pdf_url = ? WHERE id = ?', existingPdfPath, invoiceId);
+    const existingPdfReference = resolveInvoicePdfPath(invoiceId, invoice.pdf_url);
+    const existingPdfAttachment = await getStoredInvoicePdfAttachment(invoiceId, invoice.pdf_url);
+    if (existingPdfAttachment) {
+        if (invoiceColumns.pdf_url && invoice.pdf_url !== existingPdfReference) {
+            await db.run('UPDATE invoices SET pdf_url = ? WHERE id = ?', existingPdfReference, invoiceId);
         }
-        return existingPdfPath;
+        return existingPdfReference;
     }
 
     let html = invoice.html_content || null;
@@ -626,9 +785,7 @@ async function generateAndStoreInvoicePdf(invoiceId) {
     }
 
     const pdfBuffer = await renderInvoicePdf(html);
-    const pdfPath = getInvoicePdfStoragePath(invoiceId);
-    await fs.promises.mkdir(path.dirname(pdfPath), { recursive: true });
-    await fs.promises.writeFile(pdfPath, pdfBuffer);
+    const pdfPath = await storeInvoicePdf(invoiceId, pdfBuffer);
 
     if (invoiceColumns.pdf_url) {
         await db.run('UPDATE invoices SET pdf_url = ? WHERE id = ?', pdfPath, invoiceId);
