@@ -23,6 +23,7 @@ const { trackLeadFunnelEvent } = require('./analytics');
 const { sendPush } = require('./notifications_service');
 const runPushMigration = require('./init_push_db');
 const { getDriverLockState } = require('./lazy_matching');
+const { createInvoiceSchemaHelpers } = require('./invoice_schema_helpers');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -51,42 +52,17 @@ async function ensureStripeCustomerForCompany(company) {
     return customer.id;
 }
 
-const schemaColumnsCache = new Map();
-
-async function getTableColumns(tableName) {
-    if (schemaColumnsCache.has(tableName)) {
-        return schemaColumnsCache.get(tableName);
-    }
-
-    let columns = {};
-
-    if (db.IS_POSTGRES) {
-        const rows = await db.all(`
-            SELECT column_name, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ?
-        `, tableName);
-
-        columns = (rows || []).reduce((acc, row) => {
-            acc[row.column_name] = { notNull: row.is_nullable === 'NO' };
-            return acc;
-        }, {});
-    } else {
-        const safeTables = new Set(['invoices', 'invoice_items', 'tickets', 'empresas']);
-        if (!safeTables.has(tableName)) {
-            throw new Error(`Unsafe table lookup: ${tableName}`);
-        }
-
-        const rows = await db.all(`PRAGMA table_info(${tableName})`);
-        columns = (rows || []).reduce((acc, row) => {
-            acc[row.name] = { notNull: !!row.notnull };
-            return acc;
-        }, {});
-    }
-
-    schemaColumnsCache.set(tableName, columns);
-    return columns;
-}
+const {
+    getTableColumns,
+    updateInvoiceRetryState,
+    markInvoiceCharged,
+    markInvoiceChargedByWhereClause
+} = createInvoiceSchemaHelpers({
+    db,
+    nowIso,
+    warn: (message) => console.warn(message),
+    safeTables: ['invoices', 'invoice_items', 'tickets', 'empresas']
+});
 
 function buildBillingHttpError(httpStatus, code, message, extras = {}) {
     const err = new Error(message);
@@ -1366,51 +1342,6 @@ async function ensurePendingInvoice({ companyId, amountCents, metadata = {}, run
     return invoice;
 }
 
-async function markInvoiceCharged(invoiceId, paymentInfo = {}, runner = db) {
-    if (!invoiceId) return;
-
-    const invoiceColumns = await getTableColumns('invoices');
-    const assignments = ['status = ?'];
-    const params = ['charged'];
-
-    if (paymentInfo.paymentIntentId && invoiceColumns.stripe_payment_intent_id) {
-        assignments.push('stripe_payment_intent_id = ?');
-        params.push(paymentInfo.paymentIntentId);
-    }
-    if (paymentInfo.chargeId && invoiceColumns.stripe_charge_id) {
-        assignments.push('stripe_charge_id = ?');
-        params.push(paymentInfo.chargeId);
-    }
-    if (paymentInfo.receiptUrl && invoiceColumns.receipt_url) {
-        assignments.push('receipt_url = ?');
-        params.push(paymentInfo.receiptUrl);
-    }
-    if (invoiceColumns.paid_at) {
-        assignments.push('paid_at = ?');
-        params.push(nowIso());
-    }
-    if (invoiceColumns.paid_method) {
-        assignments.push('paid_method = ?');
-        params.push('stripe');
-    }
-    if (invoiceColumns.failure_reason) {
-        assignments.push('failure_reason = NULL');
-    }
-    if (invoiceColumns.next_retry_at) {
-        assignments.push('next_retry_at = NULL');
-    }
-    if (invoiceColumns.suspended_at) {
-        assignments.push('suspended_at = NULL');
-    }
-    if (invoiceColumns.updated_at) {
-        assignments.push('updated_at = ?');
-        params.push(nowIso());
-    }
-
-    params.push(invoiceId);
-    await runner.run(`UPDATE invoices SET ${assignments.join(', ')} WHERE id = ? AND status <> 'charged'`, ...params);
-}
-
 async function reconcileChargedInvoiceForTicket(ticketId, paymentInfo = {}, runner = db, companyId = null) {
     if (!ticketId) return { invoice: null, changedToCharged: false };
 
@@ -1749,13 +1680,11 @@ const handleStripeWebhook = async (req, res) => {
                 // Direct Reconciliation (Worker Originated)
                 const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
                 if (pre && pre.status !== 'charged') {
-                    await tx.run(`
-                        UPDATE invoices 
-                        SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=COALESCE(?, stripe_charge_id),
-                            receipt_url=COALESCE(?, receipt_url), paid_at=COALESCE(paid_at, ?), paid_method='stripe',
-                            failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
-                        WHERE id=? AND status != 'charged'
-                    `, piId, chargeId, receiptUrl, nowIso(), nowIso(), invoiceId);
+                    await markInvoiceCharged(invoiceId, {
+                        paymentIntentId: piId,
+                        chargeId,
+                        receiptUrl
+                    }, tx);
 
                     await tx.run(`
                         UPDATE tickets 
@@ -1789,13 +1718,12 @@ const handleStripeWebhook = async (req, res) => {
                 // Inverse Reconciliation (Out-of-band manual dashboard capture)
                 const pre = await tx.get("SELECT id, status FROM invoices WHERE stripe_payment_intent_id=?", piId);
                 if (pre && pre.status !== 'charged') {
-                    await tx.run(`
-                        UPDATE invoices 
-                        SET status='charged', stripe_charge_id=COALESCE(?, stripe_charge_id),
-                            receipt_url=COALESCE(?, receipt_url), paid_at=COALESCE(paid_at, ?), paid_method='stripe',
-                            failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
-                        WHERE stripe_payment_intent_id=? AND status != 'charged'
-                    `, chargeId, receiptUrl, nowIso(), nowIso(), piId);
+                    await markInvoiceChargedByWhereClause(
+                        'stripe_payment_intent_id = ? AND status <> \'charged\'',
+                        [piId],
+                        { chargeId, receiptUrl },
+                        tx
+                    );
 
                     await tx.run(`
                         UPDATE tickets 
@@ -1867,13 +1795,9 @@ const handleStripeWebhook = async (req, res) => {
                 const invoiceId = session.metadata.invoice_id;
                 const piId = session.payment_intent || null;
                 const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
-                await tx.run(`
-                    UPDATE invoices 
-                    SET status='charged', stripe_payment_intent_id=COALESCE(stripe_payment_intent_id, ?),
-                        paid_at=COALESCE(paid_at, ?), paid_method='stripe',
-                        failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL, updated_at=? 
-                    WHERE id=? AND status != 'charged'
-                `, piId, nowIso(), nowIso(), invoiceId);
+                await markInvoiceCharged(invoiceId, {
+                    paymentIntentId: piId
+                }, tx);
 
                 await tx.run(`
                     UPDATE tickets 
@@ -3220,7 +3144,13 @@ app.post('/admin/invoices/:id/retry', async (req, res) => {
         }
 
         // Set to retrying and reset next_retry_at to now for immediate pickup by Dunning loop or direct queue
-        await db.run("UPDATE invoices SET status='retrying', failure_reason=NULL, next_retry_at=?, updated_at=?, last_attempt_at=? WHERE id=?", nowIso(), nowIso(), nowIso(), invoiceId);
+        await updateInvoiceRetryState(invoiceId, {
+            status: 'retrying',
+            clearFailureReason: true,
+            nextRetryAt: nowIso(),
+            updatedAt: nowIso(),
+            lastAttemptAt: nowIso()
+        });
 
         const { enqueueJob } = require('./worker_queue');
         await enqueueJob('charge_weekly_invoice', { invoice_id: invoiceId }, { idempotency_key: `charge_${invoiceId}` });
@@ -3248,7 +3178,11 @@ app.post('/admin/invoices/:id/suspend', async (req, res) => {
 
         if (invoice.status === 'charged') return res.status(400).json({ error: 'Cannot suspend a charged invoice' });
 
-        await db.run("UPDATE invoices SET status='suspended', suspended_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await updateInvoiceRetryState(invoiceId, {
+            status: 'suspended',
+            suspendedAt: nowIso(),
+            updatedAt: nowIso()
+        });
         await auditLog('invoice_suspended_manual', 'admin', invoiceId, {}, req);
 
         res.json({ ok: true, message: 'Invoice suspended manually' });
@@ -3272,7 +3206,13 @@ app.post('/admin/invoices/:id/unsuspend', async (req, res) => {
         if (invoice.status !== 'suspended') return res.status(400).json({ error: `Invoice is not suspended (Status: ${invoice.status})` });
 
         // Set to failed/retrying with next_retry_at to NOW() so Dunning loop can pick it up
-        await db.run("UPDATE invoices SET status='retrying', suspended_at=NULL, next_retry_at=?, attempt_count=0, updated_at=? WHERE id=?", nowIso(), nowIso(), invoiceId);
+        await updateInvoiceRetryState(invoiceId, {
+            status: 'retrying',
+            clearSuspendedAt: true,
+            nextRetryAt: nowIso(),
+            attemptCount: 0,
+            updatedAt: nowIso()
+        });
 
         // Also enqueue it immediately just in case
         const { enqueueJob } = require('./worker_queue');

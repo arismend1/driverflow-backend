@@ -4,6 +4,7 @@ const db = require('./db_adapter'); // Async Adapter
 const logger = require('./logger');
 const time = require('./time_contract');
 const { getStripe } = require('./stripe_client');
+const { createInvoiceSchemaHelpers } = require('./invoice_schema_helpers');
 
 const WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 const POLL_INTERVAL = 2000;
@@ -13,6 +14,16 @@ const BATCH_SIZE = 5;
 const nowIso = () => time.nowIso({ ctx: 'worker_queue' });
 const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
 const FROM_NAME = "DriverFlow";
+const {
+    ensureInvoiceDunningRescueColumns,
+    updateInvoiceRetryState,
+    markInvoiceCharged
+} = createInvoiceSchemaHelpers({
+    db,
+    nowIso,
+    warn: (message) => logger.warn(message),
+    safeTables: ['invoices']
+});
 
 // --- ENQUEUE HELPER ---
 
@@ -498,11 +509,15 @@ const handlers = {
 
             const tx = await db.beginTransaction();
             try {
-                await tx.run(`
-                    UPDATE invoices 
-                    SET status=?, failure_reason=?, attempt_count=?, last_attempt_at=?, next_retry_at=?, suspended_at=?, updated_at=? 
-                    WHERE id=?
-                `, nextStatus, reason, newAttemptCount, nowIso(), nextRetryAt, nextStatus === 'suspended' ? nowIso() : null, nowIso(), invoice.id);
+                await updateInvoiceRetryState(invoice.id, {
+                    status: nextStatus,
+                    failureReason: reason,
+                    attemptCount: newAttemptCount,
+                    lastAttemptAt: nowIso(),
+                    nextRetryAt,
+                    suspendedAt: nextStatus === 'suspended' ? nowIso() : null,
+                    updatedAt: nowIso()
+                }, tx);
 
                 if (nextStatus === 'suspended') {
                     await tx.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
@@ -545,14 +560,15 @@ const handlers = {
             }
             const successAttempt = (invoice.attempt_count || 0) + 1;
 
-            await db.run(`
-                UPDATE invoices 
-                SET status='charged', stripe_payment_intent_id=?, stripe_charge_id=COALESCE(stripe_charge_id, ?),
-                    receipt_url=COALESCE(receipt_url, ?), paid_at=?, paid_method='stripe',
-                    failure_reason=NULL, next_retry_at=NULL, suspended_at=NULL,
-                    attempt_count=?, last_attempt_at=?, updated_at=? 
-                WHERE id=?
-            `, paymentIntent.id, chargeId, receiptUrl, nowIso(), successAttempt, nowIso(), nowIso(), invoice.id);
+            await markInvoiceCharged(invoice.id, {
+                paymentIntentId: paymentIntent.id,
+                chargeId,
+                receiptUrl,
+                paidAt: nowIso(),
+                attemptCount: successAttempt,
+                lastAttemptAt: nowIso(),
+                updatedAt: nowIso()
+            });
 
             await db.run(`
                 UPDATE tickets
@@ -593,27 +609,30 @@ async function processJobs() {
 
     // 0. Auto-Rescue Dunning (Retrying Invoices)
     try {
-        const retryingInvoices = await db.all(`
-            SELECT id FROM invoices 
-            WHERE status = 'retrying'
-              AND (next_retry_at IS NULL OR next_retry_at <= ?)
-        `, nowIso());
+        const { hasRequiredColumns } = await ensureInvoiceDunningRescueColumns();
+        if (hasRequiredColumns) {
+            const retryingInvoices = await db.all(`
+                SELECT id FROM invoices 
+                WHERE status = 'retrying'
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            `, nowIso());
 
-        for (const inv of retryingInvoices) {
-            // Check if a job already exists to avoid duplicate flooding
-            const matchQuery = db.IS_POSTGRES 
-                ? "CAST(payload_json::json->>'invoice_id' AS TEXT) = ?"
-                : "CAST(json_extract(payload_json, '$.invoice_id') AS TEXT) = ?";
+            for (const inv of retryingInvoices) {
+                // Check if a job already exists to avoid duplicate flooding
+                const matchQuery = db.IS_POSTGRES 
+                    ? "CAST(payload_json::json->>'invoice_id' AS TEXT) = ?"
+                    : "CAST(json_extract(payload_json, '$.invoice_id') AS TEXT) = ?";
 
-            const existing = await db.get(`
-                SELECT id FROM jobs_queue 
-                WHERE job_type = 'charge_weekly_invoice' 
-                  AND ${matchQuery} 
-                  AND status IN ('pending', 'processing')
-            `, String(inv.id));
+                const existing = await db.get(`
+                    SELECT id FROM jobs_queue 
+                    WHERE job_type = 'charge_weekly_invoice' 
+                      AND ${matchQuery} 
+                      AND status IN ('pending', 'processing')
+                `, String(inv.id));
 
-            if (!existing) {
-                await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+                if (!existing) {
+                    await enqueueJob('charge_weekly_invoice', { invoice_id: inv.id });
+                }
             }
         }
     } catch (e) {
@@ -762,6 +781,9 @@ async function startQueueWorker() {
                 WHERE status = 'retrying'
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
             `;
+            const { hasRequiredColumns } = await ensureInvoiceDunningRescueColumns();
+            if (!hasRequiredColumns) return;
+
             console.log("[Scheduler][Dunning] Executing query:", querySelect);
             const invoices = await db.all(querySelect, nowIso());
 
