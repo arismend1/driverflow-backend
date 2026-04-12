@@ -24,6 +24,14 @@ const { sendPush } = require('./notifications_service');
 const runPushMigration = require('./init_push_db');
 const { getDriverLockState } = require('./lazy_matching');
 const { createInvoiceSchemaHelpers } = require('./invoice_schema_helpers');
+const {
+    hasDriverReactivationTable,
+    canCreateDriverReactivationRequests,
+    runDriverReactivationStartupCompatibilityBootstrap,
+    isPendingReactivationDuplicateError,
+    getDriverReactivationContext,
+    closePriorEmploymentRelationship
+} = require('./driver_reactivation_helpers');
 
 // --- 1. BOOTSTRAP & SECURITY CHECKS ---
 validateEnv({ role: 'api' }); // Checks env vars
@@ -248,6 +256,15 @@ function getMutationCount(result) {
     if (typeof result.rowCount === 'number') return result.rowCount;
     if (typeof result.changes === 'number') return result.changes;
     return 0;
+}
+
+async function runBestEffortSideEffect(logPrefix, effect) {
+    try {
+        await effect();
+    } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        console.error(`${logPrefix} ${message}`);
+    }
 }
 
 function getInvoiceEmailLockColumn(invoiceColumns) {
@@ -3873,7 +3890,8 @@ app.get('/api/driver/search_status', authenticateToken, async (req, res) => {
     try {
         const row = await db.get("SELECT search_status FROM drivers WHERE id = ?", req.user.id);
         const status = row ? (row.search_status || 'ON') : 'ON';
-        res.json({ ok: true, status });
+        const context = await getDriverReactivationContext(db, req.user.id);
+        res.json(buildDriverReactivationPayload(status, context));
     } catch (e) {
         console.error('Error fetching driver search_status:', e.message);
         res.status(500).json({ error: 'Server Error' });
@@ -3886,10 +3904,290 @@ app.post('/api/driver/search_status', authenticateToken, async (req, res) => {
     const { status } = req.body;
     if (status !== 'ON' && status !== 'OFF') return res.status(400).json({ error: 'Invalid status' });
     try {
-        await db.run("UPDATE drivers SET search_status = ?, updated_at = ? WHERE id = ?", status, nowIso(), req.user.id);
-        res.json({ ok: true, status });
+        const current = await db.get("SELECT search_status FROM drivers WHERE id = ?", req.user.id);
+        const persistedStatus = current ? (current.search_status || 'ON') : 'ON';
+        const context = await getDriverReactivationContext(db, req.user.id);
+
+        if (status === 'ON' && context.isCurrentlyHired) {
+            return res.status(409).json({
+                ...buildDriverReactivationPayload(persistedStatus, context),
+                error: 'reactivation_confirmation_required',
+                message: !context.featureAvailable
+                    ? 'Driver reactivation is unavailable until the required schema updates are applied.'
+                    : context.reactivationStatus === 'denied_by_company'
+                    ? 'Your last hiring company reported that you still work there.'
+                    : 'Your last hiring company must confirm that you no longer work there before matching can resume.'
+            });
+        }
+        const now = nowIso();
+        if (status === 'ON') {
+            // Atomic guard against races with concurrent company denial/hiring state changes.
+            const updateResult = await db.run(`
+                UPDATE drivers
+                SET search_status = ?, updated_at = ?
+                WHERE id = ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM potential_matches pm
+                    WHERE pm.driver_id = drivers.id
+                      AND pm.status = 'HIRED'
+                  )
+            `, status, now, req.user.id);
+
+            if (getMutationCount(updateResult) !== 1) {
+                const refreshedContext = await getDriverReactivationContext(db, req.user.id);
+                const refreshedStatusRow = await db.get("SELECT search_status FROM drivers WHERE id = ?", req.user.id);
+                const refreshedStatus = refreshedStatusRow ? (refreshedStatusRow.search_status || 'ON') : 'ON';
+                return res.status(409).json({
+                    ...buildDriverReactivationPayload(refreshedStatus, refreshedContext),
+                    error: 'reactivation_confirmation_required',
+                    message: refreshedContext.reactivationStatus === 'denied_by_company'
+                        ? 'Your last hiring company reported that you still work there.'
+                        : 'Your last hiring company must confirm that you no longer work there before matching can resume.'
+                });
+            }
+            return res.json(await getFreshDriverReactivationPayload(req.user.id));
+        }
+
+        await db.run("UPDATE drivers SET search_status = ?, updated_at = ? WHERE id = ?", status, now, req.user.id);
+        res.json(await getFreshDriverReactivationPayload(req.user.id));
     } catch (e) {
         console.error('Error updating driver search_status:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.post('/api/driver/reactivation-requests', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'driver') return res.status(403).json({ error: 'Only drivers can request reactivation' });
+    try {
+        const currentStatus = await db.get("SELECT search_status FROM drivers WHERE id = ?", req.user.id);
+        const persistedStatus = currentStatus ? (currentStatus.search_status || 'ON') : 'ON';
+        const context = await getDriverReactivationContext(db, req.user.id);
+
+        if (!context.lastHire || !context.isCurrentlyHired) {
+            return res.status(409).json({
+                ...buildDriverReactivationPayload(persistedStatus, context),
+                error: 'no_current_hiring_company',
+                message: 'No active hiring company was found for this driver.'
+            });
+        }
+
+        if (context.reactivationStatus === 'pending_company_confirmation') {
+            return res.json({
+                ...buildDriverReactivationPayload(persistedStatus, context),
+                message: 'Your request is already waiting for company confirmation.'
+            });
+        }
+
+        if (context.reactivationStatus === 'denied_by_company') {
+            return res.status(409).json({
+                ...buildDriverReactivationPayload(persistedStatus, context),
+                error: 'reactivation_denied',
+                message: 'Your last hiring company reported that you still work there.'
+            });
+        }
+
+        if (!(await canCreateDriverReactivationRequests(db))) {
+            return res.status(503).json({
+                ...buildDriverReactivationPayload(persistedStatus, context),
+                ...buildDriverReactivationFeatureUnavailableError()
+            });
+        }
+
+        const requestedAt = nowIso();
+        const driverNotes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : null;
+        const tx = await db.beginTransaction();
+        let requestId = null;
+        try {
+            const insert = await tx.run(`
+                INSERT INTO driver_reactivation_requests (
+                    driver_id, company_id, match_id, status, requested_at, responded_at, company_response,
+                    driver_notes, company_notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?)
+            `, req.user.id, context.lastHire.company_id, context.lastHire.match_id, 'pending_company_confirmation', requestedAt, driverNotes, requestedAt, requestedAt);
+            requestId = insert.lastInsertRowid || null;
+
+            await tx.run("UPDATE drivers SET search_status = 'OFF', updated_at = ? WHERE id = ?", requestedAt, req.user.id);
+            await tx.commit();
+        } catch (txErr) {
+            await tx.rollback();
+            if (isPendingReactivationDuplicateError(txErr)) {
+                const refreshedContext = await getDriverReactivationContext(db, req.user.id);
+                return res.json({
+                    ...buildDriverReactivationPayload(persistedStatus, refreshedContext),
+                    message: 'Your request is already waiting for company confirmation.'
+                });
+            }
+            throw txErr;
+        }
+
+        await runBestEffortSideEffect('[ReactivationPush][Company]', async () => {
+            await sendPush(
+                context.lastHire.company_id,
+                'empresa',
+                'Driver reactivation request',
+                'A hired driver asked to appear again for new job opportunities.'
+            );
+        });
+
+        await runBestEffortSideEffect('[ReactivationAudit][Request]', async () => {
+            await auditLog(
+                'driver_reactivation_requested',
+                req.user.id,
+                requestId || context.lastHire.match_id || req.user.id,
+                {
+                    driver_id: req.user.id,
+                    company_id: context.lastHire.company_id,
+                    match_id: context.lastHire.match_id
+                },
+                req
+            );
+        });
+
+        res.json({
+            ...(await getFreshDriverReactivationPayload(req.user.id)),
+            message: 'Your request was sent to the last hiring company for confirmation.'
+        });
+    } catch (e) {
+        console.error('Error creating driver reactivation request:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.get('/api/company/reactivation-requests', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can access reactivation requests' });
+    try {
+        if (!(await hasDriverReactivationTable(db))) {
+            return res.status(503).json(buildDriverReactivationFeatureUnavailableError());
+        }
+        const scopeIds = await getCompanyScopeIds(req.user.id);
+        const scopeIn = scopeIds.map(() => '?').join(',');
+        const rows = await db.all(`
+            SELECT
+                r.id,
+                r.driver_id,
+                r.company_id,
+                r.match_id,
+                r.status,
+                r.requested_at,
+                r.responded_at,
+                r.company_response,
+                r.driver_notes,
+                d.nombre AS driver_name
+            FROM driver_reactivation_requests r
+            LEFT JOIN drivers d ON d.id = r.driver_id
+            WHERE r.company_id IN (${scopeIn})
+              AND r.status = 'pending_company_confirmation'
+            ORDER BY r.requested_at ASC, r.id ASC
+        `, ...scopeIds);
+
+        res.json({ ok: true, requests: rows || [] });
+    } catch (e) {
+        console.error('Error fetching company reactivation requests:', e.message);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.post('/api/company/reactivation-requests/:id/respond', authenticateToken, async (req, res) => {
+    if (req.user.type !== 'empresa') return res.status(403).json({ error: 'Only companies can respond to reactivation requests' });
+    const requestId = parseInt(req.params.id, 10);
+    const response = String(req.body?.response || '').trim();
+    const validResponses = ['still_employed', 'no_longer_employed'];
+    if (!Number.isFinite(requestId)) return res.status(400).json({ error: 'Invalid request id' });
+    if (!validResponses.includes(response)) return res.status(400).json({ error: 'Invalid response' });
+
+    try {
+        if (!(await hasDriverReactivationTable(db))) {
+            return res.status(503).json(buildDriverReactivationFeatureUnavailableError());
+        }
+        const scopeIds = await getCompanyScopeIds(req.user.id);
+        const scopeIn = scopeIds.map(() => '?').join(',');
+        const requestRow = await db.get(`
+            SELECT
+                r.id,
+                r.driver_id,
+                r.company_id,
+                r.match_id,
+                r.status,
+                r.requested_at,
+                d.nombre AS driver_name
+            FROM driver_reactivation_requests r
+            LEFT JOIN drivers d ON d.id = r.driver_id
+            WHERE r.id = ?
+              AND r.company_id IN (${scopeIn})
+        `, requestId, ...scopeIds);
+
+        if (!requestRow) return res.status(404).json({ error: 'Reactivation request not found' });
+
+        const respondedAt = nowIso();
+        const nextStatus = response === 'no_longer_employed' ? 'approved_by_company' : 'denied_by_company';
+        const companyNotes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : null;
+
+        const tx = await db.beginTransaction();
+        try {
+            const resolveResult = await tx.run(`
+                UPDATE driver_reactivation_requests
+                SET status = ?, responded_at = ?, company_response = ?, company_notes = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'pending_company_confirmation'
+            `, nextStatus, respondedAt, response, companyNotes, respondedAt, requestId);
+
+            if (getMutationCount(resolveResult) !== 1) {
+                await tx.rollback();
+                return res.status(409).json({ error: 'Reactivation request already resolved' });
+            }
+
+            if (response === 'no_longer_employed') {
+                await closePriorEmploymentRelationship(db, requestRow.match_id, respondedAt, tx);
+                await tx.run("UPDATE drivers SET search_status = 'ON', updated_at = ? WHERE id = ?", respondedAt, requestRow.driver_id);
+            } else {
+                await tx.run("UPDATE drivers SET search_status = 'OFF', updated_at = ? WHERE id = ?", respondedAt, requestRow.driver_id);
+            }
+
+            await tx.commit();
+        } catch (txErr) {
+            await tx.rollback();
+            throw txErr;
+        }
+
+        await runBestEffortSideEffect('[ReactivationPush][Driver]', async () => {
+            await sendPush(
+                requestRow.driver_id,
+                'driver',
+                response === 'no_longer_employed' ? 'Reactivation approved' : 'Reactivation denied',
+                response === 'no_longer_employed'
+                    ? 'Your last hiring company confirmed that you can receive new matches again.'
+                    : 'Your last hiring company reported that you still work there.'
+            );
+        });
+
+        await runBestEffortSideEffect('[ReactivationAudit][Response]', async () => {
+            await auditLog(
+                response === 'no_longer_employed' ? 'driver_reactivation_approved' : 'driver_reactivation_denied',
+                req.user.id,
+                requestId,
+                {
+                    driver_id: requestRow.driver_id,
+                    company_id: requestRow.company_id,
+                    match_id: requestRow.match_id,
+                    response
+                },
+                req
+            );
+        });
+
+        res.json({
+            ok: true,
+            request: {
+                id: requestId,
+                status: nextStatus,
+                responded_at: respondedAt,
+                company_response: response
+            },
+            driver_status: await getFreshDriverReactivationPayload(requestRow.driver_id)
+        });
+    } catch (e) {
+        console.error('Error responding to reactivation request:', e.message);
         res.status(500).json({ error: 'Server Error' });
     }
 });
@@ -4212,8 +4510,10 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
 
         console.log(`[DRIVER_PROFILE] Bridge tables updated`);
 
-        // Set search status ON instantly, don't use updated_at since it might be missing like in empresas
-        await db.run(`UPDATE drivers SET search_status = 'ON', updated_at = ? WHERE id = ?`, nowIso(), driverId);
+        // Keep hired drivers blocked from casually re-entering matching until company reactivation is approved.
+        const reactivationContext = await getDriverReactivationContext(db, driverId);
+        const nextSearchStatus = reactivationContext.isCurrentlyHired ? 'OFF' : 'ON';
+        await db.run(`UPDATE drivers SET search_status = ?, updated_at = ? WHERE id = ?`, nextSearchStatus, nowIso(), driverId);
 
         res.json({ ok: true });
     } catch (e) {
@@ -4246,9 +4546,9 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
             JOIN potential_matches pm ON t.match_id = pm.id
         `;
         if (isDriver) {
-            sql += ` WHERE t.driver_id = ? AND pm.status = 'HIRED'`;
+            sql += ` WHERE t.driver_id = ? AND (pm.status = 'HIRED' OR (pm.status = 'CLOSED' AND (pm.resolution_company = 'HIRED' OR pm.resolution_driver = 'HIRED')))`;
         } else if (isEmpresa) {
-            sql += ` WHERE t.company_id = ? AND pm.status = 'HIRED'`;
+            sql += ` WHERE t.company_id = ? AND (pm.status = 'HIRED' OR (pm.status = 'CLOSED' AND (pm.resolution_company = 'HIRED' OR pm.resolution_driver = 'HIRED')))`;
         } else {
             return res.status(403).json({ error: 'Forbidden' });
         }
@@ -4578,6 +4878,54 @@ async function getCompanyScopeIds(companyId) {
         console.error('[CompanyScope] error:', e.message);
     }
     return [companyId];
+}
+
+function buildDriverReactivationFeatureUnavailableError() {
+    return {
+        ok: false,
+        error: 'reactivation_feature_unavailable',
+        message: 'Driver reactivation is unavailable until the required schema updates are applied.'
+    };
+}
+
+async function getFreshDriverReactivationPayload(driverId) {
+    const statusRow = await db.get("SELECT search_status FROM drivers WHERE id = ?", driverId);
+    const persistedStatus = statusRow ? (statusRow.search_status || 'ON') : 'ON';
+    const context = await getDriverReactivationContext(db, driverId);
+    return buildDriverReactivationPayload(persistedStatus, context);
+}
+
+function buildDriverReactivationPayload(searchStatus, context) {
+    const effectiveStatus = context.isCurrentlyHired ? 'OFF' : (searchStatus || 'ON');
+    const request = context.latestRequest
+        ? {
+            id: context.latestRequest.id,
+            status: context.latestRequest.status,
+            requested_at: context.latestRequest.requested_at,
+            responded_at: context.latestRequest.responded_at,
+            company_response: context.latestRequest.company_response,
+            driver_notes: context.latestRequest.driver_notes || null,
+            company_notes: context.latestRequest.company_notes || null
+        }
+        : null;
+
+    return {
+        ok: true,
+        status: effectiveStatus,
+        persisted_status: searchStatus || effectiveStatus,
+        reactivation_feature_available: context.featureAvailable === true,
+        is_currently_hired: context.isCurrentlyHired,
+        can_request_reactivation: context.canRequestReactivation,
+        reactivation_status: context.reactivationStatus,
+        last_hiring_company: context.lastHire
+            ? {
+                id: context.lastHire.company_id,
+                name: context.lastHire.company_name || `Company #${context.lastHire.company_id}`,
+                match_id: context.lastHire.match_id
+            }
+            : null,
+        reactivation_request: request
+    };
 }
 
 // ─── MATCHES READER ENDPOINTS ───────────────────────────────────────────────
@@ -5806,6 +6154,9 @@ async function startServer() {
     console.log("🚀 Running push_tokens migration...");
     await runPushMigration().catch(err => {
       console.error("⚠️ Migration warning:", err.message);
+    });
+    await runDriverReactivationStartupCompatibilityBootstrap(db, console).catch(err => {
+      console.warn("[Driver Reactivation] Compatibility bootstrap warning:", err.message);
     });
     await resumeInvoicePdfGenerationJobs();
     console.log("✅ Migration step finished.");
