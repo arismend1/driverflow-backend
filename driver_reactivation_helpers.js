@@ -360,7 +360,10 @@ async function closePriorEmploymentRelationship(db, matchId, nowIsoValue, runner
 
     const result = await runner.run(`
         UPDATE potential_matches
-        SET status = 'CLOSED', updated_at = ?
+        SET status = 'CLOSED',
+            resolution_company = COALESCE(resolution_company, 'HIRED'),
+            resolution_driver = COALESCE(resolution_driver, 'HIRED'),
+            updated_at = ?
         WHERE id = ?
           AND status = 'HIRED'
     `, nowIsoValue, matchId);

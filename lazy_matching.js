@@ -23,6 +23,7 @@ const CANDIDATE_POOL_SIZE = parseInt(process.env.CANDIDATE_POOL_SIZE) || 200;
 const CANDIDATE_POOL_EXPAND = parseInt(process.env.CANDIDATE_POOL_EXPAND) || 400;
 const MIN_SCORE = 0.2;
 const EXCLUSIVE_HOURS = 72;
+const REAPPEARANCE_COOLDOWN_MONTHS = 36;
 
 // OTR eligibility config
 const OTR_POOL_REQUIRE_TRAVEL = (process.env.OTR_POOL_REQUIRE_TRAVEL || 'true') === 'true';
@@ -34,6 +35,35 @@ function addHoursToIso(baseValue, hours) {
     const baseMs = new Date(baseValue).getTime();
     if (!Number.isFinite(baseMs)) return null;
     return new Date(baseMs + hours * 3600 * 1000).toISOString();
+}
+
+function addMonthsToIso(baseValue, months) {
+    const baseDate = new Date(baseValue);
+    if (!Number.isFinite(baseDate.getTime())) return null;
+    const copy = new Date(baseDate.getTime());
+    copy.setUTCMonth(copy.getUTCMonth() + months);
+    if (!Number.isFinite(copy.getTime())) return null;
+    return copy.toISOString();
+}
+
+function getHistoricalHireClosureInfo(matchRow, nowMs = Date.now()) {
+    if (!matchRow) return null;
+    const hasHireResolution = matchRow.resolution_company === 'HIRED' || matchRow.resolution_driver === 'HIRED';
+    if (!(matchRow.status === 'CLOSED' && hasHireResolution)) return null;
+
+    const employmentEndedAt = matchRow.updated_at || matchRow.created_at || null;
+    if (!employmentEndedAt) return null;
+    const cooldownEndsAt = addMonthsToIso(employmentEndedAt, REAPPEARANCE_COOLDOWN_MONTHS);
+    if (!cooldownEndsAt) return null;
+
+    const cooldownEndsMs = new Date(cooldownEndsAt).getTime();
+    if (!Number.isFinite(cooldownEndsMs)) return null;
+
+    return {
+        employmentEndedAt,
+        cooldownEndsAt,
+        isBlocked: nowMs < cooldownEndsMs
+    };
 }
 
 async function getDriverLockState(driverId, excludeMatchId = null) {
@@ -196,7 +226,21 @@ function computeScore(co, dr) {
 async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
     try {
         const existing = await db.get(
-            'SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at FROM potential_matches WHERE company_id = ? AND driver_id = ?',
+            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, created_at, updated_at
+             FROM potential_matches
+             WHERE company_id = ? AND driver_id = ?
+             ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+             LIMIT 1`,
+            companyId, driverId
+        );
+        const latestHistoricalHireClosureRow = await db.get(
+            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, created_at, updated_at
+             FROM potential_matches
+             WHERE company_id = ? AND driver_id = ?
+               AND status = 'CLOSED'
+               AND (resolution_company = 'HIRED' OR resolution_driver = 'HIRED')
+             ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+             LIMIT 1`,
             companyId, driverId
         );
 
@@ -205,28 +249,42 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             return 'skipped';
         }
 
+        const historicalHireClosure = getHistoricalHireClosureInfo(latestHistoricalHireClosureRow);
+        if (historicalHireClosure && historicalHireClosure.isBlocked) {
+            console.log(`[Funnel] skipped by company-specific reappearance cooldown (company=${companyId}, driver=${driverId}, employment_ended_at=${historicalHireClosure.employmentEndedAt}, cooldown_ends_at=${historicalHireClosure.cooldownEndsAt})`);
+            return 'skipped';
+        }
+
+        const existingIsHistoricalHireClosure = !!(
+            existing &&
+            latestHistoricalHireClosureRow &&
+            existing.id === latestHistoricalHireClosureRow.id
+        );
+        // After cooldown, rematch must be a fresh row; never mutate historical hire closure back to NEW.
+        const candidateExisting = existingIsHistoricalHireClosure ? null : existing;
+
         // 1. Safety Rule: Do not revive if there was a manual rejection, if a historical ticket already exists, 
         // or if the pair already reached INFO_SHARED (permanent block for audit/billing integrity).
-        if (existing && (
-            (existing.status === 'CLOSED' && (existing.resolution_company || existing.resolution_driver)) ||
-            existing.ticket_id != null ||
-            existing.info_shared_at != null
+        if (candidateExisting && (
+            (candidateExisting.status === 'CLOSED' && (candidateExisting.resolution_company || candidateExisting.resolution_driver)) ||
+            candidateExisting.ticket_id != null ||
+            candidateExisting.info_shared_at != null
         )) {
             console.log('[Funnel] skipped because match was manually rejected, has ticket history, or reached INFO_SHARED');
             return 'skipped';
         }
 
-        if (existing) {
-            const isProactivelyClosed = (existing.status === 'CLOSED');
-            const wasHiredElsewhere = (existing.status === 'HIRED_ELSEWHERE');
+        if (candidateExisting) {
+            const isProactivelyClosed = (candidateExisting.status === 'CLOSED');
+            const wasHiredElsewhere = (candidateExisting.status === 'HIRED_ELSEWHERE');
 
             // BugFix: Also identify matches in an active state but older than the visibility window
-            const isStaleActive = ['NEW', 'VIEWED', 'CONTACTED', 'ACCEPTED'].includes(existing.status) &&
-                (new Date() - new Date(existing.created_at) > MATCH_FRESH_HOURS * 3600 * 1000);
+            const isStaleActive = ['NEW', 'VIEWED', 'CONTACTED', 'ACCEPTED'].includes(candidateExisting.status) &&
+                (new Date() - new Date(candidateExisting.created_at) > MATCH_FRESH_HOURS * 3600 * 1000);
 
             // 2. Freedom Check Rule: Do not interfere with active processes
             // Exclusivity window: 72 hours base + dynamic extensions
-            const freedomCheck = await getDriverLockState(driverId, existing.id);
+            const freedomCheck = await getDriverLockState(driverId, candidateExisting.id);
 
             if (isProactivelyClosed || wasHiredElsewhere || isStaleActive) {
                 if (freedomCheck.is_blocked) {
@@ -239,25 +297,26 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
 
                 if (driver && driver.search_status === 'ON') {
                     if (isStaleActive) {
-                        console.log(`[Funnel] refreshing stale active match ${existing.id}`);
+                        console.log(`[Funnel] refreshing stale active match ${candidateExisting.id}`);
                         await db.run(
                             `UPDATE potential_matches 
                              SET match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?
                              WHERE id = ?`,
-                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                            score, JSON.stringify(breakdown), nowStr, nowStr, candidateExisting.id
                         );
                         return 'updated';
                     } else {
-                        console.log(`[Funnel] reviving match ${existing.id} to NEW`);
+                        console.log(`[Funnel] reviving match ${candidateExisting.id} to NEW`);
                         await db.run(
                             `UPDATE potential_matches 
                              SET status = 'NEW', match_score = ?, score_breakdown = ?, created_at = ?, updated_at = ?,
                                  driver_step1_accepted_at = NULL, company_step1_accepted_at = NULL,
                                  driver_share_consent_at = NULL, company_share_consent_at = NULL,
+                                 info_shared_at = NULL,
                                  resolution_company = NULL, resolution_driver = NULL,
                                  exclusivity_extension_hours = 0
                              WHERE id = ?`,
-                            score, JSON.stringify(breakdown), nowStr, nowStr, existing.id
+                            score, JSON.stringify(breakdown), nowStr, nowStr, candidateExisting.id
                         );
                         return 'inserted';
                     }
@@ -267,7 +326,7 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             console.log('[Funnel] updating score for existing match');
             await db.run(
                 'UPDATE potential_matches SET match_score = ?, score_breakdown = ?, updated_at = ? WHERE id = ?',
-                score, JSON.stringify(breakdown), nowStr, existing.id
+                score, JSON.stringify(breakdown), nowStr, candidateExisting.id
             );
             return 'updated';
         } else {
