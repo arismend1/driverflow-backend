@@ -168,6 +168,30 @@ async function runDriverReactivationStartupCompatibilityBootstrap(db, logger = c
             WHERE status = 'pending_company_confirmation'
         `);
 
+        try {
+            if (db.IS_POSTGRES) {
+                await db.run('ALTER TABLE potential_matches ADD COLUMN IF NOT EXISTS employment_ended_at TEXT');
+            } else {
+                await db.run('ALTER TABLE potential_matches ADD COLUMN employment_ended_at TEXT');
+            }
+        } catch (e) {
+            if (!String(e.message).includes('duplicate') && !String(e.message).includes('already exists')) {
+                warnOnce(db, 'reactivation-col-err', logger, '[Driver Reactivation] Error adding employment_ended_at: ' + e.message);
+            }
+        }
+
+        try {
+            await db.run(`
+                UPDATE potential_matches
+                SET employment_ended_at = COALESCE(employment_ended_at, updated_at, created_at)
+                WHERE status = 'CLOSED'
+                  AND (resolution_company = 'HIRED' OR resolution_driver = 'HIRED')
+                  AND employment_ended_at IS NULL
+            `);
+        } catch (e) {
+            warnOnce(db, 'reactivation-backfill-err', logger, '[Driver Reactivation] Error backfilling employment_ended_at: ' + e.message);
+        }
+
         clearDriverReactivationSchemaState(db);
         return getDriverReactivationSchemaState(db);
     })().catch((err) => {
@@ -363,10 +387,11 @@ async function closePriorEmploymentRelationship(db, matchId, nowIsoValue, runner
         SET status = 'CLOSED',
             resolution_company = COALESCE(resolution_company, 'HIRED'),
             resolution_driver = COALESCE(resolution_driver, 'HIRED'),
+            employment_ended_at = COALESCE(employment_ended_at, ?),
             updated_at = ?
         WHERE id = ?
           AND status = 'HIRED'
-    `, nowIsoValue, matchId);
+    `, nowIsoValue, nowIsoValue, matchId);
 
     return !!((typeof result?.changes === 'number' && result.changes > 0) || (typeof result?.rowCount === 'number' && result.rowCount > 0));
 }

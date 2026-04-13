@@ -51,7 +51,10 @@ function getHistoricalHireClosureInfo(matchRow, nowMs = Date.now()) {
     const hasHireResolution = matchRow.resolution_company === 'HIRED' || matchRow.resolution_driver === 'HIRED';
     if (!(matchRow.status === 'CLOSED' && hasHireResolution)) return null;
 
-    const employmentEndedAt = matchRow.updated_at || matchRow.created_at || null;
+    const employmentEndedAt = matchRow.employment_ended_at || matchRow.updated_at || matchRow.created_at || null;
+    if (employmentEndedAt && !matchRow.employment_ended_at) {
+        console.warn(`[LazyMatch] Fallback to mutable timestamp for employment_ended_at on legacy hire closure (match_id: ${matchRow.id})`);
+    }
     if (!employmentEndedAt) return null;
     const cooldownEndsAt = addMonthsToIso(employmentEndedAt, REAPPEARANCE_COOLDOWN_MONTHS);
     if (!cooldownEndsAt) return null;
@@ -226,7 +229,7 @@ function computeScore(co, dr) {
 async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
     try {
         const existing = await db.get(
-            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, created_at, updated_at
+            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, employment_ended_at, created_at, updated_at
              FROM potential_matches
              WHERE company_id = ? AND driver_id = ?
              ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
@@ -234,7 +237,7 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
             companyId, driverId
         );
         const latestHistoricalHireClosureRow = await db.get(
-            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, created_at, updated_at
+            `SELECT id, status, resolution_company, resolution_driver, ticket_id, info_shared_at, employment_ended_at, created_at, updated_at
              FROM potential_matches
              WHERE company_id = ? AND driver_id = ?
                AND status = 'CLOSED'

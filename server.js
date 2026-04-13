@@ -4595,7 +4595,7 @@ app.post('/requests/:id/apply', (req, res) => res.status(410).json({ error: 'Dep
 
 // --- 9. STARTUP ---
 const { startQueueWorker } = require('./worker_queue');
-startQueueWorker().catch(e => console.error('Worker Start Error:', e));
+// startQueueWorker() is now invoked inside startServer() to ensure schema readiness
 
 const STARTUP_TIME = new Date().toISOString();
 console.log(`[ConsentFlow] Production startup at: ${STARTUP_TIME}`);
@@ -6160,6 +6160,9 @@ async function startServer() {
     });
     await resumeInvoicePdfGenerationJobs();
     console.log("✅ Migration step finished.");
+
+    console.log("⚙️ Starting background workers...");
+    startQueueWorker().catch(e => console.error('Worker Start Error:', e));
 
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT} [${process.env.NODE_ENV}]`);
