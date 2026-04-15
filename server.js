@@ -89,6 +89,20 @@ function buildStripeMetadata(metadata = {}) {
     }, {});
 }
 
+function getStripePublishableKey() {
+    return process.env.STRIPE_PUBLISHABLE_KEY || null;
+}
+
+function isReusablePayAndSharePaymentIntentStatus(status) {
+    return [
+        'requires_payment_method',
+        'requires_confirmation',
+        'requires_action',
+        'processing',
+        'requires_capture'
+    ].includes(String(status || '').toLowerCase());
+}
+
 function getInstantInvoiceDateRange() {
     const today = nowIso().slice(0, 10);
     return {
@@ -118,6 +132,41 @@ async function fetchInvoiceByTicket(ticketId, runner = db, companyId = null) {
 async function hasChargedInvoiceForTicket(ticketId, companyId, runner = db) {
     const invoice = await fetchInvoiceByTicket(ticketId, runner, companyId);
     return !!(invoice && invoice.status === 'charged');
+}
+
+async function unlockPendingPaywallMatchByInvoice(invoiceId, runner = db) {
+    if (!invoiceId) return null;
+
+    const blockedMatch = await runner.get(
+        `SELECT pm.id FROM potential_matches pm
+         JOIN tickets t ON t.match_id = pm.id
+         JOIN invoice_items ii ON ii.ticket_id = t.id
+         WHERE ii.invoice_id = ? AND pm.status = 'PAYMENT_REQUIRED'
+         LIMIT 1`,
+        invoiceId
+    );
+
+    if (!blockedMatch) return null;
+
+    await finalizeShare(blockedMatch.id, runner);
+    return blockedMatch.id;
+}
+
+async function unlockPendingPaywallMatchByTicket(ticketId, runner = db) {
+    if (!ticketId) return null;
+
+    const blockedMatch = await runner.get(
+        `SELECT pm.id FROM potential_matches pm
+         JOIN tickets t ON t.match_id = pm.id
+         WHERE t.id = ? AND pm.status = 'PAYMENT_REQUIRED'
+         LIMIT 1`,
+        ticketId
+    );
+
+    if (!blockedMatch) return null;
+
+    await finalizeShare(blockedMatch.id, runner);
+    return blockedMatch.id;
 }
 
 function buildLockedDriverPreviewName(row) {
@@ -1712,17 +1761,9 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, invoiceId);
                     console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
-                    // Unlock PAYMENT_REQUIRED match tied to this invoice (paywall)
-                    const blockedMatchByInvoice = await tx.get(
-                        `SELECT pm.id FROM potential_matches pm
-                         JOIN tickets t ON t.match_id = pm.id
-                         JOIN invoice_items ii ON ii.ticket_id = t.id
-                         WHERE ii.invoice_id = ? AND pm.status = 'PAYMENT_REQUIRED'
-                         LIMIT 1`, invoiceId
-                    );
-                    if (blockedMatchByInvoice) {
-                        await finalizeShare(blockedMatchByInvoice.id, tx);
-                        console.log(`[Paywall][Webhook] PAYMENT_REQUIRED -> INFO_SHARED match=${blockedMatchByInvoice.id} on invoice=${invoiceId}`);
+                    const unlockedMatchId = await unlockPendingPaywallMatchByInvoice(invoiceId, tx);
+                    if (unlockedMatchId) {
+                        console.log(`[Paywall][Webhook] PAYMENT_REQUIRED -> INFO_SHARED match=${unlockedMatchId} on invoice=${invoiceId}`);
                     }
                     invoiceReceiptEmailQueue.add(String(invoiceId));
                 }
@@ -1739,6 +1780,10 @@ const handleStripeWebhook = async (req, res) => {
                 } else {
                     await markTicketPaid(ticketId, { paymentIntentId: piId }, tx);
                     console.log(`[Stripe Webhook] Reconciled PAID via Ticket Match: ticket=${ticketId}, invoice=${invoice.id}, PI=${piId}`);
+                    const unlockedMatchId = await unlockPendingPaywallMatchByTicket(ticketId, tx);
+                    if (unlockedMatchId) {
+                        console.log(`[Paywall][Webhook] PAYMENT_REQUIRED -> INFO_SHARED match=${unlockedMatchId} on ticket=${ticketId}`);
+                    }
                     if (changedToCharged) {
                         invoiceReceiptEmailQueue.add(String(invoice.id));
                     }
@@ -1763,6 +1808,10 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, pre.id);
                     console.log(`[Stripe Webhook] Reconciled PAID via Inverse PI Match: ${piId}`);
+                    const unlockedMatchId = await unlockPendingPaywallMatchByInvoice(pre.id, tx);
+                    if (unlockedMatchId) {
+                        console.log(`[Paywall][Webhook] PAYMENT_REQUIRED -> INFO_SHARED match=${unlockedMatchId} on inverse_pi=${piId}`);
+                    }
                     invoiceReceiptEmailQueue.add(String(pre.id));
                 }
             }
@@ -5684,6 +5733,10 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
     try {
         const stripe = getStripe();
         if (!stripe) return res.status(503).json({ error: 'stripe_unavailable' });
+        const publishableKey = getStripePublishableKey();
+        if (!publishableKey) {
+            return res.status(503).json({ error: 'stripe_publishable_key_missing' });
+        }
 
         const scopeIds = await getCompanyScopeIds(req.user.id);
         const scopeIn = scopeIds.map(() => '?').join(',');
@@ -5719,15 +5772,47 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
             metadata: { ticketId, matchId, driverId: match.driver_id, companyId: match.company_id, source: 'pay_and_share' }
         });
 
-        // Create or retrieve PaymentIntent (idempotent via idempotency key)
+        if (invoice.status === 'charged') {
+            return res.status(409).json({
+                error: 'already_paid',
+                message: 'Payment already received. Waiting for unlock confirmation.',
+                match_id: matchId,
+                ticket_id: ticketId,
+                invoice_id: invoice.id,
+                status: 'PAYMENT_REQUIRED'
+            });
+        }
+
+        // Create or retrieve PaymentIntent without duplicating active live intents
         let paymentIntent;
         if (invoice.stripe_payment_intent_id) {
-            paymentIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id);
-        } else {
+            const existingIntent = await stripe.paymentIntents.retrieve(invoice.stripe_payment_intent_id);
+            if (existingIntent.status === 'succeeded') {
+                return res.status(409).json({
+                    error: 'already_paid',
+                    message: 'Payment already received. Waiting for unlock confirmation.',
+                    match_id: matchId,
+                    ticket_id: ticketId,
+                    invoice_id: invoice.id,
+                    status: 'PAYMENT_REQUIRED'
+                });
+            }
+
+            if (isReusablePayAndSharePaymentIntentStatus(existingIntent.status)) {
+                paymentIntent = existingIntent;
+            }
+        }
+
+        if (!paymentIntent) {
+            const paymentIntentIdempotencyKey = invoice.stripe_payment_intent_id
+                ? `pay_share_match_${matchId}_retry_after_${invoice.stripe_payment_intent_id}`
+                : `pay_share_match_${matchId}_invoice_${invoice.id}`;
+
             paymentIntent = await stripe.paymentIntents.create({
                 amount: price_cents,
                 currency: 'usd',
                 customer: customerId,
+                automatic_payment_methods: { enabled: true },
                 metadata: buildStripeMetadata({
                     invoice_id: invoice.id,
                     ticket_id: ticketId,
@@ -5737,7 +5822,7 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
                     source: 'pay_and_share'
                 }),
                 description: `Driver info unlock for match #${matchId}`
-            }, { idempotencyKey: `pay_share_match_${matchId}` });
+            }, { idempotencyKey: paymentIntentIdempotencyKey });
             await db.run(
                 'UPDATE invoices SET stripe_payment_intent_id = ?, updated_at = ? WHERE id = ?',
                 paymentIntent.id, now, invoice.id
@@ -5746,8 +5831,12 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
 
         console.log(`[Paywall] pay-and-share: match=${matchId} invoice=${invoice.id} pi=${paymentIntent.id} ticket=${ticketId}`);
         return res.json({
+            ok: true,
             success: true,
             client_secret: paymentIntent.client_secret,
+            publishable_key: publishableKey,
+            match_id: matchId,
+            status: 'PAYMENT_REQUIRED',
             invoice_id: invoice.id,
             ticket_id: ticketId,
             amount_cents: price_cents
