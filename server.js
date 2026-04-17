@@ -134,6 +134,32 @@ async function hasChargedInvoiceForTicket(ticketId, companyId, runner = db) {
     return !!(invoice && invoice.status === 'charged');
 }
 
+async function isCompanyContactUnlockedForTicketContext(context, runner = db) {
+    const ticketId = context && context.ticketId ? context.ticketId : null;
+    const companyId = context && context.companyId ? context.companyId : null;
+    const matchId = context && context.matchId ? context.matchId : null;
+    const driverId = context && context.driverId ? context.driverId : null;
+
+    if (!ticketId || !companyId) return false;
+
+    const ticket = await runner.get(
+        `SELECT id, company_id, match_id, driver_id, billing_status
+         FROM tickets
+         WHERE id = ? AND company_id = ?`,
+        ticketId,
+        companyId
+    );
+    if (!ticket) return false;
+    if (matchId && String(ticket.match_id) !== String(matchId)) return false;
+    if (driverId && String(ticket.driver_id) !== String(driverId)) return false;
+
+    if (ticket.billing_status === 'free_share' || ticket.billing_status === 'paid') {
+        return true;
+    }
+
+    return hasChargedInvoiceForTicket(ticketId, companyId, runner);
+}
+
 async function unlockPendingPaywallMatchByInvoice(invoiceId, runner = db) {
     if (!invoiceId) return null;
 
@@ -4620,7 +4646,12 @@ app.get('/api/tickets/my', authenticateToken, async (req, res) => {
 
         if (isEmpresa) {
             const sanitized = await Promise.all((rows || []).map(async (row) => {
-                const unlocked = await hasChargedInvoiceForTicket(row.id, req.user.id, db);
+                const unlocked = await isCompanyContactUnlockedForTicketContext({
+                    ticketId: row.id,
+                    companyId: req.user.id,
+                    matchId: row.match_id,
+                    driverId: row.driver_id
+                }, db);
                 if (!unlocked) {
                     return {
                         ...row,
@@ -5082,6 +5113,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 pm.driver_share_consent_at,
                 pm.company_share_consent_at,
                 d.id            AS driver_id,
+                COALESCE(d.nombre, '') AS driver_name,
                 COALESCE(d.nombre, '') AS display_name,
                 ${db.IS_POSTGRES ? "COALESCE(d.email, '')" : "COALESCE(d.contacto, '')"} AS driver_email,
                 COALESCE(d.experience_years, 0) AS experience_years,
@@ -5138,7 +5170,12 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 return lockDriverRow(r);
             }
 
-            const unlocked = await hasChargedInvoiceForTicket(r.ticket_id, req.user.id, db);
+            const unlocked = await isCompanyContactUnlockedForTicketContext({
+                ticketId: r.ticket_id,
+                companyId: req.user.id,
+                matchId: r.match_id,
+                driverId: r.driver_id
+            }, db);
             if (!unlocked) {
                 return lockDriverRow(r);
             }
