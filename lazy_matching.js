@@ -387,9 +387,10 @@ async function upsertMatch(companyId, driverId, score, breakdown, nowStr) {
 
 async function fetchCompanyCandidates(driver, limit, excludeIds) {
     const driverHasTruck = driver.has_truck ? 1 : 0;
+    const searchNow = nowIso();
 
     let excludeFilter = '';
-    const params = [driverHasTruck, driver.id, driver.id];
+    const params = [searchNow, driverHasTruck, driver.id, driver.id];
 
     if (excludeIds && excludeIds.length > 0) {
         excludeFilter = `AND e.id NOT IN (${excludeIds.map(() => '?').join(',')})`;
@@ -414,7 +415,7 @@ async function fetchCompanyCandidates(driver, limit, excludeIds) {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.search_status = 'ON'
-          AND (e.search_expires_at IS NULL OR e.search_expires_at > NOW())
+          AND (e.search_expires_at IS NULL OR e.search_expires_at > ?)
           AND (cr.req_truck IS NULL OR cr.req_truck = false OR ? = 1)
           AND (
               NOT EXISTS (SELECT 1 FROM company_req_operation_types WHERE company_id = e.id)
@@ -448,9 +449,11 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
     const reqTruck = company.req_truck ? 1 : 0;
     const requireTravel = OTR_POOL_REQUIRE_TRAVEL ? 1 : 0;
     const requiresImmediate = company.requires_immediate_start ? 1 : 0;
+    const searchNow = nowIso();
+    const immediateStartCutoff = new Date(Date.now() + OTR_IMMEDIATE_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
     let excludeFilter = '';
-    const params = [reqTruck, requireTravel, requiresImmediate, OTR_IMMEDIATE_DAYS,
+    const params = [searchNow, reqTruck, requireTravel, requiresImmediate, immediateStartCutoff,
         company.id, company.id, company.id, company.id];
 
     if (excludeIds && excludeIds.length > 0) {
@@ -478,13 +481,13 @@ async function fetchDriverCandidates(company, limit, excludeIds) {
                COALESCE(d.home_time_weeks, 0) AS home_time_weeks
         FROM drivers d
         WHERE d.search_status = 'ON'
-          AND (d.search_expires_at IS NULL OR d.search_expires_at > NOW())
+          AND (d.search_expires_at IS NULL OR d.search_expires_at > ?)
           AND (? = 0 OR d.has_truck = true)
           AND (? = 0 OR d.willing_to_travel = true)
           AND (
               ? = 0
               OR d.available_from_date IS NULL
-              OR d.available_from_date <= CURRENT_DATE + (? * INTERVAL '1 day')
+              OR d.available_from_date <= ?
           )
           AND (
               NOT EXISTS (SELECT 1 FROM company_req_operation_types WHERE company_id = ?)
@@ -528,14 +531,15 @@ function scorePool(candidates, scorer) {
 
 async function generateMatchesForDriver(driverId) {
     console.log(`[LazyMatch] driver #${driverId}: starting normalized candidate pool`);
+    const searchNow = nowIso();
 
     const driver = await db.get(`
         SELECT id, nombre, has_cdl, license_types, endorsements, experience_years,
                operation_types, job_preferences, has_truck, payment_methods,
                work_relationships, availability, willing_travel_interview
         FROM drivers WHERE id = ? AND search_status = 'ON'
-               AND (search_expires_at IS NULL OR search_expires_at > NOW())
-    `, driverId);
+               AND (search_expires_at IS NULL OR search_expires_at > ?)
+    `, driverId, searchNow);
 
     if (!driver) {
         console.log(`[LazyMatch] driver #${driverId}: not found or search_status != ON`);
@@ -581,6 +585,7 @@ async function generateMatchesForDriver(driverId) {
 
 async function generateMatchesForCompany(companyId) {
     console.log(`[LazyMatch] company #${companyId}: starting normalized candidate pool`);
+    const searchNow = nowIso();
 
     const company = await db.get(`
         SELECT e.id, e.nombre,
@@ -591,8 +596,8 @@ async function generateMatchesForCompany(companyId) {
         FROM empresas e
         LEFT JOIN company_requirements cr ON e.id = cr.company_id
         WHERE e.id = ? AND e.search_status = 'ON'
-          AND (e.search_expires_at IS NULL OR e.search_expires_at > NOW())
-    `, companyId);
+          AND (e.search_expires_at IS NULL OR e.search_expires_at > ?)
+    `, companyId, searchNow);
 
     if (!company) {
         console.log(`[LazyMatch] company #${companyId}: not found or search_status != ON`);

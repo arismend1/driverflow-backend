@@ -4876,7 +4876,7 @@ async function ensureUserMatchGenerationLogTable() {
             CREATE TABLE IF NOT EXISTS user_match_generation_log (
                 user_id INTEGER NOT NULL,
                 user_type TEXT NOT NULL,
-                last_generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                last_generated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         `);
         await db.run(`
@@ -5054,8 +5054,12 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 if (locked) {
                     try {
                         const { generateMatchesForCompany } = require('./lazy_matching');
-                        await generateMatchesForCompany(req.user.id);
-                        await writeGenerationLog('empresa', req.user.id);
+                        const genCount = await generateMatchesForCompany(req.user.id);
+                        if (genCount > 0) {
+                            await writeGenerationLog('empresa', req.user.id);
+                        } else {
+                            console.log(`[matches/candidates] generation produced 0 new matches — skipping cooldown write for company=${req.user.id}`);
+                        }
                     } finally {
                         await unlockUserAdvisoryLock(lockKey);
                     }
@@ -5237,13 +5241,18 @@ app.get('/matches/opportunities', authenticateToken, async (req, res) => {
                     try {
                         const { generateMatchesForDriver, generateMatchesForCompany } = require('./lazy_matching');
                         console.log(`[matches/opportunities] 4a. BEFORE generateMatchesFor${userType === 'driver' ? 'Driver' : 'Company'}`);
+                        let genCount = 0;
                         if (userType === 'driver') {
-                            await generateMatchesForDriver(userId);
+                            genCount = await generateMatchesForDriver(userId);
                         } else {
-                            await generateMatchesForCompany(userId);
+                            genCount = await generateMatchesForCompany(userId);
                         }
-                        console.log(`[matches/opportunities] 4b. AFTER generateMatchesFor${userType === 'driver' ? 'Driver' : 'Company'}`);
-                        await writeGenerationLog(userType, userId);
+                        console.log(`[matches/opportunities] 4b. AFTER generateMatchesFor${userType === 'driver' ? 'Driver' : 'Company'} genCount=${genCount}`);
+                        if (genCount > 0) {
+                            await writeGenerationLog(userType, userId);
+                        } else {
+                            console.log(`[matches/opportunities] generation produced 0 new matches — skipping cooldown write for ${userType}=${userId}`);
+                        }
                     } finally {
                         await unlockUserAdvisoryLock(lockKey);
                     }
