@@ -5776,6 +5776,8 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
     const matchId = parseInt(req.params.id, 10);
     const now = new Date().toISOString();
 
+    console.log(`[Paywall] pay-and-share entry: match=${matchId} user=${req.user.id} STRIPE_KEY=${process.env.STRIPE_SECRET_KEY ? 'SET' : 'MISSING'} PK=${process.env.STRIPE_PUBLISHABLE_KEY ? 'SET' : 'MISSING'} FEE=${process.env.WEEKLY_FEE_CENTS || 'MISSING'}`);
+
     try {
         const stripe = getStripe();
         if (!stripe) return res.status(503).json({ error: 'stripe_unavailable' });
