@@ -5859,7 +5859,6 @@ app.post('/matches/:id/pay-and-share', authenticateToken, async (req, res) => {
             paymentIntent = await stripe.paymentIntents.create({
                 amount: price_cents,
                 currency: 'usd',
-                customer: customerId,
                 automatic_payment_methods: { enabled: true },
                 metadata: buildStripeMetadata({
                     invoice_id: invoice.id,
