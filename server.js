@@ -1707,6 +1707,7 @@ console.log("[SERVER] Starting Version: 1.4.0-atomic");
 // Unified Stripe Webhook Handler
 const handleStripeWebhook = async (req, res) => {
     console.log('[WEBHOOK HIT]', req.path);
+    console.log("[WEBHOOK] received request");
     if (!checkRateLimit(req.ip, 'webhook')) return res.status(429).json({ error: 'RATE_LIMITED' });
 
     const sig = req.headers['stripe-signature'];
@@ -1717,6 +1718,7 @@ const handleStripeWebhook = async (req, res) => {
     try {
         if (!stripe || !endpointSecret) throw new Error('Config Missing');
         event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+        console.log("[WEBHOOK] event type:", event.type);
         const isTestKey = process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.includes('test');
         if (process.env.NODE_ENV === 'production' && !event.livemode && !isTestKey) {
             console.warn('[Stripe] Test event ignored in PROD');
@@ -1745,6 +1747,7 @@ const handleStripeWebhook = async (req, res) => {
 
         // 3. Invoice Payment Interception
         if (event.type === 'payment_intent.succeeded') {
+            console.log("[WEBHOOK] payment_intent.succeeded received");
             const paymentIntent = event.data.object;
             const invoiceId = paymentIntent.metadata?.invoice_id || null;
             const ticketId = paymentIntent.metadata?.ticket_id || null;
@@ -1772,6 +1775,7 @@ const handleStripeWebhook = async (req, res) => {
                 // Direct Reconciliation (Worker Originated)
                 const pre = await tx.get("SELECT status FROM invoices WHERE id=?", invoiceId);
                 if (pre && pre.status !== 'charged') {
+                    console.log("[WEBHOOK] marking invoice charged:", invoiceId);
                     await markInvoiceCharged(invoiceId, {
                         paymentIntentId: piId,
                         chargeId,
@@ -1787,6 +1791,7 @@ const handleStripeWebhook = async (req, res) => {
                         )
                     `, invoiceId);
                     console.log(`[Stripe Webhook] Reconciled PAID via metadata ID: ${invoiceId}`);
+                    console.log("[WEBHOOK] unlocking match for invoice:", invoiceId);
                     const unlockedMatchId = await unlockPendingPaywallMatchByInvoice(invoiceId, tx);
                     if (unlockedMatchId) {
                         console.log(`[Paywall][Webhook] PAYMENT_REQUIRED -> INFO_SHARED match=${unlockedMatchId} on invoice=${invoiceId}`);
@@ -5171,16 +5176,6 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
 
         const sanitized = await Promise.all(rows.map(async (r) => {
             if (r.status !== 'INFO_SHARED' && r.status !== 'HIRED') {
-                return lockDriverRow(r);
-            }
-
-            const unlocked = await isCompanyContactUnlockedForTicketContext({
-                ticketId: r.ticket_id,
-                companyId: req.user.id,
-                matchId: r.match_id,
-                driverId: r.driver_id
-            }, db);
-            if (!unlocked) {
                 return lockDriverRow(r);
             }
 
