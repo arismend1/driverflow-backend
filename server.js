@@ -2254,8 +2254,34 @@ app.get('/privacy', (req, res) => {
     `);
 });
 
+const getHeaderValue = (req, headerName) => {
+    const value = req.headers[headerName];
+    return Array.isArray(value) ? value[0] : value;
+};
+
+const requireNonProductionAdminDebugAccess = (req, res) => {
+    if (process.env.NODE_ENV === 'production') {
+        res.status(404).json({ error: 'not_found' });
+        return false;
+    }
+
+    if (!process.env.ADMIN_SECRET) {
+        res.status(503).json({ error: 'admin_secret_missing' });
+        return false;
+    }
+
+    const secret = getHeaderValue(req, 'x-admin-secret');
+    if (!secret || secret !== process.env.ADMIN_SECRET) {
+        res.status(403).json({ error: 'Forbidden' });
+        return false;
+    }
+
+    return true;
+};
+
 // Debug Endpoints (Production Diagnosis)
 app.get('/sys/debug/email-status', async (req, res) => {
+    if (!requireNonProductionAdminDebugAccess(req, res)) return;
     try {
         const events = await db.all("SELECT id, event_name, queue_status, created_at FROM events_outbox ORDER BY id DESC LIMIT 10");
         const jobs = await db.all("SELECT id, job_type, status, attempts, last_error, run_at FROM jobs_queue ORDER BY id DESC LIMIT 5");
@@ -2275,26 +2301,8 @@ app.post('/sys/debug/reset-jobs', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Temporary Diagnostic for Match Scope Fix
 app.get('/sys/debug/lux-check', async (req, res) => {
-    try {
-        const email = 'luxuryservicesfl@gmail.com';
-        const rows = await db.all(`SELECT id, nombre, contacto, created_at, account_state, verified FROM empresas WHERE LOWER(TRIM(contacto)) = LOWER(TRIM(?)) ORDER BY id ASC`, email);
-        const matchId = 136252;
-        const match = await db.get(`SELECT id, company_id, driver_id, status FROM potential_matches WHERE id = ?`, matchId);
-        res.json({
-            timestamp: nowIso(),
-            duplicate_companies: rows,
-            match_136252: match,
-            analysis: {
-                found_count: rows.length,
-                match_company_id: match ? match.company_id : null,
-                is_match_id_in_duplicates: match ? rows.some(r => r.id === match.company_id) : false
-            }
-        });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    res.status(404).json({ error: 'not_found' });
 });
 
 // --- 6. AUTHENTICATION ---
@@ -4360,11 +4368,26 @@ app.get('/api/drivers/profile', authenticateToken, async (req, res) => {
 
 // --- INTERNAL ADMIN / BANNER CONTROL ---
 
-const BANNER_TOKEN = process.env.SECURE_BANNER_TOKEN || 'DF_INTERNAL_2026';
+const BANNER_TOKEN = process.env.SECURE_BANNER_TOKEN;
+
+const requireBannerAdminToken = (req, res) => {
+    if (!BANNER_TOKEN) {
+        res.status(503).send('Banner admin token is not configured.');
+        return null;
+    }
+
+    const token = getHeaderValue(req, 'x-admin-token');
+    if (!token || token !== BANNER_TOKEN) {
+        res.status(403).send('Forbidden: Invalid Token');
+        return null;
+    }
+
+    return token;
+};
 
 app.get('/internal/banner-control', async (req, res) => {
-    const { token } = req.query;
-    if (token !== BANNER_TOKEN) return res.status(403).send('Forbidden: Invalid Token');
+    const bannerToken = requireBannerAdminToken(req, res);
+    if (!bannerToken) return;
 
     try {
         const current = await db.get(`SELECT image_url FROM driver_banner WHERE is_active = true ORDER BY updated_at DESC LIMIT 1`);
@@ -4389,12 +4412,31 @@ app.get('/internal/banner-control', async (req, res) => {
                     <div class="status">Current Banner:</div>
                     ${current ? `<img src="${current.image_url}" />` : '<p>No active banner</p>'}
                     <hr style="border: 0; border-top: 1px solid #30363d; margin: 20px 0;">
-                    <form action="/api/admin/banner?token=${token}" method="POST">
+                    <form id="banner-form">
                         <label>New Image URL:</label>
                         <input type="text" name="imageUrl" placeholder="https://..." required>
                         <button type="submit">Activate Banner</button>
                     </form>
                 </div>
+                <script>
+                    const form = document.getElementById('banner-form');
+                    form.addEventListener('submit', async (event) => {
+                        event.preventDefault();
+                        const imageUrl = form.imageUrl.value;
+                        const response = await fetch('/api/admin/banner', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'x-admin-token': '${escapeHtml(String(bannerToken))}'
+                            },
+                            body: new URLSearchParams({ imageUrl }).toString()
+                        });
+                        const html = await response.text();
+                        document.open();
+                        document.write(html);
+                        document.close();
+                    });
+                </script>
             </body>
             </html>
         `);
@@ -4405,8 +4447,8 @@ app.get('/internal/banner-control', async (req, res) => {
 
 // Endpoint to process banner update
 app.post('/api/admin/banner', async (req, res) => {
-    const { token } = req.query;
-    if (token !== BANNER_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+    const bannerToken = requireBannerAdminToken(req, res);
+    if (!bannerToken) return;
 
     const { imageUrl } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'Image URL required' });
@@ -4418,7 +4460,7 @@ app.post('/api/admin/banner', async (req, res) => {
             <div style="font-family: sans-serif; padding: 40px; background: #0d1117; color: white; text-align: center;">
                 <h2>✅ Banner Updated</h2>
                 <p>The new banner is now active in the driver app.</p>
-                <a href="/internal/banner-control?token=${token}" style="color: #58a6ff;">Return to control</a>
+                <a href="/internal/banner-control" style="color: #58a6ff;">Return to control</a>
             </div>
         `);
     } catch (e) {
@@ -4448,8 +4490,6 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
 
     const driverId = req.user.id;
     const body = req.body;
-    const { token, password, ...safePayload } = body;
-    console.log("[DRIVER_PROFILE][PUT] RECEIVED PAYLOAD:", JSON.stringify(safePayload).slice(0, 500));
 
     const {
         has_cdl, license_types, endorsements, operation_types,
@@ -4462,6 +4502,16 @@ app.put('/api/drivers/profile', authenticateToken, async (req, res) => {
         // Phase 6 media
         profile_photo_base64, license_front_base64, license_back_base64, photo_consent_at
     } = body;
+
+    console.log('[DRIVER_PROFILE][PUT] MEDIA FLAGS:', JSON.stringify({
+        driver_id: driverId,
+        has_profile_photo: !!profile_photo_base64,
+        profile_photo_len: profile_photo_base64 ? profile_photo_base64.length : 0,
+        has_license_front: !!license_front_base64,
+        license_front_len: license_front_base64 ? license_front_base64.length : 0,
+        has_license_back: !!license_back_base64,
+        license_back_len: license_back_base64 ? license_back_base64.length : 0
+    }));
 
     try {
         let sql, params;
@@ -5895,14 +5945,8 @@ app.post('/matches/:id/accept', authenticateToken, (req, res) => updateMatchStat
 // ──────────────────────────────────────────────────────────────────────────────
 
 app.post('/api/debug/sql', async (req, res) => {
-    if (process.env.NODE_ENV === 'production') {
-        return res.status(404).json({
-            error: 'not_found'
-        });
-    }
+    if (!requireNonProductionAdminDebugAccess(req, res)) return;
     console.warn('[DEBUG_SQL] Accessed in non-production environment');
-    // Only for diagnostic test purposes as specifically requested
-    if (req.body.secret !== 'surgical_evidence_123') return res.status(403).json({ error: 'unauthorized' });
     try {
         if (req.body.run_migrations) {
             console.log("Forcibly applying migrations from debug endpoint");
@@ -5925,26 +5969,17 @@ app.post('/api/debug/sql', async (req, res) => {
             return res.json({ msg: "Migrations run flawlessly" });
         }
 
-        const drivers = await db.all("SELECT id, nombre, email, contacto, phone, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
-        const empresas = await db.all("SELECT id, nombre, email, contacto, telefono, contact_phone, account_state, verified FROM empresas ORDER BY id DESC LIMIT 5");
+        const drivers = await db.all("SELECT id, nombre, verified, status FROM drivers ORDER BY id DESC LIMIT 5");
+        const empresas = await db.all("SELECT id, nombre, account_state, verified FROM empresas ORDER BY id DESC LIMIT 5");
 
         let outbox = [];
         let jobs = [];
         if (req.body.get_queues) {
-            outbox = await db.all("SELECT id,event_name,company_id,driver_id,queue_status,metadata,created_at FROM events_outbox ORDER BY id DESC LIMIT 10;");
-            jobs = await db.all("SELECT id,job_type,status,attempts,last_error,run_at FROM jobs_queue ORDER BY id DESC LIMIT 10;");
+            outbox = await db.all("SELECT id,event_name,company_id,driver_id,queue_status,created_at FROM events_outbox ORDER BY id DESC LIMIT 10;");
+            jobs = await db.all("SELECT id,job_type,status,attempts,run_at FROM jobs_queue ORDER BY id DESC LIMIT 10;");
         }
 
-        // Also retrieve the specific tokens for verification test
-        const reqEmails = req.body.emails || [];
-        const tokens = {};
-        for (let em of reqEmails) {
-            let u = await db.get("SELECT verify_token_hash FROM drivers WHERE email=?", em);
-            if (!u) u = await db.get("SELECT verify_token_hash FROM empresas WHERE email=?", em);
-            if (u) tokens[em] = u.verify_token_hash;
-        }
-
-        res.json({ drivers, empresas, tokens, outbox, jobs });
+        res.json({ drivers, empresas, outbox, jobs });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -5994,6 +6029,14 @@ app.post('/api/matches/:id/resolve', authenticateToken, async (req, res) => {
         if (req.user.type === 'driver' && match.driver_id !== req.user.id) {
             console.log(`[RESOLVE_MATCH][403] Forbidden: Driver ID mismatch. Match driver: ${match.driver_id}, Token driver: ${req.user.id}`);
             return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        if (match.status !== 'INFO_SHARED' || !match.info_shared_at || !match.ticket_id) {
+            return res.status(409).json({
+                error: 'invalid_match_state',
+                message: 'Match must be unlocked before it can be resolved.',
+                current_status: match.status
+            });
         }
 
         const now = new Date().toISOString();
