@@ -1964,24 +1964,36 @@ const handleStripeWebhook = async (req, res) => {
         await tx.run(`UPDATE stripe_webhook_events SET status='processed', processed_at=CURRENT_TIMESTAMP WHERE stripe_event_id=?`, event.id);
         
         await tx.commit();
-        for (const invoiceId of invoiceReceiptEmailQueue) {
-            try {
-                await generateAndStoreInvoicePdf(invoiceId);
-            } catch (pdfErr) {
-                console.warn(`[InvoicePDF] Immediate generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
-                try {
-                    await enqueueInvoicePdfGeneration(invoiceId);
-                } catch (enqueueErr) {
-                    console.warn(`[InvoicePDF] Failed to enqueue PDF generation for invoice #${invoiceId}: ${enqueueErr.message}`);
-                }
-            }
-            try {
-                await sendInvoiceReceiptEmail(invoiceId);
-            } catch (emailErr) {
-                console.error(`[InvoiceEmail] Failed for invoice #${invoiceId}: ${emailErr.message}`);
-            }
-        }
+        const invoiceReceiptIds = [...invoiceReceiptEmailQueue];
         res.json({ received: true });
+
+        if (invoiceReceiptIds.length > 0) {
+            console.log(`[WEBHOOK][ASYNC_RECEIPT_QUEUE] invoices=${invoiceReceiptIds.join(',')}`);
+            setImmediate(() => {
+                (async () => {
+                    console.log(`[WEBHOOK][ASYNC_RECEIPT_START] invoices=${invoiceReceiptIds.join(',')}`);
+                    for (const invoiceId of invoiceReceiptIds) {
+                        try {
+                            await generateAndStoreInvoicePdf(invoiceId);
+                        } catch (pdfErr) {
+                            console.warn(`[InvoicePDF] Async generation failed for invoice #${invoiceId}: ${pdfErr.message}`);
+                            try {
+                                await enqueueInvoicePdfGeneration(invoiceId);
+                            } catch (enqueueErr) {
+                                console.warn(`[InvoicePDF] Failed to enqueue PDF generation for invoice #${invoiceId}: ${enqueueErr.message}`);
+                            }
+                        }
+                        try {
+                            await sendInvoiceReceiptEmail(invoiceId);
+                        } catch (emailErr) {
+                            console.error(`[InvoiceEmail] Async send failed for invoice #${invoiceId}: ${emailErr.message}`);
+                        }
+                    }
+                })().catch((err) => {
+                    console.error('[WEBHOOK][ASYNC_ERROR]', err);
+                });
+            });
+        }
     } catch (err) {
         await tx.rollback();
         console.error('[Stripe Processing Error]', err);
