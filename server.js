@@ -440,83 +440,113 @@ async function persistInvoiceHtmlContent(invoiceId, html, runner = db) {
 
 function buildInvoiceEmailHtml(invoice, company) {
     const invoiceNumber = `DF-${String(invoice.id).padStart(6, '0')}`;
-    const invoiceDate = formatDate(invoice.created_at);
     const paidDateValue = invoice.paid_at || invoice.charged_at;
     const paidDate = formatDate(paidDateValue);
     const amount = formatCurrency(invoice.total_cents, invoice.currency);
-    const supportEmail = escapeHtml(process.env.BILLING_CONTACT_EMAIL || process.env.EMAIL_FROM || 'support@driverflow.app');
     const billing = resolveInvoiceBillingContext(invoice, company);
-    const companyName = escapeHtml(billing.name);
-    const companyEmail = escapeHtml(billing.email || 'N/A');
-    const companyPhone = billing.phone ? escapeHtml(billing.phone) : null;
-    const addressLine1 = billing.addressLine1 ? escapeHtml(billing.addressLine1) : null;
-    const addressLine2 = billing.addressLine2 ? escapeHtml(billing.addressLine2) : null;
-    const locationLine = [billing.city, billing.state, billing.postalCode].filter(Boolean).map(escapeHtml).join(', ');
-    const countryLine = billing.country ? escapeHtml(billing.country) : null;
+    const normalizeField = (value) => {
+        if (value === undefined || value === null) return null;
+        const normalized = String(value).trim();
+        if (!normalized) return null;
+        if (['n/a', 'na', 'null', 'undefined', 'unknown', '-'].includes(normalized.toLowerCase())) return null;
+        return normalized;
+    };
+
+    const companyNameValue = normalizeField(billing.name) || `Company #${invoice.company_id || company.id || 'unknown'}`;
+    const companyEmailValue = normalizeField(billing.email);
+    const companyPhoneValue = normalizeField(billing.phone);
+    const addressLine1Value = normalizeField(billing.addressLine1);
+    const addressLine2Value = normalizeField(billing.addressLine2);
+    const cityValue = normalizeField(billing.city);
+    const stateValue = normalizeField(billing.state);
+    const postalCodeValue = normalizeField(billing.postalCode);
+    const countryValue = normalizeField(billing.country);
+    const locationParts = [cityValue, stateValue, postalCodeValue].filter(Boolean);
+    const shouldShowAddress = !!(addressLine1Value && cityValue && stateValue && postalCodeValue);
+
+    const companyName = escapeHtml(companyNameValue);
+    const companyEmail = companyEmailValue ? escapeHtml(companyEmailValue) : null;
+    const companyPhone = companyPhoneValue ? escapeHtml(companyPhoneValue) : null;
+    const addressLine1 = shouldShowAddress ? escapeHtml(addressLine1Value) : null;
+    const addressLine2 = shouldShowAddress && addressLine2Value ? escapeHtml(addressLine2Value) : null;
+    const locationLine = shouldShowAddress ? locationParts.map(escapeHtml).join(', ') : null;
+    const countryLine = shouldShowAddress && countryValue ? escapeHtml(countryValue) : null;
     const receiptUrl = invoice.receipt_url ? String(invoice.receipt_url) : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
-  <body style="margin:0;padding:0;background:#f5f7fb;font-family:Arial,sans-serif;color:#1f2937;">
-    <div style="max-width:720px;margin:0 auto;padding:24px;">
-      <div style="background:#111827;color:#ffffff;padding:24px 28px;border-radius:16px 16px 0 0;">
-        <div style="font-size:28px;font-weight:700;">DriverFlow</div>
-        <div style="font-size:14px;opacity:0.9;margin-top:6px;">${supportEmail}</div>
+  <body style="margin:0;padding:0;background:#eef2f7;font-family:Arial,sans-serif;color:#1f2937;">
+    <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
+      <div style="background:#0f172a;color:#ffffff;padding:28px 30px;border-radius:18px 18px 0 0;">
+        <div style="font-size:30px;font-weight:700;letter-spacing:-0.02em;">DriverFlow</div>
+        <div style="font-size:22px;font-weight:700;margin-top:10px;">Payment Receipt</div>
+        <div style="font-size:15px;opacity:0.9;margin-top:6px;">Premium Driver Match Access</div>
       </div>
-      <div style="background:#ffffff;padding:28px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 16px 16px;">
-        <div style="display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:24px;">
-          <div>
-            <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Bill To</div>
-            <div style="font-size:18px;font-weight:700;margin-top:8px;">${companyName}</div>
-            <div style="font-size:14px;color:#4b5563;margin-top:4px;">${companyEmail}</div>
-            ${companyPhone ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${companyPhone}</div>` : ''}
-            ${addressLine1 ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${addressLine1}</div>` : ''}
-            ${addressLine2 ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${addressLine2}</div>` : ''}
-            ${locationLine ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${locationLine}</div>` : ''}
-            ${countryLine ? `<div style="font-size:14px;color:#4b5563;margin-top:4px;">${countryLine}</div>` : ''}
+      <div style="background:#ffffff;padding:30px;border:1px solid #dbe4ee;border-top:0;border-radius:0 0 18px 18px;">
+        <div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:24px;">
+          <div style="flex:1;min-width:170px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:16px;">
+            <div style="font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.08em;">Invoice</div>
+            <div style="font-size:20px;font-weight:700;color:#0f172a;margin-top:8px;">${escapeHtml(invoiceNumber)}</div>
           </div>
-          <div>
-            <div style="font-size:12px;text-transform:uppercase;color:#6b7280;letter-spacing:0.08em;">Invoice</div>
-            <div style="font-size:22px;font-weight:700;margin-top:8px;">${escapeHtml(invoiceNumber)}</div>
-            <div style="font-size:14px;color:#4b5563;margin-top:8px;">Invoice Date: ${escapeHtml(invoiceDate)}</div>
-            <div style="font-size:14px;color:#4b5563;margin-top:4px;">Paid Date: ${escapeHtml(paidDate)}</div>
+          <div style="flex:1;min-width:170px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:16px;">
+            <div style="font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.08em;">Paid Date</div>
+            <div style="font-size:20px;font-weight:700;color:#0f172a;margin-top:8px;">${escapeHtml(paidDate)}</div>
+          </div>
+          <div style="flex:1;min-width:170px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:16px;">
+            <div style="font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.08em;">Amount</div>
+            <div style="font-size:20px;font-weight:700;color:#0f172a;margin-top:8px;">${escapeHtml(amount)}</div>
           </div>
         </div>
 
-        <div style="border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;margin-bottom:24px;">
+        <div style="display:flex;flex-wrap:wrap;gap:24px;margin-bottom:24px;">
+          <div style="flex:1;min-width:240px;">
+            <div style="font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.08em;">Bill To</div>
+            <div style="font-size:19px;font-weight:700;color:#0f172a;margin-top:8px;">${companyName}</div>
+            ${companyEmail ? `<div style="font-size:14px;color:#475569;margin-top:6px;">${companyEmail}</div>` : ''}
+            ${companyPhone ? `<div style="font-size:14px;color:#475569;margin-top:6px;">${companyPhone}</div>` : ''}
+            ${addressLine1 ? `<div style="font-size:14px;color:#475569;margin-top:6px;">${addressLine1}</div>` : ''}
+            ${addressLine2 ? `<div style="font-size:14px;color:#475569;margin-top:4px;">${addressLine2}</div>` : ''}
+            ${locationLine ? `<div style="font-size:14px;color:#475569;margin-top:4px;">${locationLine}</div>` : ''}
+            ${countryLine ? `<div style="font-size:14px;color:#475569;margin-top:4px;">${countryLine}</div>` : ''}
+          </div>
+          <div style="flex:1;min-width:240px;">
+            <div style="font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.08em;">Service</div>
+            <div style="font-size:18px;font-weight:700;color:#0f172a;margin-top:8px;">DriverFlow Premium Driver Match Access</div>
+            <div style="font-size:14px;color:#475569;line-height:1.6;margin-top:8px;">
+              Includes access to driver contact information after mutual match confirmation.
+            </div>
+          </div>
+        </div>
+
+        <div style="border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;margin-bottom:24px;">
           <table style="width:100%;border-collapse:collapse;">
-            <thead>
-              <tr style="background:#f9fafb;">
-                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Description</th>
-                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Payment Method</th>
-                <th align="left" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Status</th>
-                <th align="right" style="padding:14px 16px;font-size:12px;text-transform:uppercase;color:#6b7280;">Amount</th>
-              </tr>
-            </thead>
             <tbody>
               <tr>
-                <td style="padding:16px;border-top:1px solid #e5e7eb;">Driver contact unlock</td>
-                <td style="padding:16px;border-top:1px solid #e5e7eb;">Stripe</td>
-                <td style="padding:16px;border-top:1px solid #e5e7eb;color:#166534;font-weight:700;">Paid</td>
-                <td align="right" style="padding:16px;border-top:1px solid #e5e7eb;font-weight:700;">${escapeHtml(amount)}</td>
+                <td style="padding:16px;border-bottom:1px solid #e2e8f0;font-size:13px;text-transform:uppercase;color:#64748b;letter-spacing:0.06em;width:35%;">Status</td>
+                <td style="padding:16px;border-bottom:1px solid #e2e8f0;font-size:15px;font-weight:700;color:#166534;">Paid</td>
+              </tr>
+              <tr>
+                <td style="padding:16px;border-bottom:1px solid #e2e8f0;font-size:13px;text-transform:uppercase;color:#64748b;letter-spacing:0.06em;">Payment Method</td>
+                <td style="padding:16px;border-bottom:1px solid #e2e8f0;font-size:15px;color:#0f172a;">Stripe</td>
+              </tr>
+              <tr>
+                <td style="padding:16px;font-size:13px;text-transform:uppercase;color:#64748b;letter-spacing:0.06em;">Amount</td>
+                <td style="padding:16px;font-size:17px;font-weight:700;color:#0f172a;">${escapeHtml(amount)}</td>
               </tr>
             </tbody>
           </table>
         </div>
 
-        <div style="display:flex;justify-content:flex-end;margin-bottom:20px;">
-          <div style="min-width:220px;">
-            <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;">
-              <span style="color:#6b7280;">Total</span>
-              <span style="font-weight:700;">${escapeHtml(amount)}</span>
-            </div>
-          </div>
-        </div>
+        ${receiptUrl ? `
+        <div style="margin-bottom:24px;">
+          <a href="${escapeHtml(receiptUrl)}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px;">
+            View Stripe receipt
+          </a>
+        </div>` : ''}
 
-        ${receiptUrl ? `<div style="margin-bottom:20px;"><a href="${escapeHtml(receiptUrl)}" style="color:#2563eb;text-decoration:none;">View Stripe receipt</a></div>` : ''}
-
-        <div style="font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb;padding-top:16px;">
-          This payment has been successfully processed. Keep this email for your accounting records.
+        <div style="font-size:13px;color:#64748b;border-top:1px solid #e5e7eb;padding-top:18px;line-height:1.7;">
+          <div>This receipt was generated by DriverFlow.</div>
+          <div>DriverFlow connects companies with qualified commercial drivers.</div>
         </div>
       </div>
     </div>
