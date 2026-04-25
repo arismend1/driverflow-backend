@@ -3,11 +3,13 @@ services:
     name: driverflow-api
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: PUPPETEER_CACHE_DIR=/opt/render/project/src/.cache/puppeteer npm install && PUPPETEER_CACHE_DIR=/opt/render/project/src/.cache/puppeteer npx puppeteer browsers install chrome
     startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/project/src/.cache/puppeteer
       - key: DATABASE_URL
         fromDatabase:
           name: driverflow-db

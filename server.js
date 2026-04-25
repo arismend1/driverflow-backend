@@ -557,9 +557,19 @@ function buildInvoiceEmailHtml(invoice, company) {
 async function renderInvoicePdf(html) {
     const puppeteer = require('puppeteer');
     let browser = null;
+    let executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || null;
+
+    if (!executablePath && typeof puppeteer.executablePath === 'function') {
+        try {
+            executablePath = puppeteer.executablePath();
+        } catch (pathErr) {
+            console.warn(`[InvoicePDF] Puppeteer executable path unavailable: ${pathErr.message}`);
+        }
+    }
 
     try {
         browser = await puppeteer.launch({
+            ...(executablePath ? { executablePath } : {}),
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
