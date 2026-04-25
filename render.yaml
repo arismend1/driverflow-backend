@@ -17,7 +17,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: STRIPE_WEBHOOK_SECRET
-        generateValue: true
+        sync: false
       - key: RUN_MIGRATIONS
         value: "true"
       - key: PORT
@@ -38,8 +38,10 @@ services:
         fromDatabase:
           name: driverflow-db
           property: connectionString
-      - key: JWT_SECRET
-        sync: false # Re-use from web if possible or generate same
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
       - key: RUN_MIGRATIONS
         value: "false"
 

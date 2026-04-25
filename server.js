@@ -4798,26 +4798,10 @@ app.get('/api/diagnostics/uptime', (req, res) => {
 });
 
 app.get('/api/diagnostics/debug-duplicates', async (req, res) => {
+    if (!requireNonProductionAdminDebugAccess(req, res)) return;
+
     try {
-        const sqlCompanies = `
-            SELECT id, nombre, contacto, created_at, account_state, verified 
-            FROM empresas 
-            WHERE contacto = 'luxuryservicesfl@gmail.com' 
-            ORDER BY id
-        `;
-        const sqlMatch = `
-            SELECT id, company_id, driver_id, status 
-            FROM potential_matches 
-            WHERE id = 136252
-        `;
-
-        const companies = await db.all(sqlCompanies);
-        const match = await db.get(sqlMatch);
-
-        res.json({
-            match_136252: match,
-            duplicate_companies: companies
-        });
+        res.status(410).json({ error: 'diagnostic_disabled' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -5473,6 +5457,17 @@ const updateMatchStatus = async (req, res, newStatus) => {
             if (!scopeIds.includes(match.company_id)) return res.status(403).json({ error: 'Unauthorized scope' });
         }
         if (userType === 'driver' && match.driver_id !== userId) return res.status(403).json({ error: 'Unauthorized driver' });
+
+        if (newStatus === 'ACCEPTED') {
+            const validAcceptStatuses = ['NEW', 'VIEWED', 'CONTACTED', 'ACCEPTED'];
+            if (!validAcceptStatuses.includes(match.status)) {
+                return res.status(409).json({
+                    error: 'invalid_match_state',
+                    message: 'Match cannot be accepted from its current state.',
+                    current_status: match.status
+                });
+            }
+        }
 
         let updateSql = 'UPDATE potential_matches SET status = ?, updated_at = ?';
         let params = [newStatus, now];
