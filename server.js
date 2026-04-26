@@ -213,6 +213,59 @@ function buildLockedDriverPreviewName(row) {
     return 'Experienced Driver';
 }
 
+function parseMaybeJsonArray(value) {
+    if (Array.isArray(value)) return value;
+    if (value === undefined || value === null || value === '') return [];
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (_) {
+            return [];
+        }
+    }
+    return [];
+}
+
+function firstNameOnly(value) {
+    if (value === undefined || value === null) return null;
+    const trimmed = String(value).trim();
+    if (!trimmed) return null;
+    return trimmed.split(/\s+/)[0] || null;
+}
+
+function buildLockedDriverProfilePayload(row) {
+    return {
+        locked: true,
+        preview: true,
+        match_id: row.match_id,
+        status: row.status,
+        first_name: firstNameOnly(row.driver_name || row.display_name),
+        city: row.driver_city || row.city || null,
+        state: row.driver_state || row.state || null,
+        experience_years: row.experience_years ?? null,
+        has_cdl: row.has_cdl,
+        license_types: parseMaybeJsonArray(row.license_types ?? row.license_summ),
+        endorsements: parseMaybeJsonArray(row.endorsements),
+        operation_types: parseMaybeJsonArray(row.operation_types ?? row.op_types),
+        trailer_experience: parseMaybeJsonArray(row.trailer_experience),
+        weekly_miles: row.weekly_miles ?? null,
+        longest_otr: row.longest_otr ?? null,
+        home_time: row.home_time ?? null,
+        availability: row.availability || null,
+        job_preferences: parseMaybeJsonArray(row.job_preferences),
+        payment_methods: parseMaybeJsonArray(row.payment_methods ?? row.pay_methods),
+        work_relationships: parseMaybeJsonArray(row.work_relationships),
+        preferred_freight: row.preferred_freight || null,
+        preferred_region: row.preferred_region || null,
+        willing_to_relocate: row.willing_to_relocate,
+        willing_travel_interview: row.willing_travel_interview,
+        has_truck: row.has_truck,
+        accidents_3y: row.accidents_3y,
+        tickets_3y: row.tickets_3y
+    };
+}
+
 async function resolvePaymentIntentCharge(stripe, paymentIntent) {
     if (!paymentIntent) return { chargeId: null, receiptUrl: null };
 
@@ -5203,13 +5256,19 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 COALESCE(d.nombre, '') AS display_name,
                 ${db.IS_POSTGRES ? "COALESCE(d.email, '')" : "COALESCE(d.contacto, '')"} AS driver_email,
                 COALESCE(d.experience_years, 0) AS experience_years,
+                COALESCE(d.license_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS license_types,
                 COALESCE(d.license_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS license_summ,
+                COALESCE(d.operation_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS operation_types,
                 COALESCE(d.operation_types, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS op_types,
+                COALESCE(d.payment_methods, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS payment_methods,
                 COALESCE(d.payment_methods, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS pay_methods,
+                COALESCE(d.job_preferences, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS job_preferences,
+                COALESCE(d.work_relationships, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS work_relationships,
                 COALESCE(d.availability, '') AS availability,
                 d.city AS driver_city,
                 d.state AS driver_state,
                 d.phone AS driver_phone,
+                COALESCE(d.has_truck, ${db.IS_POSTGRES ? 'false' : '0'}) AS has_truck,
                 d.weekly_miles,
                 d.longest_otr,
                 COALESCE(d.trailer_experience, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS trailer_experience,
@@ -5219,6 +5278,7 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
                 d.preferred_freight,
                 d.preferred_region,
                 ${db.IS_POSTGRES ? 'd.willing_to_relocate' : 'COALESCE(d.willing_to_relocate, 0)'} AS willing_to_relocate,
+                ${db.IS_POSTGRES ? 'd.willing_travel_interview' : 'COALESCE(d.willing_travel_interview, 0)'} AS willing_travel_interview,
                 d.driver_bio,
                 COALESCE(d.has_cdl, ${db.IS_POSTGRES ? 'false' : '0'}) AS has_cdl,
                 COALESCE(d.endorsements, ${db.IS_POSTGRES ? "'[]'::jsonb" : "'[]'"}) AS endorsements,
@@ -5233,27 +5293,9 @@ app.get('/matches/candidates', authenticateToken, async (req, res) => {
             ORDER BY pm.created_at DESC
         `, ...scopeIds);
 
-        const lockDriverRow = (row) => {
-            return {
-                ...row,
-                locked: true,
-                preview: true,
-                display_name: buildLockedDriverPreviewName(row),
-                driver_name: null,
-                driver_email: null,
-                driver_phone: null,
-                driver_city: null,
-                driver_state: null,
-                driver_bio: null,
-                profile_photo_base64: null,
-                license_front_base64: null,
-                license_back_base64: null
-            };
-        };
-
         const sanitized = await Promise.all(rows.map(async (r) => {
             if (r.status !== 'INFO_SHARED' && r.status !== 'HIRED') {
-                return lockDriverRow(r);
+                return buildLockedDriverProfilePayload(r);
             }
 
             return { ...r, locked: false, preview: false };
