@@ -11,7 +11,7 @@
     "start:worker": "node worker_queue.js",
     "migrate:push": "node init_push_db.js",
     "migrate": "node migrate_auth_fix.js",
-    "test": "node --test \"tests/**/*.test.js\"",
+    "test": "jest --runInBand",
     "test:match": "node --test tests/match_confirmed.test.js",
     "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\""
   },
@@ -31,5 +31,9 @@
     "pg": "^8.13.1",
     "puppeteer": "^24.40.0",
     "resend": "^6.9.3"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "supertest": "^7.2.2"
   }
 }
