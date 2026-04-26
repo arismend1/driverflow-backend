@@ -19,7 +19,7 @@ services:
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
       - key: RUN_MIGRATIONS
-        value: "true"
+        value: "false"
       - key: PORT
         value: "10000"
       - key: ALLOWED_ORIGINS

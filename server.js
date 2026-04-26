@@ -2141,6 +2141,8 @@ app.get('/admin/analytics/funnel', async (req, res) => {
     if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden: Invalid Admin Secret' });
 
     try {
+        const requestedDays = req.query.days === undefined ? 7 : Number(req.query.days);
+        const days = Number.isInteger(requestedDays) && requestedDays > 0 ? requestedDays : 7;
         const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
         const baseQuery = `SELECT event_type, COUNT(*) as count FROM lead_funnel_events`;
         const filter = !isNaN(days) && days > 0 ? `WHERE created_at > ?` : '';
@@ -2332,10 +2334,9 @@ app.get('/sys/debug/email-status', async (req, res) => {
 });
 
 app.post('/sys/debug/reset-jobs', async (req, res) => {
-    try {
-        const secret = req.headers['x-admin-secret'];
-        if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+    if (!requireNonProductionAdminDebugAccess(req, res)) return;
 
+    try {
         await db.run("UPDATE jobs_queue SET status='pending', attempts=0 WHERE status = 'failed'");
         // Also reset stuck outbox events
         await db.run("UPDATE events_outbox SET queue_status='pending' WHERE queue_status = 'failed'");
@@ -6214,8 +6215,8 @@ app.get('/api/admin/invoices', requireAdmin, async (req, res) => {
         
         // Exact JSON matching based on engine to prevent false matches (e.g. 12 matching 112)
         const joinCondition = db.IS_POSTGRES 
-            ? "CAST(j.payload::json->>'invoice_id' AS TEXT) = CAST(i.id AS TEXT)"
-            : "CAST(json_extract(j.payload, '$.invoice_id') AS TEXT) = CAST(i.id AS TEXT)";
+            ? "CAST(j.payload_json::json->>'invoice_id' AS TEXT) = CAST(i.id AS TEXT)"
+            : "CAST(json_extract(j.payload_json, '$.invoice_id') AS TEXT) = CAST(i.id AS TEXT)";
 
         const rows = await db.all(`
             SELECT 
@@ -6227,7 +6228,7 @@ app.get('/api/admin/invoices', requireAdmin, async (req, res) => {
                     ORDER BY j.id DESC LIMIT 1
                 ), 0) as attempts,
                 (
-                    SELECT j.run_after 
+                    SELECT j.run_at 
                     FROM jobs_queue j 
                     WHERE j.job_type = 'charge_weekly_invoice' AND ${joinCondition}
                     ORDER BY j.id DESC LIMIT 1
@@ -6247,7 +6248,7 @@ app.post('/api/admin/invoices/:id/retry', requireAdmin, async (req, res) => {
         const inv = await db.get("SELECT id FROM invoices WHERE id = ?", invoiceId);
         if (!inv) return res.status(404).json({ error: 'Invoice not found' });
         
-        await db.run("INSERT INTO jobs_queue (job_type, payload, status, attempts, run_after, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?, ?)",
+        await db.run("INSERT INTO jobs_queue (job_type, payload_json, status, attempts, run_at, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?, ?)",
             'charge_weekly_invoice', JSON.stringify({ invoice_id: invoiceId, admin_forced: true }), nowIso(), nowIso(), nowIso()
         );
         
@@ -6266,7 +6267,10 @@ app.post('/api/admin/companies/:id/unsuspend', requireAdmin, async (req, res) =>
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-if (process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1') {
+const shouldRunStartupMigrations = process.env.RUN_MIGRATIONS === 'true' || process.env.RUN_MIGRATIONS === '1';
+if (shouldRunStartupMigrations && process.env.NODE_ENV === 'production') {
+    console.warn('[Migrations] RUN_MIGRATIONS ignored in production. Run migrations manually.');
+} else if (shouldRunStartupMigrations) {
     const { execSync } = require('child_process');
     console.log("--- Starting Consolidated Auto-Migrations ---");
     try {
