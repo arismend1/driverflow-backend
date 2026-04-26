@@ -240,9 +240,14 @@ function buildLockedDriverProfilePayload(row) {
         preview: true,
         match_id: row.match_id,
         status: row.status,
-        first_name: firstNameOnly(row.driver_name || row.display_name),
-        city: row.driver_city || row.city || null,
-        state: row.driver_state || row.state || null,
+        first_name: firstNameOnly(
+            row.first_name ||
+            row.driver_first_name ||
+            row.driver_name ||
+            row.display_name
+        ),
+        city: row.city || row.driver_city || null,
+        state: row.state || row.driver_state || null,
         experience_years: row.experience_years ?? null,
         has_cdl: row.has_cdl,
         license_types: parseMaybeJsonArray(row.license_types ?? row.license_summ),
