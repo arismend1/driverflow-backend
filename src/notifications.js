@@ -1,4 +1,9 @@
-const logger = require('./logger');
+let logger = console;
+try {
+    logger = require('../logger');
+} catch (err) {
+    console.warn(`[Notifications] Logger unavailable, using console fallback: ${err.message}`);
+}
 
 /**
  * Stub Notification System for Dunning (Phase 14)
