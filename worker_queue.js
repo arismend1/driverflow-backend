@@ -15,6 +15,7 @@ const nowIso = () => time.nowIso({ ctx: 'worker_queue' });
 const API_URL = process.env.API_URL || "https://driverflow-backend.onrender.com";
 const FROM_NAME = "DriverFlow";
 const {
+    getTableColumns,
     ensureInvoiceDunningRescueColumns,
     updateInvoiceRetryState,
     markInvoiceCharged
@@ -22,8 +23,159 @@ const {
     db,
     nowIso,
     warn: (message) => logger.warn(message),
-    safeTables: ['invoices']
+    safeTables: ['invoices', 'empresas']
 });
+
+let billingNotifications = {};
+try {
+    billingNotifications = require('./src/notifications');
+} catch (err) {
+    logger.warn(`[Billing Notify] Notifications module unavailable: ${err.message}`);
+}
+
+async function notifyPaymentFailedSafe(invoice, attempt, maxAttempts, errorMsg) {
+    if (typeof billingNotifications.notifyPaymentFailed !== 'function') {
+        logger.warn(`[Billing Notify] notifyPaymentFailed unavailable for invoice ${invoice?.id || 'unknown'}`);
+        return;
+    }
+
+    try {
+        await billingNotifications.notifyPaymentFailed(invoice, attempt, maxAttempts, errorMsg);
+    } catch (err) {
+        logger.warn(`[Billing Notify] notifyPaymentFailed failed for invoice ${invoice?.id || 'unknown'}: ${err.message}`);
+    }
+}
+
+async function notifyPaymentSuspendedSafe(invoice) {
+    if (typeof billingNotifications.notifyPaymentSuspended !== 'function') {
+        logger.warn(`[Billing Notify] notifyPaymentSuspended unavailable for invoice ${invoice?.id || 'unknown'}`);
+        return;
+    }
+
+    try {
+        await billingNotifications.notifyPaymentSuspended(invoice);
+    } catch (err) {
+        logger.warn(`[Billing Notify] notifyPaymentSuspended failed for invoice ${invoice?.id || 'unknown'}: ${err.message}`);
+    }
+}
+
+async function getUsablePaymentMethodForCustomer(stripe, customerId) {
+    if (!stripe || !customerId) return null;
+
+    const customer = await stripe.customers.retrieve(customerId, {
+        expand: ['invoice_settings.default_payment_method']
+    });
+
+    const defaultPm = customer?.invoice_settings?.default_payment_method;
+    if (defaultPm) {
+        return typeof defaultPm === 'string' ? defaultPm : defaultPm.id || null;
+    }
+
+    const paymentMethods = await stripe.paymentMethods.list({
+        customer: customerId,
+        type: 'card',
+        limit: 1
+    });
+
+    return paymentMethods?.data?.[0]?.id || null;
+}
+
+async function resolveOffSessionPaymentMethod(stripe, invoice) {
+    if (invoice?.company_stripe_payment_method_id) {
+        return invoice.company_stripe_payment_method_id;
+    }
+
+    if (invoice?.stripe_customer_id) {
+        return await getUsablePaymentMethodForCustomer(stripe, invoice.stripe_customer_id);
+    }
+
+    return null;
+}
+
+async function finalizeChargeFailure(invoice, {
+    reason,
+    stripeCode = 'unknown',
+    errorType = null,
+    maxAttempts = 3,
+    forceStatus = null
+}) {
+    const invoiceColumns = await getTableColumns('invoices');
+    const newAttemptCount = (invoice.attempt_count || 0) + 1;
+    const isRetryable = errorType === 'StripeCardError' ||
+        ['StripeConnectionError', 'StripeAPIError'].includes(errorType);
+    let nextStatus = 'failed';
+
+    if (forceStatus) {
+        nextStatus = forceStatus;
+    } else if (newAttemptCount >= maxAttempts) {
+        nextStatus = 'suspended';
+    } else if (isRetryable) {
+        nextStatus = 'retrying';
+    }
+
+    const delaySec = 5 * Math.pow(2, newAttemptCount - 1);
+    const nowMs = time.nowMs({ ctx: 'invoice_retry_calc' });
+    const nextRetryAt = nextStatus === 'retrying'
+        ? new Date(nowMs + delaySec * 1000).toISOString()
+        : null;
+
+    const tx = await db.beginTransaction();
+    try {
+        await updateInvoiceRetryState(invoice.id, {
+            status: nextStatus,
+            failureReason: reason,
+            attemptCount: newAttemptCount,
+            lastAttemptAt: nowIso(),
+            nextRetryAt,
+            suspendedAt: nextStatus === 'suspended' ? nowIso() : null,
+            updatedAt: nowIso()
+        }, tx);
+
+        const extraAssignments = [];
+        const extraParams = [];
+        if (invoiceColumns.last_error) {
+            extraAssignments.push('last_error = ?');
+            extraParams.push(reason);
+        }
+        if (invoiceColumns.last_error_code) {
+            extraAssignments.push('last_error_code = ?');
+            extraParams.push(stripeCode);
+        }
+        if (invoiceColumns.last_error_message) {
+            extraAssignments.push('last_error_message = ?');
+            extraParams.push(reason);
+        }
+        if (invoiceColumns.stripe_error_code) {
+            extraAssignments.push('stripe_error_code = ?');
+            extraParams.push(stripeCode);
+        }
+        if (extraAssignments.length > 0) {
+            extraParams.push(invoice.id);
+            await tx.run(`UPDATE invoices SET ${extraAssignments.join(', ')} WHERE id = ?`, ...extraParams);
+        }
+
+        if (nextStatus === 'suspended') {
+            await tx.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
+        }
+
+        await tx.run(`
+            INSERT INTO invoice_attempts 
+            (invoice_id, attempt_number, status, stripe_payment_intent_id, error_code, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, invoice.id, newAttemptCount, nextStatus, invoice.stripe_payment_intent_id || null, stripeCode, reason, nowIso());
+
+        await tx.commit();
+    } catch (txErr) {
+        await tx.rollback();
+        throw txErr;
+    }
+
+    if (nextStatus === 'suspended') {
+        await notifyPaymentSuspendedSafe(invoice);
+    } else {
+        await notifyPaymentFailedSafe(invoice, newAttemptCount, maxAttempts, reason);
+    }
+}
 
 // --- ENQUEUE HELPER ---
 
@@ -354,11 +506,15 @@ const handlers = {
         // 2. Fetch Invoice
         // Support payload flexibility if rescheduled
         let invoice;
+        const empresaColumns = await getTableColumns('empresas');
         const companyEmailExpr = db.IS_POSTGRES ? "COALESCE(c.email, c.contacto)" : "c.contacto";
+        const companyPaymentMethodExpr = empresaColumns.stripe_payment_method_id
+            ? "c.stripe_payment_method_id AS company_stripe_payment_method_id,"
+            : "NULL AS company_stripe_payment_method_id,";
         if (invoice_id) {
-            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.id = ?`, invoice_id);
+            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyPaymentMethodExpr} ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.id = ?`, invoice_id);
         } else if (payload.company_id && payload.week_start) {
-            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?`, payload.company_id, payload.week_start);
+            invoice = await db.get(`SELECT w.*, c.stripe_customer_id, ${companyPaymentMethodExpr} ${companyEmailExpr} AS company_email, c.nombre AS company_name FROM invoices w JOIN empresas c ON w.company_id = c.id WHERE w.company_id = ? AND w.week_start = ?`, payload.company_id, payload.week_start);
         }
 
         if (!invoice) {
@@ -418,6 +574,9 @@ const handlers = {
             return;
         }
 
+        const paymentMethodId = await resolveOffSessionPaymentMethod(stripe, invoice);
+        const MAX_ATTEMPTS = 3;
+
         // 5. Idempotency Key & Create-or-Confirm Logic
         const idempotencyKey = `invoice_${invoice.id}_charge`;
         let paymentIntent;
@@ -432,11 +591,24 @@ const handlers = {
                     expand: ['latest_charge']
                 });
             } else {
+                if (!paymentMethodId) {
+                    logger.warn(`${logPrefix} Missing payment method; skipping off-session charge`);
+                    await finalizeChargeFailure(invoice, {
+                        reason: 'Missing payment method for off-session charge.',
+                        stripeCode: 'missing_payment_method',
+                        errorType: 'missing_payment_method',
+                        maxAttempts: MAX_ATTEMPTS,
+                        forceStatus: 'suspended'
+                    });
+                    return;
+                }
+
                 logger.info(`${logPrefix} Creating new PI with key: ${idempotencyKey}`);
                 paymentIntent = await stripe.paymentIntents.create({
                     amount: invoice.total_cents,
                     currency: invoice.currency || 'usd',
                     customer: invoice.stripe_customer_id,
+                    payment_method: paymentMethodId,
                     confirm: true, // Try to charge immediately
                     off_session: true,
                     expand: ['latest_charge'],
@@ -461,10 +633,26 @@ const handlers = {
 
             // Retry/Confirm if needed
             if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
+                if (!paymentMethodId && !paymentIntent.payment_method) {
+                    logger.warn(`${logPrefix} Missing payment method; skipping off-session charge`);
+                    await finalizeChargeFailure(invoice, {
+                        reason: 'Missing payment method for off-session charge.',
+                        stripeCode: 'missing_payment_method',
+                        errorType: 'missing_payment_method',
+                        maxAttempts: MAX_ATTEMPTS,
+                        forceStatus: 'suspended'
+                    });
+                    return;
+                }
+
                 logger.info(`${logPrefix} PI ${paymentIntent.id} is ${paymentIntent.status}, attempting confirm...`);
-                paymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
+                const confirmPayload = {
                     off_session: true
-                });
+                };
+                if (paymentMethodId) {
+                    confirmPayload.payment_method = paymentMethodId;
+                }
+                paymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, confirmPayload);
             }
 
             // (PI Id saving was moved above for guaranteed bottom-up reconciliation)
@@ -474,67 +662,24 @@ const handlers = {
             if (e.raw && e.raw.payment_intent) {
                 const piId = e.raw.payment_intent.id;
                 await db.run("UPDATE invoices SET stripe_payment_intent_id=? WHERE id=?", piId, invoice.id);
+                invoice.stripe_payment_intent_id = piId;
             }
             const reason = e.message || 'Unknown Stripe Error';
-            let isDecline = false;
             let stripeCode = 'unknown';
 
             if (e.type === 'StripeCardError') {
-                isDecline = true;
                 stripeCode = e.code || 'card_declined';
             } else if (e.type) {
                 stripeCode = e.type;
             }
 
             logger.error(`${logPrefix} Stripe Error: ${reason} (Code: ${stripeCode})`);
-
-            // DUNNING LOGIC: Increment attempt, determine next status and backoff
-            const newAttemptCount = (invoice.attempt_count || 0) + 1;
-            const MAX_ATTEMPTS = 3; 
-            let nextStatus = 'failed';
-            isDecline = (e.type === 'StripeCardError');
-            
-            if (newAttemptCount >= MAX_ATTEMPTS) {
-                nextStatus = 'suspended';
-                await notifyPaymentSuspended(invoice);
-            } else {
-                nextStatus = (isDecline || ['StripeConnectionError', 'StripeAPIError'].includes(e.type)) ? 'retrying' : 'failed';
-                await notifyPaymentFailed(invoice, newAttemptCount, MAX_ATTEMPTS, reason);
-            }
-            const delaySec = 5 * Math.pow(2, newAttemptCount - 1);
-            const nowMs = time.nowMs({ ctx: 'invoice_retry_calc' });
-            const nextRetryAt = nextStatus === 'retrying'
-                ? new Date(nowMs + delaySec * 1000).toISOString()
-                : null;
-
-            const tx = await db.beginTransaction();
-            try {
-                await updateInvoiceRetryState(invoice.id, {
-                    status: nextStatus,
-                    failureReason: reason,
-                    attemptCount: newAttemptCount,
-                    lastAttemptAt: nowIso(),
-                    nextRetryAt,
-                    suspendedAt: nextStatus === 'suspended' ? nowIso() : null,
-                    updatedAt: nowIso()
-                }, tx);
-
-                if (nextStatus === 'suspended') {
-                    await tx.run("UPDATE empresas SET search_status = 'OFF', billing_suspended = true WHERE id = ?", invoice.company_id);
-                }
-
-                // Audit
-                await tx.run(`
-                    INSERT INTO invoice_attempts 
-                    (invoice_id, attempt_number, status, stripe_payment_intent_id, error_code, error_message, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                `, invoice.id, newAttemptCount, nextStatus, invoice.stripe_payment_intent_id, stripeCode, reason, nowIso());
-
-                await tx.commit();
-            } catch (txErr) {
-                await tx.rollback();
-                throw txErr;
-            }
+            await finalizeChargeFailure(invoice, {
+                reason,
+                stripeCode,
+                errorType: e.type || null,
+                maxAttempts: MAX_ATTEMPTS
+            });
 
             return;
         }
