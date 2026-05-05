@@ -13,7 +13,8 @@
     "migrate": "node migrate_auth_fix.js",
     "test": "jest --runInBand",
     "test:match": "node --test tests/match_confirmed.test.js",
-    "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\""
+    "test:ci": "node --test --test-reporter spec \"tests/**/*.test.js\"",
+    "start:optionb": "node opcionb/http_server.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1028.0",
